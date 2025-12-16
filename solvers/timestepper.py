@@ -170,53 +170,10 @@ def advance_one_step_scipy(
         cfg=cfg,
     )
 
-    # --- Stage 2: liquid temperature update using new Ts as boundary ---
+    # --- Stage 2 removed: Tl is now solved in Stage 1 (coupled mode) ---
+    # No separate liquid temperature solve needed
     liq_diag: Dict[str, Any] | None = None
     liq_lin: Optional[LinearSolveResult] = None
-    if cfg.physics.solve_Tl and layout.has_block("Tl"):
-        try:
-            state_new, liq_lin, liq_diag = _advance_liquid_T_step12(
-                cfg=cfg,
-                grid=grid,
-                layout=layout,
-                state_tr=state_new,
-                props=props_old,
-                dt=dt,
-            )
-        except Exception as exc:
-            logger.exception("Liquid temperature solve raised an exception.")
-            diag = _build_step_diagnostics_fail(
-                t_old=t_old,
-                t_new=t_new,
-                dt=dt,
-                message=str(exc),
-                linear=liq_lin,
-                diag_sys=diag_sys,
-            )
-            return StepResult(
-                state_new=state_old,
-                props_new=props_old,
-                diag=diag,
-                success=False,
-                message=f"liquid T solve error: {exc}",
-            )
-
-        if liq_lin is not None and not liq_lin.converged:
-            diag = _build_step_diagnostics_fail(
-                t_old=t_old,
-                t_new=t_new,
-                dt=dt,
-                message=liq_lin.message,
-                linear=liq_lin,
-                diag_sys=diag_sys,
-            )
-            return StepResult(
-                state_new=state_new,
-                props_new=props_old,
-                diag=diag,
-                success=False,
-                message=f"liquid T solve not converged: {liq_lin.message}",
-            )
 
     diag = _build_step_diagnostics(
         lin_result=lin_result,
@@ -308,6 +265,11 @@ def _unpack_solution_to_state(
     if layout.has_block("Tg"):
         for ig in range(grid.Ng):
             state_new.Tg[ig] = float(x[layout.idx_Tg(ig)])
+
+    # Tl block (coupled mode)
+    if layout.has_block("Tl"):
+        for il in range(grid.Nl):
+            state_new.Tl[il] = float(x[layout.idx_Tl(il)])
 
     # Ts
     if cfg.physics.include_Ts and layout.has_block("Ts"):
