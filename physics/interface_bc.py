@@ -419,7 +419,7 @@ def _build_mpp_row(
         # Gauss-Seidel split: Yg fixed at old value
         cols = [idx_mpp]
         vals = [coeff_mpp]
-        rhs = -rho_g * D_cond * (Yg_cell_cond - Yg_eq_cond) / dr_g  # explicit Yg
+        rhs = rho_g * D_cond * (Yg_cell_cond - Yg_eq_cond) / dr_g  # explicit Yg, Newton RHS: -R = -J_cond
 
     mpp_cur = float(state.mpp)
     J_cond_cur = -rho_g * D_cond * (Yg_cell_cond - Yg_eq_cond) / dr_g
