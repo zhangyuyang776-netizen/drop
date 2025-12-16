@@ -137,10 +137,10 @@ def _make_simple_case(grid: Grid1D) -> CaseConfig:
         enforce_assembly_purity=True,
     )
     conventions = CaseConventions(
-        radial_normal="+r",
+        radial_normal="+er",
         flux_sign="outward_positive",
         heat_flux_def="q_positive_outward",
-        evap_sign="mpp_positive_outward",
+        evap_sign="mpp_positive_liq_to_gas",
         gas_closure_species="N2",
         index_source="layout",
         assembly_pure=True,
@@ -247,7 +247,8 @@ def test_one_step_no_flux_no_evap_keeps_state_constant(timestepper_env, monkeypa
     assert abs(state_new.Ts - T0) < 1e-10
 
     assert abs(state_new.mpp) < 1e-12
-    assert abs(state_new.Rd - float(cfg.initial.T_d0 if hasattr(cfg.initial, "T_d0") else grid.r_f[grid.iface_f])) < 1e-12
+    expected_Rd = float(grid.r_f[grid.iface_f])
+    assert abs(state_new.Rd - expected_Rd) < 1e-12
 
     if diag.energy_balance_if is not None:
         assert abs(diag.energy_balance_if) < 1e-8
