@@ -1,0 +1,535 @@
+"""
+Single-step timestepper (Step 12.2) using SciPy backend.
+
+Scope (current stage):
+- Stage 1: Advance Tg, Ts, mpp, Rd for one fixed dt using build_transport_system (SciPy).
+- Stage 2: Advance Tl via build_liquid_T_system_SciPy using the updated Ts (Gauss–Seidel split).
+- No Yg/Yl coupling yet.
+- No property recomputation inside this function (props treated as given).
+- No grid remeshing for Rd changes.
+
+This module:
+- Delegates assembly to assembly.build_system_SciPy.build_transport_system.
+- Delegates liquid assembly to assembly.build_liquid_T_system_SciPy.build_liquid_T_system.
+- Delegates linear solve to solvers.scipy_linear.solve_linear_system_scipy.
+- Packs/unpacks state via UnknownLayout (no direct vector math elsewhere).
+- Computes interface equilibrium per-step to supply eq_result for mpp equation.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+from pathlib import Path
+import importlib.util
+import sys
+from typing import Any, Dict, Optional, Tuple
+
+import numpy as np
+
+from core.types import CaseConfig, Grid1D, Props, State
+from core.layout import UnknownLayout
+from assembly.build_system_SciPy import build_transport_system
+from assembly.build_liquid_T_system_SciPy import build_liquid_T_system
+from properties.equilibrium import build_equilibrium_model, compute_interface_equilibrium
+from physics.interface_bc import EqResultLike
+from solvers.scipy_linear import LinearSolveResult, solve_linear_system_scipy
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class StepDiagnostics:
+    """Diagnostics for a single timestep."""
+
+    # Time info
+    t_old: float
+    t_new: float
+    dt: float
+
+    # Linear solve info
+    linear_converged: bool
+    linear_method: str
+    linear_n_iter: int
+    linear_residual_norm: float
+    linear_rel_residual: float
+
+    # Key state values (new state)
+    Ts: float
+    Rd: float
+    mpp: float
+    Tg_min: float
+    Tg_max: float
+
+    # Interface/radius diagnostics
+    energy_balance_if: Optional[float] = None
+    mass_balance_rd: Optional[float] = None
+
+    # Extra debug data
+    extra: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class StepResult:
+    """Result of a single timestep."""
+
+    state_new: State
+    props_new: Props
+    diag: StepDiagnostics
+    success: bool
+    message: Optional[str] = None
+
+
+def advance_one_step_scipy(
+    cfg: CaseConfig,
+    grid: Grid1D,
+    layout: UnknownLayout,
+    state: State,
+    props: Props,
+    t: float,
+) -> StepResult:
+    """
+    Advance (Tg, Ts, mpp, Rd) by one fixed dt using SciPy linear solver.
+
+    Inputs state/props are treated as t^n; outputs are t^{n+1}.
+    Does not mutate input state/props.
+    """
+    dt = float(cfg.time.dt)
+    if dt <= 0.0:
+        raise ValueError(f"cfg.time.dt must be positive, got {dt}")
+    t_old = float(t)
+    t_new = t_old + dt
+
+    state_old = state.copy()
+    props_old = props  # Step 12.2: treat props as quasi-steady (no recompute here)
+
+    eq_result: EqResultLike = None
+    if cfg.physics.include_mpp:
+        eq_result = _build_eq_result_for_step(cfg=cfg, grid=grid, state=state_old, props=props_old)
+
+    # initial nonlinear guess (MVP: old state)
+    state_guess = state_old
+
+    try:
+        A, b, diag_sys = _assemble_transport_system_step12(
+            cfg=cfg,
+            grid=grid,
+            layout=layout,
+            state_old=state_old,
+            state_guess=state_guess,
+            props=props_old,
+            dt=dt,
+            eq_result=eq_result,
+        )
+    except Exception as exc:
+        logger.exception("Failed to assemble transport system.")
+        diag = _build_step_diagnostics_fail(t_old, t_new, dt, message=str(exc))
+        return StepResult(
+            state_new=state_old,
+            props_new=props_old,
+            diag=diag,
+            success=False,
+            message=f"assembly failed: {exc}",
+        )
+
+    try:
+        lin_result: LinearSolveResult = solve_linear_system_scipy(A=A, b=b, cfg=cfg)
+    except Exception as exc:
+        logger.exception("Linear solve raised an exception.")
+        diag = _build_step_diagnostics_fail(t_old, t_new, dt, message=str(exc))
+        return StepResult(
+            state_new=state_old,
+            props_new=props_old,
+            diag=diag,
+            success=False,
+            message=f"linear solve error: {exc}",
+        )
+
+    if not lin_result.converged:
+        diag = _build_step_diagnostics_fail(
+            t_old,
+            t_new,
+            dt,
+            linear=lin_result,
+            diag_sys=diag_sys,
+            message=lin_result.message,
+        )
+        return StepResult(
+            state_new=state_old,
+            props_new=props_old,
+            diag=diag,
+            success=False,
+            message=f"linear solve not converged: {lin_result.message}",
+        )
+
+    state_new = _unpack_solution_to_state(
+        x=lin_result.x,
+        layout=layout,
+        grid=grid,
+        state_ref=state_old,
+        cfg=cfg,
+    )
+
+    # --- Stage 2: liquid temperature update using new Ts as boundary ---
+    liq_diag: Dict[str, Any] | None = None
+    liq_lin: Optional[LinearSolveResult] = None
+    if cfg.physics.solve_Tl and layout.has_block("Tl"):
+        try:
+            state_new, liq_lin, liq_diag = _advance_liquid_T_step12(
+                cfg=cfg,
+                grid=grid,
+                layout=layout,
+                state_tr=state_new,
+                props=props_old,
+                dt=dt,
+            )
+        except Exception as exc:
+            logger.exception("Liquid temperature solve raised an exception.")
+            diag = _build_step_diagnostics_fail(
+                t_old=t_old,
+                t_new=t_new,
+                dt=dt,
+                message=str(exc),
+                linear=liq_lin,
+                diag_sys=diag_sys,
+            )
+            return StepResult(
+                state_new=state_old,
+                props_new=props_old,
+                diag=diag,
+                success=False,
+                message=f"liquid T solve error: {exc}",
+            )
+
+        if liq_lin is not None and not liq_lin.converged:
+            diag = _build_step_diagnostics_fail(
+                t_old=t_old,
+                t_new=t_new,
+                dt=dt,
+                message=liq_lin.message,
+                linear=liq_lin,
+                diag_sys=diag_sys,
+            )
+            return StepResult(
+                state_new=state_new,
+                props_new=props_old,
+                diag=diag,
+                success=False,
+                message=f"liquid T solve not converged: {liq_lin.message}",
+            )
+
+    diag = _build_step_diagnostics(
+        lin_result=lin_result,
+        state_new=state_new,
+        diag_sys=diag_sys,
+        t_old=t_old,
+        dt=dt,
+        liq_diag=liq_diag,
+    )
+
+    # Basic sanity checks (non-fatal in this skeleton)
+    if state_new.Rd <= 0.0:
+        return StepResult(
+            state_new=state_new,
+            props_new=props_old,
+            diag=diag,
+            success=False,
+            message="Non-positive Rd after step.",
+        )
+    if np.any(~np.isfinite(state_new.Tg)):
+        return StepResult(
+            state_new=state_new,
+            props_new=props_old,
+            diag=diag,
+            success=False,
+            message="Non-finite Tg detected after step.",
+        )
+
+    _write_step_scalars_safe(cfg=cfg, t=t_new, state=state_new, diag=diag)
+
+    return StepResult(
+        state_new=state_new,
+        props_new=props_old,
+        diag=diag,
+        success=True,
+        message=None,
+    )
+
+
+def _assemble_transport_system_step12(
+    cfg: CaseConfig,
+    grid: Grid1D,
+    layout: UnknownLayout,
+    state_old: State,
+    state_guess: State,
+    props: Props,
+    dt: float,
+    eq_result: EqResultLike,
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+    """Wrapper for build_transport_system with basic shape checks."""
+    result = build_transport_system(
+        cfg=cfg,
+        grid=grid,
+        layout=layout,
+        state_old=state_old,
+        state_guess=state_guess,
+        props=props,
+        dt=dt,
+        eq_result=eq_result,
+        return_diag=True,
+    )
+    # build_transport_system may return a tuple of length 2 or 3 depending on return_diag
+    if len(result) == 3:
+        A, b, diag_sys = result
+    else:
+        A, b = result  # type: ignore[misc]
+        diag_sys = {}
+    N = layout.n_dof()
+    if A.shape != (N, N):
+        raise ValueError(f"Assembly produced A shape {A.shape}, expected {(N, N)}")
+    if b.shape != (N,):
+        raise ValueError(f"Assembly produced b shape {b.shape}, expected {(N,)}")
+    if diag_sys is None:
+        diag_sys = {}
+    return A, b, diag_sys
+
+
+def _unpack_solution_to_state(
+    x: np.ndarray,
+    layout: UnknownLayout,
+    grid: Grid1D,
+    state_ref: State,
+    cfg: CaseConfig,
+) -> State:
+    """Map solution vector back into a new State object."""
+    state_new = state_ref.copy()
+
+    # Tg block
+    if layout.has_block("Tg"):
+        for ig in range(grid.Ng):
+            state_new.Tg[ig] = float(x[layout.idx_Tg(ig)])
+
+    # Ts
+    if cfg.physics.include_Ts and layout.has_block("Ts"):
+        state_new.Ts = float(x[layout.idx_Ts()])
+
+    # mpp
+    if cfg.physics.include_mpp and layout.has_block("mpp"):
+        state_new.mpp = float(x[layout.idx_mpp()])
+
+    # Rd
+    if cfg.physics.include_Rd and layout.has_block("Rd"):
+        state_new.Rd = float(x[layout.idx_Rd()])
+
+    return state_new
+
+
+def _build_step_diagnostics(
+    lin_result: LinearSolveResult,
+    state_new: State,
+    diag_sys: Dict[str, Any],
+    t_old: float,
+    dt: float,
+    liq_diag: Optional[Dict[str, Any]] = None,
+) -> StepDiagnostics:
+    """Assemble StepDiagnostics from solve result and system diag."""
+    t_new = t_old + dt
+    Tg_min = float(np.min(state_new.Tg)) if state_new.Tg.size else np.nan
+    Tg_max = float(np.max(state_new.Tg)) if state_new.Tg.size else np.nan
+
+    energy_balance_if = None
+    if "Ts_energy" in diag_sys:
+        energy_balance_if = float(diag_sys["Ts_energy"].get("balance", np.nan))
+
+    mass_balance_rd = None
+    if "radius_eq" in diag_sys:
+        mass_balance_rd = float(diag_sys["radius_eq"].get("mass_balance", np.nan))
+
+    extra: Dict[str, Any] = {"diag_sys": diag_sys}
+    if liq_diag is not None:
+        extra["liq_T"] = liq_diag
+
+    return StepDiagnostics(
+        t_old=t_old,
+        t_new=t_new,
+        dt=dt,
+        linear_converged=lin_result.converged,
+        linear_method=lin_result.method,
+        linear_n_iter=lin_result.n_iter,
+        linear_residual_norm=lin_result.residual_norm,
+        linear_rel_residual=lin_result.rel_residual,
+        Ts=float(state_new.Ts),
+        Rd=float(state_new.Rd),
+        mpp=float(state_new.mpp),
+        Tg_min=Tg_min,
+        Tg_max=Tg_max,
+        energy_balance_if=energy_balance_if,
+        mass_balance_rd=mass_balance_rd,
+        extra=extra,
+    )
+
+
+def _build_step_diagnostics_fail(
+    t_old: float,
+    t_new: float,
+    dt: float,
+    message: Optional[str] = None,
+    linear: Optional[LinearSolveResult] = None,
+    diag_sys: Optional[Dict[str, Any]] = None,
+) -> StepDiagnostics:
+    """Diagnostics when assembly or solve fails."""
+    diag_sys = diag_sys or {}
+    method = linear.method if linear is not None else "unknown"
+    n_iter = linear.n_iter if linear is not None else 0
+    res_norm = linear.residual_norm if linear is not None else np.nan
+    rel_res = linear.rel_residual if linear is not None else np.nan
+    return StepDiagnostics(
+        t_old=t_old,
+        t_new=t_new,
+        dt=dt,
+        linear_converged=False,
+        linear_method=method,
+        linear_n_iter=n_iter,
+        linear_residual_norm=res_norm,
+        linear_rel_residual=rel_res,
+        Ts=np.nan,
+        Rd=np.nan,
+        mpp=np.nan,
+        Tg_min=np.nan,
+        Tg_max=np.nan,
+        energy_balance_if=None,
+        mass_balance_rd=None,
+        extra={"diag_sys": diag_sys, "message": message},
+    )
+
+
+def _advance_liquid_T_step12(
+    cfg: CaseConfig,
+    grid: Grid1D,
+    layout: UnknownLayout,
+    state_tr: State,
+    props: Props,
+    dt: float,
+) -> Tuple[State, LinearSolveResult, Dict[str, Any]]:
+    """
+    Stage 2: update liquid temperature using current Ts as interface Dirichlet.
+
+    Inputs:
+        state_tr : state after Stage 1 (Tg, Ts, mpp, Rd updated; Tl still old).
+    Returns:
+        state_liq : State with Tl advanced to t^{n+1} (others from state_tr).
+        lin_res   : Linear solve result for Tl system.
+        liq_diag  : Basic diagnostics for Tl.
+    """
+    A_l, b_l = build_liquid_T_system(
+        cfg=cfg,
+        grid=grid,
+        layout=layout,
+        state_old=state_tr,
+        props=props,
+        dt=dt,
+    )
+
+    lin_res = solve_linear_system_scipy(A=A_l, b=b_l, cfg=cfg)
+
+    if not lin_res.converged:
+        return state_tr, lin_res, {}
+
+    state_liq = state_tr.copy()
+    for il in range(grid.Nl):
+        state_liq.Tl[il] = float(lin_res.x[il])
+
+    Tl_min = float(np.min(state_liq.Tl)) if state_liq.Tl.size else np.nan
+    Tl_max = float(np.max(state_liq.Tl)) if state_liq.Tl.size else np.nan
+    Tl_if = float(state_liq.Tl[grid.Nl - 1]) if grid.Nl > 0 else np.nan
+    Ts_new = float(state_liq.Ts)
+
+    liq_diag = {
+        "Tl_min": Tl_min,
+        "Tl_max": Tl_max,
+        "Tl_if": Tl_if,
+        "Ts": Ts_new,
+        "Tl_if_minus_Ts": Tl_if - Ts_new,
+    }
+
+    return state_liq, lin_res, liq_diag
+
+
+_WRITERS_MODULE_NAME = "io_writers_cached"
+
+
+def _write_step_scalars_safe(cfg: CaseConfig, t: float, state: State, diag: StepDiagnostics) -> None:
+    """
+    Safely load and call write_step_scalars without importing stdlib io module.
+    Uses a cached dynamic import to avoid conflicts with builtin io.
+    """
+    try:
+        module = sys.modules.get(_WRITERS_MODULE_NAME)
+        if module is None:
+            path = Path(__file__).resolve().parent.parent / "io" / "writers.py"
+            spec = importlib.util.spec_from_file_location(_WRITERS_MODULE_NAME, path)
+            if spec is None or spec.loader is None:
+                raise ImportError(f"Cannot load writers module from {path}")
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[_WRITERS_MODULE_NAME] = module
+            spec.loader.exec_module(module)  # type: ignore[arg-type]
+        write_fn = getattr(module, "write_step_scalars", None)
+        if write_fn is None:
+            raise AttributeError("write_step_scalars not found in writers module")
+        write_fn(cfg=cfg, t=t, state=state, diag=diag)
+    except Exception as exc:
+        logger.warning("write_step_scalars failed: %s", exc)
+
+
+def _build_eq_result_for_step(
+    cfg: CaseConfig,
+    grid: Grid1D,
+    state: State,
+    props: Props,
+) -> EqResultLike:
+    """Compute interface equilibrium result for the current step."""
+    il_if = grid.Nl - 1
+    ig_if = 0
+
+    Ts = float(state.Ts)
+    Yl_face = np.asarray(state.Yl[:, il_if], dtype=np.float64)
+    Yg_face = np.asarray(state.Yg[:, ig_if], dtype=np.float64)
+    Ns_g = Yg_face.shape[0]
+    Ns_l = Yl_face.shape[0]
+
+    M_g, M_l = _get_molar_masses_from_cfg(cfg, Ns_g=Ns_g, Ns_l=Ns_l)
+    eq_model = build_equilibrium_model(cfg, Ns_g=Ns_g, Ns_l=Ns_l, M_g=M_g, M_l=M_l)
+
+    Pg = float(getattr(cfg.initial, "P_inf", 101325.0))
+    Yg_eq, y_cond, psat = compute_interface_equilibrium(
+        eq_model,
+        Ts=Ts,
+        Pg=Pg,
+        Yl_face=Yl_face,
+        Yg_face=Yg_face,
+    )
+    return {"Yg_eq": Yg_eq, "y_cond": y_cond, "psat": psat}
+
+
+def _get_molar_masses_from_cfg(cfg: CaseConfig, Ns_g: int, Ns_l: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Build molar mass arrays (kg/mol) aligned with species order in cfg."""
+    mw_map = dict(getattr(cfg.species, "mw_kg_per_mol", {}))
+
+    gas_names = list(cfg.species.gas_species)
+    liq_names = list(cfg.species.liq_species)
+
+    def _build(names: list[str], Ns: int) -> np.ndarray:
+        arr = np.ones(Ns, dtype=np.float64)
+        for i, name in enumerate(names):
+            if i >= Ns:
+                break
+            if name in mw_map:
+                try:
+                    arr[i] = float(mw_map[name])
+                except Exception:
+                    arr[i] = 1.0
+        return arr
+
+    M_g = _build(gas_names, Ns_g)
+    M_l = _build(liq_names, Ns_l)
+    return M_g, M_l
