@@ -225,8 +225,8 @@ def _fake_eq_result_for_evap(cfg, grid, state, props):
     """
     ig_if = 0
     Yg_cell = state.Yg[:, ig_if].copy()
-    gas_names = list(cfg.species.gas_species_full)
-    cond_name = cfg.species.liq_balance_species[0] if isinstance(cfg.species.liq_balance_species, list) else cfg.species.liq_balance_species
+    gas_names = list(cfg.species.gas_species)
+    cond_name = cfg.species.liq_balance_species if isinstance(cfg.species.liq_balance_species, str) else cfg.species.liq_balance_species[0]
     cond_idx = gas_names.index(cond_name)
 
     Yg_eq = Yg_cell.copy()
