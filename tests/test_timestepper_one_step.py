@@ -61,8 +61,8 @@ def _make_simple_case(grid: Grid1D) -> CaseConfig:
     )
     physics = CasePhysics(
         solve_Tg=True,
-        solve_Yg=True,
-        solve_Tl=True,
+        solve_Yg=False,  # Stage 1 only solves Tg, Ts, mpp, Rd (per 12.2)
+        solve_Tl=False,  # Tl solved separately in Stage 2 if needed
         solve_Yl=False,
         include_Ts=True,
         include_mpp=True,
