@@ -499,7 +499,6 @@ def run_case(cfg_path: str, *, max_steps: Optional[int] = None, log_level: int |
             state = res.state_new
             props = res.props_new
             t = res.diag.t_new
-            step_id += 1
 
             _maybe_write_spatial(cfg, grid, state, step_id)
 
