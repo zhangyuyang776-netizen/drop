@@ -184,22 +184,19 @@ def advance_one_step_scipy(
         liq_diag=liq_diag,
     )
 
-    # Basic sanity checks (non-fatal in this skeleton)
-    if state_new.Rd <= 0.0:
+    sanity_msg = _sanity_check_step(cfg=cfg, grid=grid, state_new=state_new, props_new=props_old, diag=diag)
+    if sanity_msg is not None:
+        try:
+            diag.extra = dict(diag.extra)
+            diag.extra["sanity"] = {"reason": sanity_msg}
+        except Exception:
+            pass
         return StepResult(
             state_new=state_new,
             props_new=props_old,
             diag=diag,
             success=False,
-            message="Non-positive Rd after step.",
-        )
-    if np.any(~np.isfinite(state_new.Tg)):
-        return StepResult(
-            state_new=state_new,
-            props_new=props_old,
-            diag=diag,
-            success=False,
-            message="Non-finite Tg detected after step.",
+            message=sanity_msg,
         )
 
     _write_step_scalars_safe(cfg=cfg, t=t_new, state=state_new, diag=diag)
@@ -329,6 +326,100 @@ def _build_step_diagnostics(
         mass_balance_rd=mass_balance_rd,
         extra=extra,
     )
+
+
+def _sanity_check_step(cfg: CaseConfig, grid: Grid1D, state_new: State, props_new: Props, diag: StepDiagnostics) -> Optional[str]:
+    """
+    Step-level sanity checks after solve and before writing outputs.
+
+    Returns
+    -------
+    None if OK, or a string describing the first detected issue.
+    """
+    # --- numeric health ---
+    if not np.isfinite(state_new.Rd) or state_new.Rd <= 0.0:
+        return "Rd non-positive or non-finite after step"
+    if not np.isfinite(state_new.Ts):
+        return "Ts non-finite after step"
+    if not np.isfinite(state_new.mpp):
+        return "mpp non-finite after step"
+    if np.any(~np.isfinite(state_new.Tg)):
+        return "Tg contains non-finite entries after step"
+    if cfg.physics.enable_liquid and np.any(~np.isfinite(state_new.Tl)):
+        return "Tl contains non-finite entries after step"
+
+    # --- temperature bounds ---
+    if getattr(cfg.checks, "enforce_T_bounds", False):
+        T_min = float(cfg.checks.T_min)
+        T_max = float(cfg.checks.T_max)
+
+        def _check_T(arr: np.ndarray, name: str) -> Optional[str]:
+            if arr.size == 0:
+                return None
+            amin = float(np.min(arr))
+            amax = float(np.max(arr))
+            if amin < T_min or amax > T_max:
+                return f"{name} out of bounds [{T_min}, {T_max}] (min={amin:.3e}, max={amax:.3e})"
+            return None
+
+        msg = _check_T(state_new.Tg, "Tg")
+        if msg:
+            return msg
+        if cfg.physics.enable_liquid:
+            msg = _check_T(state_new.Tl, "Tl")
+            if msg:
+                return msg
+        msg = _check_T(np.array([state_new.Ts], dtype=np.float64), "Ts")
+        if msg:
+            return msg
+
+    # --- mass fractions sum and negativity ---
+    if getattr(cfg.checks, "enforce_sumY", False):
+        tol = float(getattr(cfg.checks, "sumY_tol", 1e-10))
+        if cfg.physics.solve_Yg and state_new.Yg.size:
+            s = np.sum(state_new.Yg, axis=0)
+            max_err = float(np.max(np.abs(s - 1.0)))
+            if max_err > tol:
+                return f"Gas Y sum deviates by {max_err:.3e} (tol={tol:.3e})"
+        if cfg.physics.solve_Yl and state_new.Yl.size:
+            s = np.sum(state_new.Yl, axis=0)
+            max_err = float(np.max(np.abs(s - 1.0)))
+            if max_err > tol:
+                return f"Liquid Y sum deviates by {max_err:.3e} (tol={tol:.3e})"
+
+    if not getattr(cfg.checks, "clamp_negative_Y", False):
+        min_Y_tol = float(getattr(cfg.checks, "min_Y", 0.0))
+        if cfg.physics.solve_Yg and state_new.Yg.size:
+            ymin = float(np.min(state_new.Yg))
+            if ymin < -min_Y_tol:
+                return f"Gas Y has values below -min_Y (min={ymin:.3e}, min_Y={min_Y_tol:.3e})"
+        if cfg.physics.solve_Yl and state_new.Yl.size:
+            ymin = float(np.min(state_new.Yl))
+            if ymin < -min_Y_tol:
+                return f"Liquid Y has values below -min_Y (min={ymin:.3e}, min_Y={min_Y_tol:.3e})"
+
+    # --- linear solve health ---
+    if not diag.linear_converged:
+        return "Linear solver reported non-convergence"
+    rel_res = float(diag.linear_rel_residual)
+    if not np.isfinite(rel_res):
+        return "Linear relative residual is non-finite"
+    rtol = float(getattr(cfg.petsc, "rtol", 1.0e-8))
+    thresh = max(rtol, 1.0e-8)
+    if rel_res > max(thresh, rtol * 10.0):
+        return f"Linear relative residual too large ({rel_res:.3e} > {thresh:.3e})"
+
+    # --- time consistency ---
+    if diag.dt <= 0.0:
+        return f"Non-positive dt in diagnostics: dt={diag.dt}"
+    if diag.t_new <= diag.t_old:
+        return f"Non-increasing time: t_new={diag.t_new}, t_old={diag.t_old}"
+    expected = diag.t_old + diag.dt
+    tol = 1e-12 * max(1.0, abs(diag.t_old), abs(diag.t_new), abs(diag.dt))
+    if abs(expected - diag.t_new) > tol:
+        return f"t_new mismatch: expected {expected:.12e} vs diag {diag.t_new:.12e}"
+
+    return None
 
 
 def _build_step_diagnostics_fail(
