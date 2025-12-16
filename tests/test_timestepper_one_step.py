@@ -219,6 +219,31 @@ def _fake_eq_result_for_no_evap(cfg, grid, state, props):
     return {"Yg_eq": Yg_face.copy()}
 
 
+def _fake_eq_result_for_evap(cfg, grid, state, props):
+    """
+    Create a small evaporative driving force: set equilibrium gas FUEL fraction > cell value.
+    """
+    ig_if = 0
+    Yg_cell = state.Yg[:, ig_if].copy()
+    gas_names = list(cfg.species.gas_species_full)
+    cond_name = cfg.species.liq_balance_species[0] if isinstance(cfg.species.liq_balance_species, list) else cfg.species.liq_balance_species
+    cond_idx = gas_names.index(cond_name)
+
+    Yg_eq = Yg_cell.copy()
+    delta = 0.1
+    Yg_eq[cond_idx] = Yg_cell[cond_idx] + delta
+    others = [i for i in range(Yg_cell.shape[0]) if i != cond_idx]
+    sum_others = float(np.sum(Yg_cell[others]))
+    if sum_others > 0.0:
+        scale = max(1.0 - Yg_eq[cond_idx], 0.0) / sum_others
+        for i in others:
+            Yg_eq[i] = Yg_cell[i] * scale
+    else:
+        Yg_eq[cond_idx] = 1.0
+
+    return {"Yg_eq": Yg_eq}
+
+
 def test_one_step_no_flux_no_evap_keeps_state_constant(timestepper_env, monkeypatch, tmp_path):
     cfg, grid, layout, props, state = timestepper_env
     cfg.paths.case_dir = tmp_path
@@ -258,6 +283,67 @@ def test_one_step_no_flux_no_evap_keeps_state_constant(timestepper_env, monkeypa
         assert abs(diag.energy_balance_if) < 1e-8
     if diag.mass_balance_rd is not None:
         assert abs(diag.mass_balance_rd) < 1e-8
+
+    scalars_path = cfg.paths.case_dir / "scalars" / "scalars.csv"
+    assert scalars_path.exists()
+
+
+def test_one_step_simple_evap_radius_response(timestepper_env, monkeypatch, tmp_path):
+    cfg, grid, layout, props, state = timestepper_env
+    cfg.paths.case_dir = tmp_path
+
+    # induce evaporation: equilibrium has more FUEL than cell, and set latent heat
+    monkeypatch.setattr(timestepper, "_build_eq_result_for_step", _fake_eq_result_for_evap)
+    monkeypatch.setattr(interface_bc, "_get_latent_heat", lambda props, cfg: 2.5e6)
+
+    Rd_old = float(state.Rd)
+    dt = float(cfg.time.dt)
+    rho_l_val = float(props.rho_l[0])
+
+    res = advance_one_step_scipy(
+        cfg=cfg,
+        grid=grid,
+        layout=layout,
+        state=state,
+        props=props,
+        t=0.0,
+    )
+
+    assert res.success
+    assert res.diag.linear_converged
+    assert np.isfinite(res.diag.linear_residual_norm)
+
+    state_new = res.state_new
+    mpp_new = float(state_new.mpp)
+    assert mpp_new > 0.0
+
+    Rd_new = float(state_new.Rd)
+    Rd_expected = Rd_old - mpp_new * dt / rho_l_val
+    assert np.isclose(Rd_new, Rd_expected, rtol=1e-10, atol=1e-16)
+
+    Ts_new = float(state_new.Ts)
+    assert 250.0 <= Ts_new <= 400.0
+
+    diag = res.diag
+    if diag.mass_balance_rd is not None:
+        assert np.isfinite(diag.mass_balance_rd)
+        assert abs(diag.mass_balance_rd) < 1e-4
+    if diag.energy_balance_if is not None:
+        assert np.isfinite(diag.energy_balance_if)
+        assert abs(diag.energy_balance_if) < 1e-2
+
+    diag_sys = diag.extra.get("diag_sys", {})
+    mpp_diag = diag_sys.get("mpp_mass", {})
+    if mpp_diag:
+        assert mpp_diag["Yg_eq"] > mpp_diag["Yg_cell"]
+        assert mpp_diag["J_cond"] > 0.0
+
+    Tg_new = state_new.Tg
+    Tl_new = state_new.Tl
+    assert np.all(np.isfinite(Tg_new))
+    assert np.all(np.isfinite(Tl_new))
+    assert Tg_new.min() >= 250.0 and Tg_new.max() <= 1000.0
+    assert Tl_new.min() >= 250.0 and Tl_new.max() <= 1000.0
 
     scalars_path = cfg.paths.case_dir / "scalars" / "scalars.csv"
     assert scalars_path.exists()
