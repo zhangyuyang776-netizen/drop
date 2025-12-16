@@ -3,6 +3,7 @@ import pytest
 from pathlib import Path
 
 import solvers.timestepper as timestepper
+import physics.interface_bc as interface_bc
 from core.types import (
     CaseChecks,
     CaseConfig,
@@ -139,7 +140,7 @@ def _make_simple_case(grid: Grid1D) -> CaseConfig:
     conventions = CaseConventions(
         radial_normal="+er",
         flux_sign="outward_positive",
-        heat_flux_def="q_positive_outward",
+        heat_flux_def="q=-k*dTdr",
         evap_sign="mpp_positive_liq_to_gas",
         gas_closure_species="N2",
         index_source="layout",
@@ -224,6 +225,9 @@ def test_one_step_no_flux_no_evap_keeps_state_constant(timestepper_env, monkeypa
 
     # patch equilibrium to enforce Yg_eq == Yg_face -> mpp stays 0
     monkeypatch.setattr(timestepper, "_build_eq_result_for_step", _fake_eq_result_for_no_evap)
+
+    # patch latent heat
+    monkeypatch.setattr(interface_bc, "_get_latent_heat", lambda props, cfg: 2.5e6)
 
     res = advance_one_step_scipy(
         cfg=cfg,
