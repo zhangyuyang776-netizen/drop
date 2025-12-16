@@ -26,6 +26,7 @@ def build_liquid_T_system(
     state_old: State,
     props: Props,
     dt: float,
+    couple_interface: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Assemble liquid-phase temperature equation into dense numpy system A x = b (Tl-only).
@@ -34,7 +35,16 @@ def build_liquid_T_system(
     - Only Tl in liquid cells (0..Nl-1); returned system size is (Nl, Nl).
     - Implicit conduction with rho_l, cp_l, k_l frozen at state_old.
     - Center r=0: symmetry (zero-gradient) via ghost-cell-like stencil.
-    - Interface r=R_d: Dirichlet T_l(Nl-1) = Ts_given (state_old.Ts).
+    - Interface r=R_d:
+      * If couple_interface=False (Stage 2 mode): Dirichlet T_l(Nl-1) = Ts_given.
+      * If couple_interface=True (Stage 1 coupled mode): keep conduction equation,
+        coupling provided by Ts energy equation in build_transport_system.
+
+    Parameters
+    ----------
+    couple_interface : bool, default False
+        If False: apply Dirichlet BC at interface (for Stage 2 split solve).
+        If True: keep conduction equation at interface (for Stage 1 coupled solve).
     """
     if not layout.has_block("Tl"):
         raise ValueError("layout missing 'Tl' block required for liquid T assembly.")
@@ -147,13 +157,21 @@ def build_liquid_T_system(
         A[row, row] += aP
         b[row] += b_i
 
-    # Interface Dirichlet: T_l(Nl-1) = Ts_given (from state_old)
+    # Interface boundary condition
     il_bc = Nl - 1
     row_bc = il_bc
-    Ts_given = float(state_old.Ts)
-    A[row_bc, :] = 0.0
-    A[row_bc, row_bc] = 1.0
-    b[row_bc] = Ts_given
+
+    if not couple_interface:
+        # Stage 2 mode: Dirichlet BC (Tl[Nl-1] = Ts_given)
+        Ts_given = float(state_old.Ts)
+        A[row_bc, :] = 0.0
+        A[row_bc, row_bc] = 1.0
+        b[row_bc] = Ts_given
+    else:
+        # Stage 1 coupled mode: keep conduction equation at interface
+        # Interface energy coupling is handled by _build_Ts_row
+        # The conduction equation remains as assembled in the loop above
+        pass
 
     return A, b
 

@@ -229,6 +229,29 @@ def build_transport_system(
     row_bc = layout.idx_Tg(Ng - 1)
     _apply_outer_dirichlet_Tg(A, b, row_bc, Tg_far)
 
+    # --- Liquid temperature equations (Tl block) ---
+    if layout.has_block("Tl"):
+        from assembly.build_liquid_T_system_SciPy import build_liquid_T_system
+
+        A_l, b_l = build_liquid_T_system(
+            cfg=cfg,
+            grid=grid,
+            layout=layout,
+            state_old=state_old,
+            props=props,
+            dt=dt,
+            couple_interface=True,  # Coupled mode: no Dirichlet BC at interface
+        )
+
+        # Embed local Tl system (Nl×Nl) into global matrix (N×N)
+        Nl = grid.Nl
+        for il in range(Nl):
+            row_global = layout.idx_Tl(il)
+            for il2 in range(Nl):
+                col_global = layout.idx_Tl(il2)
+                A[row_global, col_global] += A_l[il, il2]
+            b[row_global] += b_l[il]
+
     # --- Interface equations: Ts energy jump + mpp Stefan (single-condensable) ---
     phys = cfg.physics
     if (phys.include_Ts or phys.include_mpp) and (layout.has_block("Ts") or layout.has_block("mpp")):

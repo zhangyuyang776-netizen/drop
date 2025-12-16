@@ -299,18 +299,27 @@ def _build_Ts_row(
 
     L_v = _get_latent_heat(props, cfg)
 
-    # Unknown indices near the interface (layout is gas/liquid-local)
+    # Unknown indices near the interface
     idx_Tg = layout.idx_Tg(ig_local)
-    idx_Tl = layout.idx_Tl(il_local)
 
     coeff_Tg = -A_if * k_g / dr_g
     coeff_Tl = A_if * k_l / dr_l
     coeff_Ts = A_if * (k_g / dr_g - k_l / dr_l)
     coeff_mpp = -A_if * L_v
 
-    cols = [idx_Tg, idx_Ts, idx_Tl, idx_mpp]
-    vals = [coeff_Tg, coeff_Ts, coeff_Tl, coeff_mpp]
-    rhs = 0.0
+    # Check if Tl is in layout (coupled) or fixed (explicit Gauss-Seidel)
+    if layout.has_block("Tl"):
+        # Fully coupled: Tl is an unknown in this system
+        idx_Tl = layout.idx_Tl(il_local)
+        cols = [idx_Tg, idx_Ts, idx_Tl, idx_mpp]
+        vals = [coeff_Tg, coeff_Ts, coeff_Tl, coeff_mpp]
+        rhs = 0.0
+    else:
+        # Gauss-Seidel split: Tl fixed at old value
+        Tl_fixed = float(state.Tl[il_local]) if state.Tl.size > il_local else 0.0
+        cols = [idx_Tg, idx_Ts, idx_mpp]
+        vals = [coeff_Tg, coeff_Ts, coeff_mpp]
+        rhs = -coeff_Tl * Tl_fixed  # Move Tl term to RHS
 
     # Diagnostic preview using current state (not mutating state)
     Ts_cur = float(state.Ts)
@@ -398,12 +407,19 @@ def _build_mpp_row(
 
     coeff_Yg = -rho_g * D_cond / dr_g
     coeff_mpp = -1.0
-    rhs = -rho_g * D_cond * Yg_eq_cond / dr_g
 
-    idx_Yg = layout.idx_Yg(k_red, ig_local)
-
-    cols = [idx_Yg, idx_mpp]
-    vals = [coeff_Yg, coeff_mpp]
+    # Check if Yg is in layout (coupled) or fixed (explicit)
+    if layout.has_block("Yg"):
+        # Fully coupled: Yg is an unknown
+        idx_Yg = layout.idx_Yg(k_red, ig_local)
+        cols = [idx_Yg, idx_mpp]
+        vals = [coeff_Yg, coeff_mpp]
+        rhs = -rho_g * D_cond * Yg_eq_cond / dr_g
+    else:
+        # Gauss-Seidel split: Yg fixed at old value
+        cols = [idx_mpp]
+        vals = [coeff_mpp]
+        rhs = -rho_g * D_cond * (Yg_cell_cond - Yg_eq_cond) / dr_g  # explicit Yg
 
     mpp_cur = float(state.mpp)
     J_cond_cur = -rho_g * D_cond * (Yg_cell_cond - Yg_eq_cond) / dr_g
