@@ -29,7 +29,7 @@ def write_step_scalars(cfg: CaseConfig, t: float, state: State, diag: "StepDiagn
     Append scalar diagnostics for a timestep to CSV.
 
     Columns:
-    t, Rd, Ts, mpp, Tg_mean, Tl_mean, energy_balance_if, mass_balance_rd
+    t, Rd, Ts, mpp, Tg_mean, Tl_mean, Tg_if, Tg_far, Tl_center, Tl_if, energy_balance_if, mass_balance_rd
     """
     out_dir = (Path(cfg.paths.case_dir) / "scalars") if hasattr(cfg, "paths") else Path("scalars")
     out_path = out_dir / "scalars.csv"
@@ -37,6 +37,10 @@ def write_step_scalars(cfg: CaseConfig, t: float, state: State, diag: "StepDiagn
 
     Tg_mean = float(np.mean(state.Tg)) if state.Tg.size else np.nan
     Tl_mean = float(np.mean(state.Tl)) if state.Tl.size else np.nan
+    Tg_if = float(state.Tg[0]) if state.Tg.size else np.nan
+    Tg_far = float(state.Tg[-1]) if state.Tg.size else np.nan
+    Tl_center = float(state.Tl[0]) if state.Tl.size else np.nan
+    Tl_if = float(state.Tl[-1]) if state.Tl.size else np.nan
 
     row = {
         "t": t,
@@ -45,6 +49,10 @@ def write_step_scalars(cfg: CaseConfig, t: float, state: State, diag: "StepDiagn
         "mpp": float(state.mpp),
         "Tg_mean": Tg_mean,
         "Tl_mean": Tl_mean,
+        "Tg_if": Tg_if,
+        "Tg_far": Tg_far,
+        "Tl_center": Tl_center,
+        "Tl_if": Tl_if,
         "energy_balance_if": diag.energy_balance_if,
         "mass_balance_rd": diag.mass_balance_rd,
     }
