@@ -12,6 +12,7 @@ phases:
   - H
   species:
   - N2
+  - O2
   - NC12H26
   kinetics: bulk
   skip-undeclared-third-bodies: true
@@ -55,6 +56,38 @@ species:
     well-depth: 97.53
     polarizability: 1.76
     rotational-relaxation: 4.0
+- name: O2
+  composition:
+    O: 2.0
+  thermo:
+    model: NASA7
+    temperature-ranges:
+    - 200.0
+    - 1000.0
+    - 6000.0
+    data:
+    - - 3.78245636
+      - -0.00299673416
+      - 9.84730201e-06
+      - -9.68129509e-09
+      - 3.24372837e-12
+      - -1063.94356
+      - 3.65767573
+    - - 3.28253784
+      - 0.00148308754
+      - -7.57966669e-07
+      - 2.09470555e-10
+      - -2.16717794e-14
+      - -1088.45772
+      - 5.45323129
+    note: TPIS89
+  transport:
+    model: gas
+    geometry: linear
+    diameter: 3.458
+    well-depth: 107.4
+    polarizability: 1.6
+    rotational-relaxation: 3.8
 - name: NC12H26
   composition:
     C: 12.0

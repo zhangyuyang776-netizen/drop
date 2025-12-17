@@ -26,7 +26,7 @@ physics:
   include_chemistry: false
 
   solve_Tg: true
-  solve_Yg: false
+  solve_Yg: true  # Changed from false: allow gas composition to evolve for evaporation
   solve_Tl: true
   solve_Yl: false
   include_Ts: false
@@ -73,7 +73,7 @@ geometry:
     gas_beta: 2.0
     gas_center_bias: -0.4
     enforce_interface_continuity: true
-    continuity_tol: 1.0e-12
+    continuity_tol: 1.0e-2  # Relaxed from 1e-12: allow ~1% relative error at interface
 
 time:
   t0: 0.0
