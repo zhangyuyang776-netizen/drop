@@ -504,8 +504,18 @@ def run_case(cfg_path: str, *, max_steps: Optional[int] = None, log_level: int |
 
         logger.info("Completed run: t=%.6e reached t_end=%.6e after %d steps.", t, cfg.time.t_end, step_id)
         return 0
-    except Exception:
-        logger.error("Unhandled exception:\n%s", traceback.format_exc())
+    except Exception as exc:
+        tb = traceback.format_exc()
+        logger.error("Unhandled exception:\n%s", tb)
+        # Also print to stderr to ensure visibility even if logging is misconfigured
+        print(f"\n{'='*80}", file=sys.stderr)
+        print("UNHANDLED EXCEPTION IN run_case:", file=sys.stderr)
+        print(f"{'='*80}", file=sys.stderr)
+        print(f"Type: {type(exc).__name__}", file=sys.stderr)
+        print(f"Message: {exc}", file=sys.stderr)
+        print(f"\nFull traceback:", file=sys.stderr)
+        print(tb, file=sys.stderr)
+        print(f"{'='*80}\n", file=sys.stderr)
         return 99
 
 
