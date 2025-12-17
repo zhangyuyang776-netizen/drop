@@ -8,6 +8,7 @@ Scope:
 - Only temperature equation convective term is provided here.
 - Species convective flux is left as a placeholder.
 - No residual assembly, no state mutation, no property evaluation.
+- For future enthalpy-form energy equations, the convective term is rho * u * h; here MVP uses h ≈ cp * T.
 
 Assumptions/Conventions:
 - radial_normal = "+er" (outward)

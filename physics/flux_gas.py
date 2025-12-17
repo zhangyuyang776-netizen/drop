@@ -3,6 +3,7 @@ Gas-phase diffusive fluxes (Step 7 MVP):
 - Computes conductive heat flux on faces using props + grid + Tg.
 - Direction/sign follow CaseConventions: radial_normal="+er", flux_sign="outward_positive", heat_flux_def="q=-k*dTdr".
 - No state/layout mutations; no property evaluation here.
+- This is only the conductive component of energy diffusive flux (q_cond). Enthalpy diffusion q_diff = sum(h_k * J_k) is handled in physics/energy_flux.py.
 
 Future:
 - Add species diffusive fluxes (Stefan–Maxwell) via compute_gas_diffusive_flux_Y.
@@ -51,7 +52,7 @@ def compute_gas_diffusive_flux_T(
     Returns
     -------
     q_cond : (Nc+1,) ndarray
-        Heat flux on faces, outward positive, consistent with q = -k dT/dr.
+        Conductive heat flux component on faces, outward positive, consistent with q = -k dT/dr.
     """
     _check_conventions(cfg)
     Nl, Ng, Nc = grid.Nl, grid.Ng, grid.Nc

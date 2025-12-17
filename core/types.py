@@ -420,6 +420,8 @@ class Props:
     cp_g: FloatArray
     k_g: FloatArray
     D_g: Optional[FloatArray] = None  # expected shape: (Nspec_g, Ng)
+    h_g: Optional[FloatArray] = None  # (Ng,) J/kg
+    h_l: Optional[FloatArray] = None  # (Nl,) J/kg
 
     rho_l: FloatArray = field(default_factory=lambda: np.zeros(0, dtype=np.float64))
     cp_l: FloatArray = field(default_factory=lambda: np.zeros(0, dtype=np.float64))
@@ -436,6 +438,8 @@ class Props:
             raise ValueError(f"k_g shape {self.k_g.shape} != ({grid.Ng},)")
         if self.D_g is not None and self.D_g.shape != (Ns_g, grid.Ng):
             raise ValueError(f"D_g shape {self.D_g.shape} != ({Ns_g}, {grid.Ng})")
+        if self.h_g is not None and self.h_g.shape != (grid.Ng,):
+            raise ValueError(f"h_g shape {self.h_g.shape} != ({grid.Ng},)")
 
         if self.rho_l.shape != (grid.Nl,):
             raise ValueError(f"rho_l shape {self.rho_l.shape} != ({grid.Nl},)")
@@ -445,6 +449,8 @@ class Props:
             raise ValueError(f"k_l shape {self.k_l.shape} != ({grid.Nl},)")
         if self.D_l is not None and self.D_l.shape != (Ns_l, grid.Nl):
             raise ValueError(f"D_l shape {self.D_l.shape} != ({Ns_l}, {grid.Nl})")
+        if self.h_l is not None and self.h_l.shape != (grid.Nl,):
+            raise ValueError(f"h_l shape {self.h_l.shape} != ({grid.Nl},)")
 
 
 @dataclass(slots=True)

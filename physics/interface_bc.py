@@ -34,6 +34,7 @@ import numpy as np
 
 from core.types import CaseConfig, Grid1D, State, Props
 from core.layout import UnknownLayout
+from physics.energy_flux import split_energy_flux_cond_diff_single
 
 # Placeholder type for equilibrium results; echoed into diag only.
 EqResultLike = Optional[Mapping[str, np.ndarray]]
@@ -331,6 +332,36 @@ def _build_Ts_row(
     q_l = -k_l * (Ts_cur - Tl_cur) / dr_l * A_if
     q_lat = mpp_cur * L_v * A_if
 
+    # Enthalpy-based split diagnostics (no matrix impact)
+    if not hasattr(props, "h_g") or props.h_g is None:
+        raise ValueError("Props.h_g is required for Ts enthalpy diagnostics.")
+    if not hasattr(props, "h_l") or props.h_l is None:
+        raise ValueError("Props.h_l is required for Ts enthalpy diagnostics.")
+    h_g_if = float(props.h_g[ig_local])
+    h_l_if = float(props.h_l[il_local])
+
+    dTdr_g_if = (Tg_cur - Ts_cur) / dr_g
+    dTdr_l_if = (Ts_cur - Tl_cur) / dr_l
+    J_if = mpp_cur  # outward (+r) positive
+
+    q_tot_g_area, q_cond_g_area, q_diff_g_area = split_energy_flux_cond_diff_single(
+        cfg, k_g, dTdr_g_if, h_g_if, J_if
+    )
+    q_tot_l_area, q_cond_l_area, q_diff_l_area = split_energy_flux_cond_diff_single(
+        cfg, k_l, dTdr_l_if, h_l_if, J_if
+    )
+
+    q_cond_g_pow = q_cond_g_area * A_if
+    q_cond_l_pow = q_cond_l_area * A_if
+    q_diff_g_pow = q_diff_g_area * A_if
+    q_diff_l_pow = q_diff_l_area * A_if
+    q_tot_g_pow = q_tot_g_area * A_if
+    q_tot_l_pow = q_tot_l_area * A_if
+
+    Lv_eff = h_g_if - h_l_if
+    q_lat_eff_pow = mpp_cur * Lv_eff * A_if
+    latent_mismatch_pow = q_lat - q_lat_eff_pow
+
     diag_update: Dict[str, Any] = {
         "Ts_energy": {
             "A_if": A_if,
@@ -354,6 +385,29 @@ def _build_Ts_row(
                 "Ts": Ts_cur,
                 "Tl_if": Tl_cur,
                 "mpp": mpp_cur,
+            },
+            "enthalpy_split": {
+                "h_g_if": h_g_if,
+                "h_l_if": h_l_if,
+                "Lv_eff": Lv_eff,
+                "q_cond_g_area": q_cond_g_area,
+                "q_cond_l_area": q_cond_l_area,
+                "q_diff_g_area": q_diff_g_area,
+                "q_diff_l_area": q_diff_l_area,
+                "q_total_g_area": q_tot_g_area,
+                "q_total_l_area": q_tot_l_area,
+                "q_cond_g_pow": q_cond_g_pow,
+                "q_cond_l_pow": q_cond_l_pow,
+                "q_diff_g_pow": q_diff_g_pow,
+                "q_diff_l_pow": q_diff_l_pow,
+                "q_total_g_pow": q_tot_g_pow,
+                "q_total_l_pow": q_tot_l_pow,
+                "q_lat_old_pow": q_lat,
+                "q_lat_eff_pow": q_lat_eff_pow,
+                "latent_mismatch_pow": latent_mismatch_pow,
+                "balance_old_pow": q_g + q_l - q_lat,
+                "balance_eff_pow": q_g + q_l - q_lat_eff_pow,
+                "units": {"area": "W/m^2", "pow": "W"},
             },
         }
     }

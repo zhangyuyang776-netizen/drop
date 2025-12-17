@@ -49,6 +49,7 @@ def build_props_from_state(
     cp_g = gas_core["cp_g"]
     k_g = gas_core["k_g"]
     D_g = gas_core.get("D_g", None)
+    h_g = cp_g * state.Tg  # (Ng,) J/kg
 
     if liq_model is not None:
         Ns_l = len(liq_model.liq_names)
@@ -59,6 +60,7 @@ def build_props_from_state(
         cp_l = liq_core["cp_l"]
         k_l = liq_core["k_l"]
         D_l = None
+        h_l = cp_l * state.Tl  # (Nl,) J/kg
     else:
         Ns_l = state.Yl.shape[0]
         rho_l = np.zeros(Nl, dtype=np.float64)
@@ -66,12 +68,15 @@ def build_props_from_state(
         k_l = np.zeros(Nl, dtype=np.float64)
         D_l = None
         liq_extra = {}
+        h_l = np.zeros(Nl, dtype=np.float64)
 
     props = Props(
         rho_g=rho_g,
         cp_g=cp_g,
         k_g=k_g,
         D_g=D_g,
+        h_g=h_g,
+        h_l=h_l,
         rho_l=rho_l,
         cp_l=cp_l,
         k_l=k_l,

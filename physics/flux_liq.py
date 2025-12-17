@@ -8,6 +8,7 @@ Scope:
 - Only liquid faces (f <= iface_f) are populated.
 - Center face (r=0) and interface face use zero-flux placeholders.
 - No interface coupling or state mutation here.
+- This is only the conductive component q_cond; enthalpy diffusion q_diff will be handled via physics/energy_flux.py.
 """
 
 from __future__ import annotations
