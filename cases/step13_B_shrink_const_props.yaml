@@ -26,7 +26,7 @@ physics:
   include_chemistry: false
 
   solve_Tg: true
-  solve_Yg: false
+  solve_Yg: true  # Changed from false: allow gas composition to evolve for evaporation
   solve_Tl: true
   solve_Yl: false
   include_Ts: false
