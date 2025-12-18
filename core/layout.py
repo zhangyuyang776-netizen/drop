@@ -12,7 +12,7 @@ Principles:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Mapping, Optional, Tuple
+from typing import Dict, List, Mapping, Optional, Set, Tuple
 
 import numpy as np
 
@@ -111,11 +111,22 @@ class UnknownLayout:
         sl = self.require_block("Rd")
         return sl.start
 
-def _build_species_mapping(full: List[str], closure: Optional[str]):
+
+def _build_species_mapping(full: List[str], closure: Optional[str], active: Optional[Set[str]] = None):
+    """
+    Map mechanism-ordered full species list to reduced indices.
+
+    active=None: all species except closure are active (backward compatible)
+    active=set(...): only names in active become reduced unknowns; others map to None
+    """
     if len(full) != len(set(full)):
         raise ValueError(f"Duplicate species names in list: {full}")
     if closure is not None and closure not in full:
         raise ValueError(f"Closure species '{closure}' not found in species list {full}")
+    if active is not None:
+        missing = [name for name in active if name not in full]
+        if missing:
+            raise ValueError(f"Active species not present in full list: {missing}")
 
     reduced: List[str] = []
     reduced_to_full_idx: List[int] = []
@@ -126,6 +137,9 @@ def _build_species_mapping(full: List[str], closure: Optional[str]):
         if closure is not None and name == closure:
             full_to_reduced[name] = None
             closure_idx = i_full
+            continue
+        if active is not None and name not in active:
+            full_to_reduced[name] = None
             continue
         k_red = len(reduced)
         reduced.append(name)
@@ -148,10 +162,52 @@ def build_layout(cfg: CaseConfig, grid: Grid1D) -> UnknownLayout:
     gas_full = list(cfg.species.gas_species)
     if not gas_full:
         raise ValueError("cfg.species.gas_species is empty. Preprocess must load mechanism and fill it.")
+    mode = getattr(cfg.species, "solve_gas_mode", "all_minus_closure")
     gas_closure = cfg.species.gas_balance_species
+
+    if mode == "all_minus_closure":
+        gas_active: Set[str] = set(gas_full)
+        gas_active.discard(gas_closure)
+    elif mode == "condensables_only":
+        l_name = cfg.species.liq_balance_species
+        g_map = cfg.species.liq2gas_map
+        if l_name not in g_map:
+            raise ValueError(f"liq_balance_species '{l_name}' not found in liq2gas_map {g_map}")
+        g_name = g_map[l_name]
+        if g_name == gas_closure:
+            raise ValueError("Condensable species cannot be closure species")
+        gas_active = {g_name}
+    elif mode == "explicit_list":
+        names = list(getattr(cfg.species, "solve_gas_species", []))
+        if not names:
+            raise ValueError("solve_gas_species is empty for explicit_list")
+        gas_active = set(names)
+        if gas_closure in gas_active:
+            raise ValueError("closure species cannot be solved explicitly")
+        missing = [s for s in gas_active if s not in gas_full]
+        if missing:
+            raise ValueError(f"explicit gas species not in mechanism list: {missing}")
+    else:
+        raise ValueError(f"Unknown solve_gas_mode: {mode}")
+
     gas_reduced, gas_full_to_reduced, gas_reduced_to_full_idx, gas_closure_idx = _build_species_mapping(
-        gas_full, gas_closure
+        gas_full, gas_closure, active=gas_active
     )
+
+    if mode == "condensables_only" and len(gas_reduced) != 1:
+        raise ValueError(
+            f"condensables_only mode expected 1 active species, got {len(gas_reduced)} (full={gas_full})"
+        )
+    if mode == "all_minus_closure":
+        expected = len(gas_full) - (1 if gas_closure is not None else 0)
+        if len(gas_reduced) != expected:
+            raise ValueError(
+                f"all_minus_closure mode expected {expected} active species, got {len(gas_reduced)} (full={gas_full})"
+            )
+    if mode == "explicit_list" and len(gas_reduced) != len(gas_active):
+        raise ValueError(
+            f"explicit_list mode expected {len(gas_active)} active species, got {len(gas_reduced)}"
+        )
 
     liq_full = list(cfg.species.liq_species)
     liq_closure = cfg.species.liq_balance_species
@@ -398,11 +454,8 @@ def _reconstruct_closure(
         return
     if Y_full.shape[0] <= closure_idx:
         raise ValueError(f"{phase} closure index {closure_idx} out of bounds for shape {Y_full.shape}")
-    if reduced_to_full_idx:
-        sum_reduced = np.sum(Y_full[reduced_to_full_idx, :], axis=0)
-    else:
-        sum_reduced = np.zeros(Y_full.shape[1], dtype=Y_full.dtype)
-    closure = 1.0 - sum_reduced
+    sum_other = np.sum(Y_full, axis=0) - Y_full[closure_idx, :]
+    closure = 1.0 - sum_other
 
     if np.any(closure < -tol):
         raise ValueError(

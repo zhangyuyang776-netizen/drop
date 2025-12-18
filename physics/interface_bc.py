@@ -202,6 +202,8 @@ def build_interface_coeffs(
             layout=layout,
             cfg=cfg,
             eq_result=eq_result,
+            il_global=il_global,
+            il_local=il_local,
             ig_global=ig_global,
             ig_local=ig_local,
             iface_f=iface_f,
@@ -359,7 +361,7 @@ def _build_Ts_row(
     q_tot_l_pow = q_tot_l_area * A_if
 
     Lv_eff = h_g_if - h_l_if
-    q_lat_eff_pow = mpp_cur * Lv_eff * A_if
+    q_lat_eff_pow = q_diff_g_pow - q_diff_l_pow
     latent_mismatch_pow = q_lat - q_lat_eff_pow
 
     diag_update: Dict[str, Any] = {
@@ -415,6 +417,8 @@ def _build_Ts_row(
     return InterfaceRow(row=idx_Ts, cols=cols, vals=vals, rhs=rhs), diag_update
 
 
+
+
 def _build_mpp_row(
     grid: Grid1D,
     state: State,
@@ -422,25 +426,30 @@ def _build_mpp_row(
     layout: UnknownLayout,
     cfg: CaseConfig,
     eq_result: EqResultLike,
+    il_global: int,
+    il_local: int,
     ig_global: int,
     ig_local: int,
     iface_f: int,
     idx_mpp: int,
 ) -> Tuple[InterfaceRow, Dict[str, Any]]:
     """
-    Build mpp interface mass-balance row (single-condensable Stefan-like condition).
+    Build mpp interface mass-balance row using multicomponent Raoult equilibrium.
 
-    Simplified form (single condensable, ignore convective Stefan term):
-
-        J_cond · n - mpp = 0
-
-    with
-        J_cond ≈ -rho_g * D_cond * (Yg_cond,cell - Yg_cond,eq) / dr_g
+    Steps (Step16.2):
+    1) j_raw = -rho_g * D_i/dr_g * (Yg_cell_i - Yg_eq_i)
+    2) j_corr = j_raw - Yg_eq * sum(j_raw)  (enforce sum j = 0)
+    3) mpp = j_corr_b / (Yl_b - Yg_eq_b) using balance species b
+    4) J_i = mpp * Yg_eq_i + j_corr_i (diagnostics; sum J = mpp)
+    5) Linear row couples all reduced Yg (closure eliminated) + mpp.
     """
     if eq_result is None or "Yg_eq" not in eq_result:
         logger.error("mpp equation requires eq_result with 'Yg_eq'.")
         raise ValueError("eq_result with 'Yg_eq' is required for mpp equation.")
-    Yg_eq = np.asarray(eq_result["Yg_eq"], dtype=np.float64)
+    Yg_eq_full = np.asarray(eq_result["Yg_eq"], dtype=np.float64)
+    Ns_g = Yg_eq_full.shape[0]
+    if Ns_g == 0:
+        raise ValueError("eq_result['Yg_eq'] is empty; cannot build mpp row.")
 
     A_if = float(grid.A_f[iface_f])  # diagnostic only
     r_if = float(grid.r_f[iface_f])
@@ -450,56 +459,100 @@ def _build_mpp_row(
         raise ValueError(f"Gas-side spacing must be positive: dr_g={dr_g}")
 
     rho_g = float(props.rho_g[ig_local])
+    bal = _get_balance_species_indices(cfg, layout)
+    k_b_full = bal["k_g_full"]
+    k_b_red = bal["k_g_red"]
+    g_name = bal["g_name"]
+    l_name = bal["l_name"]
 
-    k_full, k_red, g_name = _get_condensable_indices(cfg, layout)
-    if Yg_eq.shape[0] <= k_full:
-        raise ValueError(f"eq_result['Yg_eq'] too short for species index {k_full}")
-    D_cond = _get_gas_diffusivity(props, cfg, k_full, ig_local)
+    if Yg_eq_full.shape[0] <= k_b_full:
+        raise ValueError(f"eq_result['Yg_eq'] too short for species index {k_b_full}")
+    if state.Yg.shape[0] < Ns_g:
+        raise ValueError(f"state.Yg has {state.Yg.shape[0]} species, expected at least {Ns_g}")
 
-    Yg_cell_cond = float(state.Yg[k_full, ig_local])
-    Yg_eq_cond = float(Yg_eq[k_full])
+    D_full = _get_gas_diffusivity_vec(props, cfg, ig_local=ig_local, Ns_g=Ns_g)
+    alpha = rho_g * D_full / dr_g
 
-    coeff_Yg = -rho_g * D_cond / dr_g
-    coeff_mpp = -1.0
+    Yg_cell_full = np.asarray(state.Yg[:, ig_local], dtype=np.float64).reshape(Ns_g)
+    Yl_b = float(state.Yl[bal["k_l_full"], il_local])
+    Yg_eq_b = float(Yg_eq_full[k_b_full])
 
-    # Check if Yg is in layout (coupled) or fixed (explicit)
-    if layout.has_block("Yg"):
-        # Fully coupled: Yg is an unknown
-        idx_Yg = layout.idx_Yg(k_red, ig_local)
-        cols = [idx_Yg, idx_mpp]
-        vals = [coeff_Yg, coeff_mpp]
-        rhs = -rho_g * D_cond * Yg_eq_cond / dr_g
+    # 1) raw and corrected diffusive fluxes (per-area, +r outward)
+    j_raw = -alpha * (Yg_cell_full - Yg_eq_full)
+    j_sum = float(np.sum(j_raw))
+    j_corr = j_raw - Yg_eq_full * j_sum
+
+    # 2) mpp from balance species
+    delta_Y = Yl_b - Yg_eq_b
+    eps_delta = 1e-14
+    if abs(delta_Y) < eps_delta:
+        mpp_cur = 0.0
     else:
-        # Gauss-Seidel split: Yg fixed at old value
-        cols = [idx_mpp]
-        vals = [coeff_mpp]
-        rhs = rho_g * D_cond * (Yg_cell_cond - Yg_eq_cond) / dr_g  # explicit Yg, Newton RHS: -R = -J_cond
+        mpp_cur = float(j_corr[k_b_full] / delta_Y)
 
-    mpp_cur = float(state.mpp)
-    J_cond_cur = -rho_g * D_cond * (Yg_cell_cond - Yg_eq_cond) / dr_g
-    R_cur = J_cond_cur - mpp_cur
+    # 3) total species fluxes for diagnostics
+    J_full = mpp_cur * Yg_eq_full + j_corr
+
+    # Linearization coefficients for j_corr_b vs reduced Yg (closure eliminated)
+    k_cl = layout.gas_closure_index
+    if k_cl is None:
+        raise ValueError("gas_closure_index missing in layout; required to eliminate closure species.")
+
+    a_full = Yg_eq_b * alpha.copy()
+    a_full[k_b_full] = alpha[k_b_full] * (Yg_eq_b - 1.0)
+    S_eq = float(np.sum(alpha * Yg_eq_full))
+    const_j = alpha[k_b_full] * Yg_eq_b - Yg_eq_b * S_eq
+    const2 = const_j + a_full[k_cl]
+
+    cols: List[int] = []
+    vals: List[float] = []
+
+    if abs(delta_Y) < eps_delta:
+        # Degenerate: enforce mpp = 0 directly
+        rhs = 0.0
+        cols.append(idx_mpp)
+        vals.append(1.0)
+    else:
+        coeff_mpp = delta_Y
+        rhs = const2
+        if layout.has_block("Yg"):
+            for k_red in range(layout.Ns_g_eff):
+                k_full = layout.gas_reduced_to_full_idx[k_red]
+                coeff_Yg = -(a_full[k_full] - a_full[k_cl])
+                cols.append(layout.idx_Yg(k_red, ig_local))
+                vals.append(coeff_Yg)
+        else:
+            # Explicit Yg: move contribution to RHS using current state
+            for k_red in range(layout.Ns_g_eff):
+                k_full = layout.gas_reduced_to_full_idx[k_red]
+                rhs -= -(a_full[k_full] - a_full[k_cl]) * float(Yg_cell_full[k_full])
+
+        cols.append(idx_mpp)
+        vals.append(coeff_mpp)
 
     diag_update: Dict[str, Any] = {
-        "mpp_mass": {
-            "rho_g": rho_g,
-            "D_cond": D_cond,
+        "evaporation": {
+            "balance_liq": l_name,
+            "balance_gas": g_name,
+            "k_b_full": k_b_full,
+            "k_b_red": k_b_red,
+            "k_closure_full": k_cl,
             "dr_g": dr_g,
-            "k_full": k_full,
-            "k_red": k_red,
-            "species": g_name,
-            "Yg_cell": Yg_cell_cond,
-            "Yg_eq": Yg_eq_cond,
-            "J_cond": J_cond_cur,
-            "mpp": mpp_cur,
-            "residual": R_cur,
-            "coeffs": {"Yg": coeff_Yg, "mpp": coeff_mpp},
-            "rhs": rhs,
+            "rho_g": rho_g,
+            "DeltaY": delta_Y,
+            "j_sum": j_sum,
+            "j_raw_sum": float(j_raw.sum()),
+            "j_corr_sum": float(j_corr.sum()),
+            "mpp_eval": mpp_cur,
+            "sumJ_minus_mpp": float(J_full.sum() - mpp_cur),
             "A_if": A_if,
+            "Yg_eq_full": Yg_eq_full,
+            "j_corr_full": j_corr,
+            "J_full": J_full,
         }
     }
 
     return InterfaceRow(row=idx_mpp, cols=cols, vals=vals, rhs=rhs), diag_update
-
 
 def _get_latent_heat(props: Props, cfg: CaseConfig) -> float:
     """Resolve latent heat L_v; prefer props if available, else cfg fallback."""
@@ -523,16 +576,15 @@ def _get_latent_heat(props: Props, cfg: CaseConfig) -> float:
     raise ValueError("Latent heat L_v not provided in props or cfg.physics.latent_heat_default.")
 
 
-def _get_condensable_indices(
+def _get_balance_species_indices(
     cfg: CaseConfig,
     layout: UnknownLayout,
-) -> Tuple[int, int, str]:
+) -> Dict[str, Any]:
     """
-    Return (k_cond_full, k_cond_red, gas_name) for the single condensable species.
+    Return indices/names for the liquid balance species and its gas counterpart.
 
-    k_cond_full : index in full gas species list (State.Yg / Props.D_g first axis)
-    k_cond_red  : reduced-species index used in UnknownLayout Yg block
-    gas_name    : gas species name (for diagnostics)
+    Returns dict with:
+        l_name, g_name, k_l_full, k_g_full, k_g_red (may be None if closure)
     """
     l_name = cfg.species.liq_balance_species
     g_map = cfg.species.liq2gas_map
@@ -540,16 +592,23 @@ def _get_condensable_indices(
         raise ValueError(f"liq_balance_species '{l_name}' not found in liq2gas_map {g_map}")
     g_name = g_map[l_name]
 
-    gas_full = layout.gas_species_full
-    if g_name not in gas_full:
-        raise ValueError(f"Condensable gas species '{g_name}' not found in gas_species_full {gas_full}")
-    k_cond_full = gas_full.index(g_name)
+    if l_name not in layout.liq_species_full:
+        raise ValueError(f"Liquid balance species '{l_name}' not found in liq_species_full {layout.liq_species_full}")
+    k_l_full = layout.liq_species_full.index(l_name)
 
-    k_red = layout.gas_full_to_reduced.get(g_name)
-    if k_red is None:
-        raise ValueError(f"Condensable species '{g_name}' is configured as gas closure; cannot be condensable.")
+    if g_name not in layout.gas_species_full:
+        raise ValueError(f"Gas balance species '{g_name}' not found in gas_species_full {layout.gas_species_full}")
+    k_g_full = layout.gas_species_full.index(g_name)
 
-    return k_cond_full, k_red, g_name
+    k_g_red = layout.gas_full_to_reduced.get(g_name)
+
+    return {
+        "l_name": l_name,
+        "g_name": g_name,
+        "k_l_full": k_l_full,
+        "k_g_full": k_g_full,
+        "k_g_red": k_g_red,
+    }
 
 
 def _get_gas_diffusivity(
@@ -576,5 +635,34 @@ def _get_gas_diffusivity(
     D_default = getattr(cfg.physics, "default_D_g", None)
     if D_default is not None:
         return float(D_default)
+
+    raise ValueError("No D_g available in props and cfg.physics.default_D_g missing.")
+
+
+def _get_gas_diffusivity_vec(
+    props: Props,
+    cfg: CaseConfig,
+    ig_local: int,
+    Ns_g: int,
+) -> np.ndarray:
+    """
+    Return D_g vector (Ns_g,) at gas cell ig_local; prefer props.D_g.
+    """
+    if props.D_g is not None:
+        if props.D_g.shape[0] < Ns_g or props.D_g.shape[1] <= ig_local:
+            raise ValueError(
+                f"D_g shape {props.D_g.shape} too small for Ns_g={Ns_g} or cell {ig_local}"
+            )
+        D_vec = np.asarray(props.D_g[:Ns_g, ig_local], dtype=np.float64)
+        if np.any(D_vec <= 0.0):
+            raise ValueError(f"D_g contains non-positive entries at cell {ig_local}: {D_vec}")
+        return D_vec
+
+    D_default = getattr(cfg.physics, "default_D_g", None)
+    if D_default is not None:
+        val = float(D_default)
+        if val <= 0.0:
+            raise ValueError(f"default_D_g must be positive, got {val}")
+        return np.full((Ns_g,), val, dtype=np.float64)
 
     raise ValueError("No D_g available in props and cfg.physics.default_D_g missing.")

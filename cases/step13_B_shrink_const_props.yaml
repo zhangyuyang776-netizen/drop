@@ -26,7 +26,7 @@ physics:
   include_chemistry: false
 
   solve_Tg: true
-  solve_Yg: true  # Changed from false: allow gas composition to evolve for evaporation
+  solve_Yg: false
   solve_Tl: true
   solve_Yl: false
   include_Ts: false
@@ -50,6 +50,8 @@ physics:
 species:
   gas_balance_species: "N2"
   gas_mechanism_phase: "gas"
+  solve_gas_mode: "all_minus_closure"
+  solve_gas_species: []
   gas_species: []          # filled from mechanism if empty
   liq_species: ["n-Dodecane"]
   liq_balance_species: "n-Dodecane"

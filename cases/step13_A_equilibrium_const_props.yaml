@@ -50,6 +50,8 @@ physics:
 species:
   gas_balance_species: "N2"
   gas_mechanism_phase: "gas"
+  solve_gas_mode: "all_minus_closure"
+  solve_gas_species: []
   gas_species: []          # will be filled from mechanism if empty
   liq_species: ["n-Dodecane"]
   liq_balance_species: "n-Dodecane"

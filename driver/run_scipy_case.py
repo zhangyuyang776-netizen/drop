@@ -47,9 +47,9 @@ from core.types import (
     Grid1D,
     State,
 )
-from properties.aggregator import build_props_from_state
-from properties.gas import GasPropertiesModel, build_gas_model
-from properties.liquid import LiquidPropertiesModel, build_liquid_model
+from properties.compute_props import compute_props, get_or_build_models
+from properties.gas import GasPropertiesModel
+from properties.liquid import LiquidPropertiesModel
 from solvers.timestepper import StepResult, advance_one_step_scipy
 
 logger = logging.getLogger(__name__)
@@ -130,12 +130,19 @@ def _load_case_config(cfg_path: str) -> CaseConfig:
         gas_balance_species=species_raw["gas_balance_species"],
         gas_mechanism_phase=species_raw.get("gas_mechanism_phase", "gas"),
         gas_species=list(species_raw.get("gas_species", [])),
+        solve_gas_mode=species_raw.get("solve_gas_mode", "all_minus_closure"),
+        solve_gas_species=list(species_raw.get("solve_gas_species", [])),
         liq_species=list(species_raw.get("liq_species", [])),
         liq_balance_species=species_raw["liq_balance_species"],
         liq2gas_map=species_raw.get("liq2gas_map", {}),
         mw_kg_per_mol=species_raw.get("mw_kg_per_mol", {}),
         molar_volume_cm3_per_mol=species_raw.get("molar_volume_cm3_per_mol", {}),
     )
+    allowed_modes = {"all_minus_closure", "condensables_only", "explicit_list"}
+    if species_cfg.solve_gas_mode not in allowed_modes:
+        raise ValueError(f"solve_gas_mode must be one of {sorted(allowed_modes)}, got {species_cfg.solve_gas_mode}")
+    if species_cfg.solve_gas_mode == "explicit_list" and not species_cfg.solve_gas_species:
+        raise ValueError("solve_gas_species cannot be empty when solve_gas_mode='explicit_list'")
 
     mesh_raw = raw["geometry"]["mesh"]
     mesh_cfg = CaseMesh(
@@ -449,18 +456,14 @@ def run_case(cfg_path: str, *, max_steps: Optional[int] = None, log_level: int |
         run_dir = _prepare_run_dir(cfg, cfg_path)
         logger.info("Run directory: %s", run_dir)
 
-        gas_model = build_gas_model(cfg)
+        gas_model, liq_model = get_or_build_models(cfg)
         _maybe_fill_gas_species(cfg, gas_model)
 
         grid = build_grid(cfg)
         layout = build_layout(cfg, grid)
 
-        liq_model: Optional[LiquidPropertiesModel] = None
-        if cfg.physics.enable_liquid:
-            liq_model = build_liquid_model(cfg)
-
         state = _build_initial_state(cfg, grid, gas_model, liq_model)
-        props, _ = build_props_from_state(cfg, grid, state, gas_model, liq_model)
+        props, _ = compute_props(cfg, grid, state)
 
         t = float(cfg.time.t0)
         step_id = 0

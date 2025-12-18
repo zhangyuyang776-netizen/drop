@@ -15,12 +15,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Mapping, Optional, Tuple
+from typing import List, Literal, Mapping, Optional, Tuple
 
 import numpy as np
 from numpy.typing import NDArray
 
 FloatArray = NDArray[np.float64]
+
+GasSolveMode = Literal["all_minus_closure", "condensables_only", "explicit_list"]
 
 
 @dataclass(slots=True)
@@ -68,6 +70,12 @@ class CaseSpecies:
     gas_balance_species: str
     gas_mechanism_phase: str = "gas"
     gas_species: List[str] = field(default_factory=list)
+    # Gas solve mode:
+    # - all_minus_closure: solve every gas species except gas_balance_species
+    # - condensables_only: solve only liq_balance_species mapped via liq2gas_map
+    # - explicit_list: solve only solve_gas_species (closure still excluded)
+    solve_gas_mode: GasSolveMode = "all_minus_closure"
+    solve_gas_species: List[str] = field(default_factory=list)  # used when solve_gas_mode == "explicit_list"
     liq_species: List[str] = field(default_factory=list)
     liq_balance_species: str = ""
     liq2gas_map: Mapping[str, str] = field(default_factory=dict)
@@ -79,6 +87,11 @@ class CaseSpecies:
             raise ValueError("gas_balance_species must be provided.")
         if not self.liq_balance_species:
             raise ValueError("liq_balance_species must be provided.")
+        allowed_modes = {"all_minus_closure", "condensables_only", "explicit_list"}
+        if self.solve_gas_mode not in allowed_modes:
+            raise ValueError(f"solve_gas_mode must be one of {sorted(allowed_modes)}, got {self.solve_gas_mode}")
+        if self.solve_gas_mode == "explicit_list" and not self.solve_gas_species:
+            raise ValueError("solve_gas_species must be provided when solve_gas_mode='explicit_list'")
         if self.liq_balance_species not in self.liq_species:
             raise ValueError(
                 f"liq_balance_species '{self.liq_balance_species}' must be included in liq_species {self.liq_species}"
@@ -183,9 +196,11 @@ class CasePhysics:
     include_Ts: bool = False
     include_mpp: bool = True
     include_Rd: bool = True
+    latent_heat_default: Optional[float] = None  # J/kg fallback if props do not provide Lv
 
     # derived fields (not in UnknownLayout)
     stefan_velocity: bool = True
+    species_convection: bool = False
 
     interface: CaseInterface = field(default_factory=CaseInterface)
 
@@ -195,6 +210,13 @@ class CasePhysics:
         if self.include_chemistry:
             raise ValueError("NoChem stage: include_chemistry must be False.")
             
+@dataclass(slots=True)
+class CaseTransport:
+    """Transport defaults/overrides."""
+
+    D_l_const: float = 1.0e-9
+    D_l_species: Mapping[str, float] = field(default_factory=dict)
+
 @dataclass(slots=True)
 class CaseInitial:
     """Initial/farfield conditions."""
@@ -271,6 +293,7 @@ class CaseConfig:
     petsc: CasePETSc
     io: CaseIO
     checks: CaseChecks
+    transport: CaseTransport = field(default_factory=CaseTransport)
 
     def __post_init__(self) -> None:
         if not isinstance(self.conventions, CaseConventions):
@@ -279,6 +302,8 @@ class CaseConfig:
             raise TypeError("species must be CaseSpecies (loader must build dataclass).")
         if not isinstance(self.physics, CasePhysics):
             raise TypeError("physics must be CasePhysics (loader must build dataclass).")
+        if not isinstance(self.transport, CaseTransport):
+            raise TypeError("transport must be CaseTransport (loader must build dataclass).")
         if self.conventions.gas_closure_species != self.species.gas_balance_species:
             raise ValueError(
                 f"gas closure species mismatch: conventions='{self.conventions.gas_closure_species}' "
@@ -421,12 +446,15 @@ class Props:
     k_g: FloatArray
     D_g: Optional[FloatArray] = None  # expected shape: (Nspec_g, Ng)
     h_g: Optional[FloatArray] = None  # (Ng,) J/kg
+    h_gk: Optional[FloatArray] = None  # (Ns_g, Ng) J/kg
     h_l: Optional[FloatArray] = None  # (Nl,) J/kg
 
     rho_l: FloatArray = field(default_factory=lambda: np.zeros(0, dtype=np.float64))
     cp_l: FloatArray = field(default_factory=lambda: np.zeros(0, dtype=np.float64))
     k_l: FloatArray = field(default_factory=lambda: np.zeros(0, dtype=np.float64))
     D_l: Optional[FloatArray] = None  # expected shape: (Nspec_l, Nl)
+    psat_l: Optional[FloatArray] = None  # (Ns_l,) Pa
+    hvap_l: Optional[FloatArray] = None  # (Ns_l,) J/kg
 
     def validate_shapes(self, grid: Grid1D, Ns_g: int, Ns_l: int) -> None:
         """Ensure property arrays match grid and species counts."""
@@ -440,6 +468,8 @@ class Props:
             raise ValueError(f"D_g shape {self.D_g.shape} != ({Ns_g}, {grid.Ng})")
         if self.h_g is not None and self.h_g.shape != (grid.Ng,):
             raise ValueError(f"h_g shape {self.h_g.shape} != ({grid.Ng},)")
+        if self.h_gk is not None and self.h_gk.shape != (Ns_g, grid.Ng):
+            raise ValueError(f"h_gk shape {self.h_gk.shape} != ({Ns_g}, {grid.Ng})")
 
         if self.rho_l.shape != (grid.Nl,):
             raise ValueError(f"rho_l shape {self.rho_l.shape} != ({grid.Nl},)")
@@ -451,6 +481,10 @@ class Props:
             raise ValueError(f"D_l shape {self.D_l.shape} != ({Ns_l}, {grid.Nl})")
         if self.h_l is not None and self.h_l.shape != (grid.Nl,):
             raise ValueError(f"h_l shape {self.h_l.shape} != ({grid.Nl},)")
+        if self.psat_l is not None and self.psat_l.shape != (Ns_l,):
+            raise ValueError(f"psat_l shape {self.psat_l.shape} != ({Ns_l},)")
+        if self.hvap_l is not None and self.hvap_l.shape != (Ns_l,):
+            raise ValueError(f"hvap_l shape {self.hvap_l.shape} != ({Ns_l},)")
 
 
 @dataclass(slots=True)

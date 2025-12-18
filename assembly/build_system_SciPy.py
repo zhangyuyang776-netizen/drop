@@ -42,6 +42,8 @@ from physics.interface_bc import build_interface_coeffs, EqResultLike
 from physics.radius_eq import build_radius_row
 from physics.interface_bc import InterfaceCoeffs  # type hint only
 from physics.radius_eq import RadiusCoeffs  # type hint only
+from assembly.build_species_system_SciPy import build_gas_species_system_global
+from assembly.build_liquid_species_system_SciPy import build_liquid_species_system
 
 
 def _apply_center_bc_Tg(A: np.ndarray, row: int, coeff: float, col_neighbor: int) -> None:
@@ -142,6 +144,7 @@ def build_transport_system(
     if state_guess is None:
         state_guess = state_old
 
+    phys = cfg.physics
     Ng = grid.Ng
     Nc = grid.Nc
     N = layout.n_dof()
@@ -175,15 +178,37 @@ def build_transport_system(
             aP += coeff
             A[row, layout.idx_Tg(ig - 1)] += -coeff
         else:
-            if Ng > 1:
-                rC = grid.r_c[cell_idx]
-                rR = grid.r_c[cell_idx + 1]
-                A_f = float(grid.A_f[cell_idx])
-                dr = rR - rC
-                k_face = 0.5 * (k_i + float(props.k_g[ig + 1]))
-                coeff = k_face * A_f / dr
-                _apply_center_bc_Tg(A, row, coeff, layout.idx_Tg(ig + 1))
-                aP += coeff
+            # Interface coupling (gas-side conduction to Ts or Ts_fixed)
+            iface_f = grid.iface_f
+            A_if = float(grid.A_f[iface_f])
+            dr_if = float(grid.r_c[cell_idx] - grid.r_f[iface_f])
+            if dr_if <= 0.0:
+                raise ValueError("Non-positive gas-side spacing at interface for Tg coupling.")
+            k_face = float(props.k_g[0])
+            coeff_if = k_face * A_if / dr_if
+
+            aP += coeff_if
+            Ts_used = "unknown"
+            Ts_val = float(state_old.Ts)
+            if phys.include_Ts and layout.has_block("Ts"):
+                A[row, layout.idx_Ts()] += -coeff_if
+            else:
+                Ts_bc = float(state_old.Ts)
+                if getattr(cfg.physics, "interface", None) is not None:
+                    if getattr(cfg.physics.interface, "bc_mode", "") == "Ts_fixed":
+                        Ts_bc = float(getattr(cfg.physics.interface, "Ts_fixed", Ts_bc))
+                b_i += coeff_if * Ts_bc
+                Ts_used = "fixed"
+                Ts_val = Ts_bc
+            diag_sys.setdefault("gas", {})["Tg_interface_coupling"] = {
+                "coeff_if": float(coeff_if),
+                "dr_if": float(dr_if),
+                "A_if": float(A_if),
+                "k_face": float(k_face),
+                "Tg0_old": float(state_old.Tg[0]),
+                "Ts_used": Ts_used,
+                "Ts_value": float(Ts_val),
+            }
 
         # Right face (ig+1/2)
         if ig < Ng - 1:
@@ -210,6 +235,10 @@ def build_transport_system(
         Tg=state_old.Tg,  # explicit in time
         u_face=u_face,
     )
+
+    # Placeholder for interface diagnostics (filled later if interface BC built)
+    iface_coeffs = None
+    iface_evap = None
 
     # Add explicit convective source to RHS: b[row] -= (A_R*q_R - A_L*q_L)
     for ig in range(Ng):
@@ -251,6 +280,27 @@ def build_transport_system(
                 col_global = layout.idx_Tl(il2)
                 A[row_global, col_global] += A_l[il, il2]
             b[row_global] += b_l[il]
+        # Interface coupling: add conduction to Ts (or Ts_fixed if Ts not solved)
+        il_last = Nl - 1
+        row_last = layout.idx_Tl(il_last)
+        iface_f = grid.iface_f
+        r_if = float(grid.r_f[iface_f])
+        r_last = float(grid.r_c[il_last])
+        dr_if = r_if - r_last
+        if dr_if <= 0.0:
+            raise ValueError("Non-positive liquid-side spacing at interface for Tl coupling.")
+        A_if = float(grid.A_f[iface_f])
+        k_last = float(props.k_l[il_last])
+        coeff_if = k_last * A_if / dr_if
+        A[row_last, row_last] += coeff_if
+        if phys.include_Ts and layout.has_block("Ts"):
+            A[row_last, layout.idx_Ts()] += -coeff_if
+        else:
+            Ts_bc = float(state_old.Ts)
+            if getattr(cfg.physics, "interface", None) is not None:
+                if getattr(cfg.physics.interface, "bc_mode", "") == "Ts_fixed":
+                    Ts_bc = float(getattr(cfg.physics.interface, "Ts_fixed", Ts_bc))
+            b[row_last] += coeff_if * Ts_bc
 
     # --- Interface equations: Ts energy jump + mpp Stefan (single-condensable) ---
     phys = cfg.physics
@@ -267,6 +317,34 @@ def build_transport_system(
         )
         _scatter_interface_rows(A, b, iface_coeffs)
         diag_sys.update(iface_coeffs.diag)
+        iface_evap = iface_coeffs.diag.get("evaporation")
+
+        # Interface enthalpy flux contribution to gas energy (optional, MVP)
+        if iface_evap is not None and state_old.Tg.size > 0:
+            iface_f = grid.iface_f
+            A_if = float(grid.A_f[iface_f])
+            mpp_evap = float(iface_evap.get("mpp_eval", 0.0))
+            j_corr_full = np.asarray(iface_evap.get("j_corr_full", []), dtype=np.float64)
+            Yg_eq_full = np.asarray(iface_evap.get("Yg_eq_full", []), dtype=np.float64)
+            Ns_full = state_old.Yg.shape[0]
+            if j_corr_full.shape[0] != Ns_full and j_corr_full.size != 0:
+                raise ValueError("j_corr_full length mismatch for enthalpy flux injection.")
+            if Yg_eq_full.shape[0] != Ns_full and Yg_eq_full.size != 0:
+                raise ValueError("Yg_eq_full length mismatch for enthalpy flux injection.")
+
+            # Use gas enthalpy at first gas cell as interface approximation
+            h_mix_if = float(getattr(props, "h_g", np.array([0.0]))[0]) if getattr(props, "h_g", None) is not None else 0.0
+            if getattr(props, "h_gk", None) is not None and np.asarray(props.h_gk).shape[0] >= Ns_full:
+                h_k_if = np.asarray(props.h_gk[:Ns_full, 0], dtype=np.float64)
+            else:
+                h_k_if = np.zeros(Ns_full, dtype=np.float64)
+
+            q_iface = mpp_evap * h_mix_if
+            if j_corr_full.size:
+                q_iface += float(np.dot(h_k_if, j_corr_full))
+
+            row_Tg0 = layout.idx_Tg(0)
+            b[row_Tg0] -= A_if * q_iface
 
     # --- Radius evolution equation (Rd–mpp coupling) ---
     if phys.include_Rd and layout.has_block("Rd"):
@@ -281,6 +359,84 @@ def build_transport_system(
         )
         _scatter_radius_row(A, b, rad_coeffs)
         diag_sys.update(rad_coeffs.diag)
+
+    # --- Gas species equations: Yg (strongly coupled, Step 15.3) ---
+    if getattr(cfg.physics, "solve_Yg", False) and layout.has_block("Yg") and layout.Ns_g_eff > 0:
+        if phys.include_mpp and eq_result is None:
+            raise ValueError("Species assembly with include_mpp=True requires eq_result with 'Yg_eq'.")
+
+        if return_diag:
+            _, _, diag_y = build_gas_species_system_global(
+                cfg=cfg,
+                grid=grid,
+                layout=layout,
+                state_old=state_old,
+                props=props,
+                dt=dt,
+                eq_result=eq_result,
+                interface_evap=iface_evap,
+                A_out=A,
+                b_out=b,
+                return_diag=True,
+            )
+            diag_sys.setdefault("blocks", {})["Yg"] = diag_y
+        else:
+            build_gas_species_system_global(
+                cfg=cfg,
+                grid=grid,
+                layout=layout,
+                state_old=state_old,
+                props=props,
+                dt=dt,
+                eq_result=eq_result,
+                interface_evap=iface_evap,
+                A_out=A,
+                b_out=b,
+                return_diag=False,
+            )
+
+        # Sanity checks on Yg rows
+        test_row = layout.idx_Yg(0, 0)
+        if np.allclose(A[test_row, :], 0.0):
+            raise RuntimeError("Yg block present but species assembly produced an all-zero row (k=0, ig=0).")
+        ig_bc = grid.Ng - 1
+        row_bc = layout.idx_Yg(0, ig_bc)
+        row_vals = A[row_bc, :]
+        if not (np.isclose(row_vals[row_bc], 1.0) and np.allclose(np.delete(row_vals, row_bc), 0.0)):
+            raise RuntimeError("Outer Dirichlet row for Yg (k=0) is not an identity row.")
+
+    # --- Liquid species equations: Yl (explicit flux, implicit time) ---
+    if getattr(cfg.physics, "solve_Yl", False) and layout.has_block("Yl") and layout.Ns_l_eff > 0:
+        if props.D_l is None:
+            raise ValueError("solve_Yl=True requires props.D_l to be provided.")
+
+        if return_diag:
+            _, _, diag_yl = build_liquid_species_system(
+                cfg=cfg,
+                grid=grid,
+                layout=layout,
+                state_old=state_old,
+                props=props,
+                dt=dt,
+                interface_evap=iface_evap,
+                A_out=A,
+                b_out=b,
+                return_diag=True,
+            )
+            diag_sys.setdefault("blocks", {})["Yl"] = diag_yl
+        else:
+            build_liquid_species_system(
+                cfg=cfg,
+                grid=grid,
+                layout=layout,
+                state_old=state_old,
+                props=props,
+                dt=dt,
+                interface_evap=iface_evap,
+                A_out=A,
+                b_out=b,
+                return_diag=False,
+            )
 
     if return_diag:
         return A, b, diag_sys

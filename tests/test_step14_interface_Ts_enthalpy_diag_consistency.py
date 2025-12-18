@@ -51,7 +51,7 @@ def _make_cfg() -> CaseConfig:
     )
     physics = CasePhysics(include_Ts=True, include_mpp=True, include_Rd=False)
     # latent heat fallback for tests (overridden in one test)
-    setattr(physics, "latent_heat_default", 2.5e6)
+    physics.latent_heat_default = 2.5e6
     species = CaseSpecies(
         gas_balance_species="N2",
         gas_species=["N2", "H2O"],

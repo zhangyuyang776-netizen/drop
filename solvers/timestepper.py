@@ -1,18 +1,17 @@
 """
-Single-step timestepper (Step 12.2) using SciPy backend.
+Single-step timestepper (SciPy backend) with coupled Tg/Tl/Yg/Ts/mpp/Rd solve.
 
-Scope (current stage):
-- Stage 1: Advance Tg, Ts, mpp, Rd for one fixed dt using build_transport_system (SciPy).
-- Stage 2: Advance Tl via build_liquid_T_system_SciPy using the updated Ts (Gauss–Seidel split).
-- No Yg/Yl coupling yet.
-- No property recomputation inside this function (props treated as given).
+Current scope:
+- Assemble once via build_transport_system (already embeds Yg via global layout).
+- Use layout pack/apply to map between State and global unknown vector (no hand indexing).
+- Per-step property recomputation enabled (props are treated as given for the current step,
+  then recomputed from the updated state for the next step).
 - No grid remeshing for Rd changes.
 
 This module:
 - Delegates assembly to assembly.build_system_SciPy.build_transport_system.
-- Delegates liquid assembly to assembly.build_liquid_T_system_SciPy.build_liquid_T_system.
 - Delegates linear solve to solvers.scipy_linear.solve_linear_system_scipy.
-- Packs/unpacks state via UnknownLayout (no direct vector math elsewhere).
+- Packs/apply state via core.layout helpers.
 - Computes interface equilibrium per-step to supply eq_result for mpp equation.
 """
 
@@ -28,10 +27,10 @@ from typing import Any, Dict, Optional, Tuple
 import numpy as np
 
 from core.types import CaseConfig, Grid1D, Props, State
-from core.layout import UnknownLayout
+from core.layout import UnknownLayout, pack_state, apply_u_to_state
 from assembly.build_system_SciPy import build_transport_system
-from assembly.build_liquid_T_system_SciPy import build_liquid_T_system
 from properties.equilibrium import build_equilibrium_model, compute_interface_equilibrium
+from properties.compute_props import compute_props
 from physics.interface_bc import EqResultLike
 from solvers.scipy_linear import LinearSolveResult, solve_linear_system_scipy
 
@@ -89,10 +88,9 @@ def advance_one_step_scipy(
     t: float,
 ) -> StepResult:
     """
-    Advance (Tg, Ts, mpp, Rd) by one fixed dt using SciPy linear solver.
+    Advance coupled unknowns (Tg, Tl, Yg, Ts, mpp, Rd) by one fixed dt using SciPy linear solver.
 
-    Inputs state/props are treated as t^n; outputs are t^{n+1}.
-    Does not mutate input state/props.
+    Inputs state/props are treated as t^n; outputs are t^{n+1}. Does not mutate inputs.
     """
     dt = float(cfg.time.dt)
     if dt <= 0.0:
@@ -106,6 +104,7 @@ def advance_one_step_scipy(
     eq_result: EqResultLike = None
     if cfg.physics.include_mpp:
         eq_result = _build_eq_result_for_step(cfg=cfg, grid=grid, state=state_old, props=props_old)
+        eq_result = _complete_Yg_eq_with_closure(cfg=cfg, layout=layout, eq_result=eq_result)
 
     # initial nonlinear guess (MVP: old state)
     state_guess = state_old
@@ -132,8 +131,11 @@ def advance_one_step_scipy(
             message=f"assembly failed: {exc}",
         )
 
+    # Initial guess from current state (mainly for API symmetry; direct solver ignores it)
+    u0, _, _ = pack_state(state_old, layout)
+
     try:
-        lin_result: LinearSolveResult = solve_linear_system_scipy(A=A, b=b, cfg=cfg)
+        lin_result: LinearSolveResult = solve_linear_system_scipy(A=A, b=b, cfg=cfg, x0=u0)
     except Exception as exc:
         logger.exception("Linear solve raised an exception.")
         diag = _build_step_diagnostics_fail(t_old, t_new, dt, message=str(exc))
@@ -162,13 +164,14 @@ def advance_one_step_scipy(
             message=f"linear solve not converged: {lin_result.message}",
         )
 
-    state_new = _unpack_solution_to_state(
-        x=lin_result.x,
+    state_new = apply_u_to_state(
+        state=state_old,
+        u=lin_result.x,
         layout=layout,
-        grid=grid,
-        state_ref=state_old,
-        cfg=cfg,
+        tol_closure=float(cfg.checks.sumY_tol),
+        clip_negative_closure=False,
     )
+    _postprocess_species_bounds(cfg, layout, state_new)
 
     # --- Stage 2 removed: Tl is now solved in Stage 1 (coupled mode) ---
     # No separate liquid temperature solve needed
@@ -181,10 +184,35 @@ def advance_one_step_scipy(
         diag_sys=diag_sys,
         t_old=t_old,
         dt=dt,
+        layout=layout,
+        cfg=cfg,
+        grid=grid,
         liq_diag=liq_diag,
     )
 
-    sanity_msg = _sanity_check_step(cfg=cfg, grid=grid, state_new=state_new, props_new=props_old, diag=diag)
+    # Recompute properties based on the updated state (for use by the caller in the next step)
+    try:
+        props_new, extras_new = compute_props(cfg, grid, state_new)
+        try:
+            diag.extra = dict(diag.extra)
+            diag.extra["props_extra"] = extras_new
+        except Exception:
+            pass
+    except Exception as exc:
+        try:
+            diag.extra = dict(diag.extra)
+            diag.extra["props_error"] = {"type": type(exc).__name__, "message": str(exc)}
+        except Exception:
+            pass
+        return StepResult(
+            state_new=state_new,
+            props_new=props_old,
+            diag=diag,
+            success=False,
+            message=f"compute_props failed: {exc}",
+        )
+
+    sanity_msg = _sanity_check_step(cfg=cfg, grid=grid, state_new=state_new, props_new=props_new, diag=diag)
     if sanity_msg is not None:
         try:
             diag.extra = dict(diag.extra)
@@ -193,7 +221,7 @@ def advance_one_step_scipy(
             pass
         return StepResult(
             state_new=state_new,
-            props_new=props_old,
+            props_new=props_new,
             diag=diag,
             success=False,
             message=sanity_msg,
@@ -203,7 +231,7 @@ def advance_one_step_scipy(
 
     return StepResult(
         state_new=state_new,
-        props_new=props_old,
+        props_new=props_new,
         diag=diag,
         success=True,
         message=None,
@@ -248,40 +276,41 @@ def _assemble_transport_system_step12(
     return A, b, diag_sys
 
 
-def _unpack_solution_to_state(
-    x: np.ndarray,
-    layout: UnknownLayout,
-    grid: Grid1D,
-    state_ref: State,
-    cfg: CaseConfig,
-) -> State:
-    """Map solution vector back into a new State object."""
-    state_new = state_ref.copy()
+def _postprocess_species_bounds(cfg: CaseConfig, layout: UnknownLayout, state: State) -> None:
+    """Clamp/check gas species after apply_u_to_state; recompute closure from reduced species."""
+    if not layout.has_block("Yg") or layout.Ns_g_eff == 0:
+        return
+    clamp = bool(getattr(cfg.checks, "clamp_negative_Y", False))
+    min_Y = float(getattr(cfg.checks, "min_Y", 0.0))
+    tol = float(getattr(cfg.checks, "sumY_tol", 1e-10))
 
-    # Tg block
-    if layout.has_block("Tg"):
-        for ig in range(grid.Ng):
-            state_new.Tg[ig] = float(x[layout.idx_Tg(ig)])
+    # Clamp solved (reduced) species if requested
+    if clamp:
+        for k_red in range(layout.Ns_g_eff):
+            k_full = layout.gas_reduced_to_full_idx[k_red]
+            state.Yg[k_full, :] = np.maximum(state.Yg[k_full, :], min_Y)
+    else:
+        solved_full = [layout.gas_reduced_to_full_idx[k] for k in range(layout.Ns_g_eff)]
+        ymin = float(np.min(state.Yg[solved_full, :]))
+        ymax = float(np.max(state.Yg[solved_full, :]))
+        if ymin < -tol:
+            raise ValueError(f"Gas species below tolerance after solve (min={ymin:.3e}, tol={tol:.3e})")
+        if ymax > 1.0 + tol:
+            raise ValueError(f"Gas species exceed 1 after solve (max={ymax:.3e}, tol={tol:.3e})")
 
-    # Tl block (coupled mode)
-    if layout.has_block("Tl"):
-        for il in range(grid.Nl):
-            state_new.Tl[il] = float(x[layout.idx_Tl(il)])
-
-    # Ts
-    if cfg.physics.include_Ts and layout.has_block("Ts"):
-        state_new.Ts = float(x[layout.idx_Ts()])
-
-    # mpp
-    if cfg.physics.include_mpp and layout.has_block("mpp"):
-        state_new.mpp = float(x[layout.idx_mpp()])
-
-    # Rd
-    if cfg.physics.include_Rd and layout.has_block("Rd"):
-        state_new.Rd = float(x[layout.idx_Rd()])
-
-    return state_new
-
+    # Recompute closure from reduced species
+    closure_idx = getattr(layout, "gas_closure_index", None)
+    if closure_idx is not None:
+        sum_reduced = np.zeros(state.Yg.shape[1], dtype=np.float64)
+        for k_red in range(layout.Ns_g_eff):
+            k_full = layout.gas_reduced_to_full_idx[k_red]
+            sum_reduced += state.Yg[k_full, :]
+        closure = 1.0 - sum_reduced
+        if np.any(closure < -tol):
+            raise ValueError(f"Gas closure species negative beyond tol={tol}: min={float(np.min(closure)):.3e}")
+        if np.any(closure > 1.0 + tol):
+            raise ValueError(f"Gas closure species exceeds 1 beyond tol={tol}: max={float(np.max(closure)):.3e}")
+        state.Yg[closure_idx, :] = closure
 
 def _build_step_diagnostics(
     lin_result: LinearSolveResult,
@@ -289,6 +318,9 @@ def _build_step_diagnostics(
     diag_sys: Dict[str, Any],
     t_old: float,
     dt: float,
+    layout: UnknownLayout,
+    cfg: CaseConfig,
+    grid: Grid1D,
     liq_diag: Optional[Dict[str, Any]] = None,
 ) -> StepDiagnostics:
     """Assemble StepDiagnostics from solve result and system diag."""
@@ -307,6 +339,27 @@ def _build_step_diagnostics(
     extra: Dict[str, Any] = {"diag_sys": diag_sys}
     if liq_diag is not None:
         extra["liq_T"] = liq_diag
+    if layout.has_block("Yg") and state_new.Yg.size:
+        Yg_min = float(np.min(state_new.Yg))
+        Yg_max = float(np.max(state_new.Yg))
+        closure_idx = getattr(layout, "gas_closure_index", None)
+        closure_min = float(np.min(state_new.Yg[closure_idx, :])) if closure_idx is not None else None
+        cond_name = None
+        cond_val = None
+        liq_bal = getattr(cfg.species, "liq_balance_species", None)
+        if liq_bal and liq_bal in getattr(cfg.species, "liq2gas_map", {}):
+            cond_name = cfg.species.liq2gas_map[liq_bal]
+            k_red = layout.gas_full_to_reduced.get(cond_name)
+            if k_red is not None and grid.Ng > 0:
+                k_full = layout.gas_reduced_to_full_idx[k_red]
+                cond_val = float(state_new.Yg[k_full, 0])
+        extra["Yg_stats"] = {
+            "min": Yg_min,
+            "max": Yg_max,
+            "closure_min": closure_min,
+            "condensable_name": cond_name,
+            "condensable_if_cell": cond_val,
+        }
 
     return StepDiagnostics(
         t_old=t_old,
@@ -456,58 +509,6 @@ def _build_step_diagnostics_fail(
     )
 
 
-def _advance_liquid_T_step12(
-    cfg: CaseConfig,
-    grid: Grid1D,
-    layout: UnknownLayout,
-    state_tr: State,
-    props: Props,
-    dt: float,
-) -> Tuple[State, LinearSolveResult, Dict[str, Any]]:
-    """
-    Stage 2: update liquid temperature using current Ts as interface Dirichlet.
-
-    Inputs:
-        state_tr : state after Stage 1 (Tg, Ts, mpp, Rd updated; Tl still old).
-    Returns:
-        state_liq : State with Tl advanced to t^{n+1} (others from state_tr).
-        lin_res   : Linear solve result for Tl system.
-        liq_diag  : Basic diagnostics for Tl.
-    """
-    A_l, b_l = build_liquid_T_system(
-        cfg=cfg,
-        grid=grid,
-        layout=layout,
-        state_old=state_tr,
-        props=props,
-        dt=dt,
-    )
-
-    lin_res = solve_linear_system_scipy(A=A_l, b=b_l, cfg=cfg)
-
-    if not lin_res.converged:
-        return state_tr, lin_res, {}
-
-    state_liq = state_tr.copy()
-    for il in range(grid.Nl):
-        state_liq.Tl[il] = float(lin_res.x[il])
-
-    Tl_min = float(np.min(state_liq.Tl)) if state_liq.Tl.size else np.nan
-    Tl_max = float(np.max(state_liq.Tl)) if state_liq.Tl.size else np.nan
-    Tl_if = float(state_liq.Tl[grid.Nl - 1]) if grid.Nl > 0 else np.nan
-    Ts_new = float(state_liq.Ts)
-
-    liq_diag = {
-        "Tl_min": Tl_min,
-        "Tl_max": Tl_max,
-        "Tl_if": Tl_if,
-        "Ts": Ts_new,
-        "Tl_if_minus_Ts": Tl_if - Ts_new,
-    }
-
-    return state_liq, lin_res, liq_diag
-
-
 _WRITERS_MODULE_NAME = "io_writers_cached"
 
 
@@ -586,3 +587,32 @@ def _get_molar_masses_from_cfg(cfg: CaseConfig, Ns_g: int, Ns_l: int) -> Tuple[n
     M_g = _build(gas_names, Ns_g)
     M_l = _build(liq_names, Ns_l)
     return M_g, M_l
+
+
+def _complete_Yg_eq_with_closure(cfg: CaseConfig, layout: UnknownLayout, eq_result: EqResultLike) -> EqResultLike:
+    """
+    Ensure eq_result['Yg_eq'] is a valid full-length mass fraction vector (sum=1, closure filled).
+
+    This guards against tests/monkeypatches that provide a partial Yg_eq (e.g., only condensables).
+    """
+    if eq_result is None or "Yg_eq" not in eq_result:
+        return eq_result
+
+    Y = np.asarray(eq_result["Yg_eq"], dtype=np.float64)
+    Ns = len(getattr(cfg.species, "gas_species", Y))
+    if Y.ndim != 1 or Y.size != Ns:
+        raise ValueError(f"eq_result['Yg_eq'] must be 1D length {Ns}, got shape {Y.shape}")
+
+    k_cl = getattr(layout, "gas_closure_index", None)
+    tol = 1e-14
+    Y = np.clip(Y, 0.0, 1.0)
+
+    if k_cl is not None and 0 <= k_cl < Ns:
+        sum_other = float(np.sum(Y) - Y[k_cl])
+        Y[k_cl] = max(0.0, 1.0 - sum_other)
+    s = float(np.sum(Y))
+    if s > tol and not np.isclose(s, 1.0, rtol=1e-12, atol=1e-12):
+        Y = Y / s
+    eq_result = dict(eq_result)
+    eq_result["Yg_eq"] = Y
+    return eq_result

@@ -108,3 +108,68 @@ def compute_liquid_diffusive_flux_T(
 
     # faces beyond interface (gas region) remain zero
     return q_cond
+
+
+def compute_liq_diffusive_flux_Y(
+    cfg: CaseConfig,
+    grid: Grid1D,
+    props: Props,
+    Yl: FloatArray,
+) -> FloatArray:
+    """
+    Compute liquid species diffusive flux on faces (mixture-averaged Fick).
+
+    J_k = -rho_l * D_l * dY_k/dr, outward (+er) positive.
+    Interface and center faces are zero placeholders in this MVP.
+    """
+    conv = cfg.conventions
+    if conv.radial_normal != "+er" or conv.flux_sign != "outward_positive":
+        raise ValueError("compute_liq_diffusive_flux_Y assumes +er/outward_positive conventions")
+
+    Nl = grid.Nl
+    Nc = grid.Nc
+    iface_f = grid.iface_f
+
+    if Yl.ndim != 2:
+        raise ValueError(f"Yl must be 2D (Ns_l, Nl), got ndim={Yl.ndim}")
+    Ns_l, Nl_y = Yl.shape
+    if Nl_y != Nl:
+        raise ValueError(f"Yl shape {Yl.shape} inconsistent with Nl={Nl}")
+
+    if props.D_l is None:
+        raise ValueError("Props.D_l is None; liquid diffusion coeffs required.")
+    if props.D_l.shape != (Ns_l, Nl):
+        raise ValueError(f"D_l shape {props.D_l.shape} != ({Ns_l}, {Nl})")
+    if props.rho_l.shape != (Nl,):
+        raise ValueError(f"rho_l shape {props.rho_l.shape} != ({Nl},)")
+
+    J_diff = np.zeros((Ns_l, Nc + 1), dtype=np.float64)
+    rho_l = props.rho_l
+    D_l = props.D_l
+
+    # Internal liquid faces (between liquid cells)
+    for il in range(Nl - 1):
+        iL = il
+        iR = il + 1
+        f = iR  # shared face index
+        if f >= iface_f:
+            break
+        rL = grid.r_c[iL]
+        rR = grid.r_c[iR]
+        dr = rR - rL
+        if dr <= 0.0:
+            raise ValueError("Non-positive dr in liquid region for species flux")
+
+        rho_f = 0.5 * (float(rho_l[iL]) + float(rho_l[iR]))
+        D_f = 0.5 * (D_l[:, iL] + D_l[:, iR])  # (Ns_l,)
+        dY_dr = (Yl[:, iR] - Yl[:, iL]) / dr   # (Ns_l,)
+
+        J_face = -rho_f * D_f * dY_dr
+        if not np.all(np.isfinite(J_face)):
+            raise ValueError(f"Non-finite liquid species diffusive flux at face {f}")
+        J_diff[:, f] = J_face
+
+    # Center symmetry and interface placeholders
+    J_diff[:, 0] = 0.0
+    J_diff[:, iface_f] = 0.0
+    return J_diff

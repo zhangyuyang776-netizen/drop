@@ -49,7 +49,10 @@ def build_props_from_state(
     cp_g = gas_core["cp_g"]
     k_g = gas_core["k_g"]
     D_g = gas_core.get("D_g", None)
-    h_g = cp_g * state.Tg  # (Ng,) J/kg
+    h_g = gas_extra.get("h_g", None)
+    h_gk = gas_extra.get("h_gk", None)
+    if h_g is None:
+        h_g = cp_g * state.Tg  # fallback to cp*T
 
     if liq_model is not None:
         Ns_l = len(liq_model.liq_names)
@@ -59,8 +62,10 @@ def build_props_from_state(
         rho_l = liq_core["rho_l"]
         cp_l = liq_core["cp_l"]
         k_l = liq_core["k_l"]
-        D_l = None
-        h_l = cp_l * state.Tl  # (Nl,) J/kg
+        D_l = _build_liq_diffusivity(cfg, liq_model.liq_names, Nl)
+        h_l = cp_l * state.Tl  # (Nl,) J/kg (MVP mix)
+        psat_l = liq_extra.get("psat_l", None)
+        hvap_l = liq_extra.get("hvap_l", None)
     else:
         Ns_l = state.Yl.shape[0]
         rho_l = np.zeros(Nl, dtype=np.float64)
@@ -69,6 +74,8 @@ def build_props_from_state(
         D_l = None
         liq_extra = {}
         h_l = np.zeros(Nl, dtype=np.float64)
+        psat_l = None
+        hvap_l = None
 
     props = Props(
         rho_g=rho_g,
@@ -76,14 +83,33 @@ def build_props_from_state(
         k_g=k_g,
         D_g=D_g,
         h_g=h_g,
+        h_gk=h_gk,
         h_l=h_l,
         rho_l=rho_l,
         cp_l=cp_l,
         k_l=k_l,
         D_l=D_l,
+        psat_l=psat_l,
+        hvap_l=hvap_l,
     )
 
     props.validate_shapes(grid, Ns_g=Ns_g, Ns_l=Ns_l)
 
     extras: Dict[str, Dict[str, FloatArray]] = {"gas": gas_extra, "liquid": liq_extra}
     return props, extras
+
+
+def _build_liq_diffusivity(cfg: CaseConfig, liq_names: Tuple[str, ...], Nl: int) -> np.ndarray:
+    """Construct liquid diffusion coefficient array (Ns_l, Nl) using cfg.transport overrides."""
+    D_default = float(getattr(cfg.transport, "D_l_const", 0.0))
+    if D_default <= 0.0:
+        raise ValueError(f"cfg.transport.D_l_const must be positive, got {D_default}")
+    D_l = np.full((len(liq_names), Nl), D_default, dtype=np.float64)
+    overrides = dict(getattr(cfg.transport, "D_l_species", {}))
+    for i, name in enumerate(liq_names):
+        if name in overrides:
+            val = float(overrides[name])
+            if val <= 0.0:
+                raise ValueError(f"D_l_species[{name}] must be positive, got {val}")
+            D_l[i, :] = val
+    return D_l

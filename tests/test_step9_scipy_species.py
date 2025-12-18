@@ -1,107 +1,80 @@
 import logging
-import sys
-from dataclasses import replace
-from pathlib import Path
-
 import numpy as np
 import pytest
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-from assembly.build_species_system_SciPy import build_species_system  # noqa: E402
-from properties.aggregator import build_props_from_state  # noqa: E402
-from solvers.scipy_linear import solve_linear_system_scipy  # noqa: E402
-from tests.test_step6_scipy_transport import (  # noqa: E402
-    cfg_step6,
-    grid_step6,
-    gas_model,
-    state_step6,
-)
+from assembly.build_species_system_SciPy import build_gas_species_system_global
+from core.layout import build_layout
+from core.types import CaseSpecies, Props, State
+from tests.utils_layout import make_case_config, make_simple_grid
 
 logger = logging.getLogger(__name__)
 
 
-class DummySpeciesLayout:
-    def __init__(self, Ng: int, k_spec: int):
-        self.Ng = Ng
-        self.k_spec = k_spec
-
-    def n_dof(self) -> int:
-        return self.Ng
-
-    def has_block(self, name: str) -> bool:
-        return name == "Yg"
-
-    def idx_Yg(self, k: int, ig: int) -> int:
-        if k != self.k_spec:
-            raise ValueError(f"Dummy layout only supports species {self.k_spec}, got k={k}")
-        if not (0 <= ig < self.Ng):
-            raise IndexError(f"ig={ig} out of range for Ng={self.Ng}")
-        return ig
+def _make_props(Ns: int, Ng: int) -> Props:
+    rho_g = np.ones(Ng, dtype=float)
+    cp_g = np.ones(Ng, dtype=float)
+    k_g = np.ones(Ng, dtype=float)
+    D_g = np.full((Ns, Ng), 1.0e-5, dtype=float)
+    rho_l = np.ones(1, dtype=float)
+    cp_l = np.ones(1, dtype=float)
+    k_l = np.ones(1, dtype=float)
+    return Props(rho_g=rho_g, cp_g=cp_g, k_g=k_g, D_g=D_g, rho_l=rho_l, cp_l=cp_l, k_l=k_l)
 
 
-def make_state_with_Y_gradient(state_step6):
-    Ns_g, Ng = state_step6.Yg.shape
-    Yg = np.zeros_like(state_step6.Yg)
+def test_species_global_diffusion_with_dirichlet_farfield():
+    grid = make_simple_grid(Nl=1, Ng=3)
+    species = CaseSpecies(
+        gas_balance_species="N2",
+        gas_species=["FUEL", "N2"],
+        liq_species=["FUEL"],
+        liq_balance_species="FUEL",
+        liq2gas_map={"FUEL": "FUEL"},
+    )
+    cfg = make_case_config(
+        grid,
+        species,
+        solve_Tg=False,
+        solve_Tl=False,
+        solve_Yl=False,
+        case_id="step9_species",
+    )
+    # Farfield: only N2 specified -> FUEL farfield = 0
 
-    # Only use first two species to keep sum(Y)=1
-    # cell:   ig=0   ig=1   ig=2
-    # Y0:    1.0    0.5    0.0
-    # Y1:    0.0    0.5    1.0
-    Y0 = np.array([1.0, 0.5, 0.0], dtype=np.float64)
-    Y1 = 1.0 - Y0
-    Yg[0, :] = Y0
-    Yg[1, :] = Y1
-    # others remain zero
+    layout = build_layout(cfg, grid)
+    Ns_full = len(species.gas_species)
+    Ng = grid.Ng
 
-    return replace(state_step6, Yg=Yg, mpp=0.0)
+    Yg = np.zeros((Ns_full, Ng), dtype=float)
+    Yg[0, :] = np.array([1.0, 0.5, 0.0])  # FUEL
+    Yg[1, :] = 1.0 - Yg[0, :]             # closure N2
 
+    state = State(
+        Tg=np.full(Ng, 300.0),
+        Yg=Yg,
+        Tl=np.full(grid.Nl, 300.0),
+        Yl=np.ones((len(species.liq_species), grid.Nl), dtype=float),
+        Ts=300.0,
+        mpp=0.0,
+        Rd=float(grid.r_f[grid.iface_f]),
+    )
+    props = _make_props(Ns_full, Ng)
 
-def test_step9_scipy_single_species_closed_loop(cfg_step6, grid_step6, state_step6, gas_model, caplog):
-    caplog.set_level(logging.INFO)
-    logger = logging.getLogger(__name__)
+    dt = 1.0e-3
+    A, b, diag = build_gas_species_system_global(cfg, grid, layout, state, props, dt, eq_result=None, return_diag=True)
 
-    state_grad = make_state_with_Y_gradient(state_step6)
-    Ns_g, Ng = state_grad.Yg.shape
-    k_spec = 0  # test first species
+    assert A.shape == (layout.size, layout.size)
+    assert b.shape == (layout.size,)
+    assert diag["bc"]["outer"]["Y_far_preview"]["FUEL"] == 0.0
 
-    # properties (includes D_g)
-    props, extras = build_props_from_state(cfg_step6, grid_step6, state_grad, gas_model, liq_model=None)
-    assert props.D_g is not None
-    assert props.D_g.shape == (Ns_g, Ng)
-    assert props.rho_g.shape == (Ng,)
+    # Solve dense system (only Yg block present)
+    x = np.linalg.solve(A, b)
+    Y_new = x.reshape(-1)
 
-    # assemble species system
-    layout = DummySpeciesLayout(Ng=Ng, k_spec=k_spec)
-    dt = cfg_step6.time.dt
-    A, b = build_species_system(cfg_step6, grid_step6, layout, state_grad, props, dt, k_spec)
+    # Outer cell pinned to farfield (0 for FUEL)
+    row_last = layout.idx_Yg(0, Ng - 1)
+    assert np.isclose(Y_new[row_last], 0.0)
 
-    assert A.shape == (Ng, Ng)
-    assert b.shape == (Ng,)
-    assert np.all(np.diag(A) > 0.0)
-
-    # solve
-    result = solve_linear_system_scipy(A, b, cfg_step6, method="direct")
-    assert result.converged
-
-    Y_old = state_grad.Yg[k_spec, :].copy()
-    Y_new = result.x
-    assert Y_new.shape == (Ng,)
-
-    logger.info("=== Step 9 species closed-loop (SciPy) ===")
-    logger.info("dt = %.3e", dt)
-    logger.info("Y_old = %s", np.array2string(Y_old, precision=4, separator=", "))
-    logger.info("Y_new = %s", np.array2string(Y_new, precision=4, separator=", "))
-    logger.info("dY    = %s", np.array2string(Y_new - Y_old, precision=4, separator=", "))
-
-    # boundary condition: Y_k at outer boundary pinned to 0
-    assert abs(Y_new[-1] - 0.0) < 1e-8
-
-    # middle cell should remain between neighbors (diffusive smoothing, mpp=0)
-    assert Y_new[1] <= max(Y_old[0], Y_old[2]) + 1e-6
-    assert Y_new[1] >= min(Y_old[0], Y_old[2]) - 1e-6
-
-    # some change should occur
-    assert np.any(np.abs(Y_new - Y_old) > 1e-12)
+    # Middle cell should smooth between neighbors (diffusion)
+    row_mid = layout.idx_Yg(0, 1)
+    assert Y_new[row_mid] <= max(Yg[0, 0], Yg[0, 2]) + 1e-6
+    assert Y_new[row_mid] >= min(Yg[0, 0], Yg[0, 2]) - 1e-6
