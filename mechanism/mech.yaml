@@ -13,6 +13,7 @@ phases:
   species:
   - N2
   - O2
+  - NC7H16
   - NC12H26
   kinetics: bulk
   skip-undeclared-third-bodies: true
@@ -119,4 +120,37 @@ species:
     geometry: nonlinear
     diameter: 6.724
     well-depth: 731.315
+- name: NC7H16
+  composition:
+    C: 7
+    H: 16
+  thermo:
+    model: NASA7
+    temperature-ranges:
+    - 300.0
+    - 1391.0
+    - 5000.0
+    data:
+    - - -1.26836187
+      - 0.085435582
+      - -5.25346786e-05
+      - 1.62945721e-08
+      - -2.02394925e-12
+      - -25658.6565
+      - 35.3732912
+    - - 22.2148969
+      - 0.034767575
+      - -1.18407129e-05
+      - 1.83298478e-09
+      - -1.06130266e-13
+      - -34276.0081
+      - -92.3040196
+  transport:
+    model: gas
+    geometry: nonlinear
+    well-depth: 564.03
+    diameter: 6.004
+    dipole: 0.0
+    polarizability: 0.0
+    rotational-relaxation: 1.0
 reactions: []

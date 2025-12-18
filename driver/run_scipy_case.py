@@ -11,8 +11,10 @@ Responsibilities:
 from __future__ import annotations
 
 import argparse
+import csv
 import importlib.util
 import logging
+import math
 import shutil
 import sys
 import traceback
@@ -48,6 +50,7 @@ from core.types import (
     State,
 )
 from properties.compute_props import compute_props, get_or_build_models
+from properties.equilibrium import build_equilibrium_model, compute_interface_equilibrium
 from properties.gas import GasPropertiesModel
 from properties.liquid import LiquidPropertiesModel
 from solvers.timestepper import StepResult, advance_one_step_scipy
@@ -213,6 +216,7 @@ def _load_case_config(cfg_path: str) -> CaseConfig:
         formats=list(io_raw.get("formats", [])),
         save_grid=io_raw.get("save_grid", False),
         fields=io_fields_cfg,
+        scalars_write_every=int(io_raw.get("scalars_write_every", io_raw.get("write_every", 1))),
     )
 
     checks_raw = raw["checks"]
@@ -249,18 +253,59 @@ def _load_case_config(cfg_path: str) -> CaseConfig:
 # Builders
 # -----------------------------------------------------------------------------
 def _maybe_fill_gas_species(cfg: CaseConfig, gas_model: GasPropertiesModel) -> None:
-    """Fill cfg.species.gas_species from mechanism if not provided or mismatched."""
+    """Mechanism-driven gas species ordering; interpret short YAML list as solved subset."""
     mech_names = list(gas_model.gas.species_names)
-    if not getattr(cfg.species, "gas_species", []):
+    mech_map = {nm: i for i, nm in enumerate(mech_names)}
+
+    # Always record mechanism order
+    cfg.species.gas_species_full = mech_names
+    cfg.species.gas_name_to_index = mech_map
+
+    yaml_list = list(getattr(cfg.species, "gas_species", []) or [])
+    # If YAML absent, adopt mechanism order
+    if not yaml_list:
         cfg.species.gas_species = mech_names
-        return
-    if len(cfg.species.gas_species) != len(mech_names):
-        logger.warning(
-            "cfg.species.gas_species length %s differs from mechanism %s; using mechanism order.",
-            len(cfg.species.gas_species),
-            len(mech_names),
-        )
-        cfg.species.gas_species = mech_names
+    else:
+        # If YAML shorter than mechanism, treat YAML list as solved subset
+        if len(yaml_list) != len(mech_names):
+            logger.warning(
+                "cfg.species.gas_species length %s differs from mechanism %s; interpreting YAML list as solved subset.",
+                len(yaml_list),
+                len(mech_names),
+            )
+            if not cfg.species.gas_solved_species:
+                cfg.species.gas_solved_species = yaml_list
+                cfg.species.solve_gas_mode = "explicit_list"
+                cfg.species.solve_gas_species = list(yaml_list)
+            cfg.species.gas_species = mech_names
+        else:
+            if yaml_list != mech_names:
+                logger.warning("cfg.species.gas_species order differs from mechanism; using mechanism order.")
+                cfg.species.gas_species = mech_names
+            else:
+                cfg.species.gas_species = mech_names
+
+    # Closure must exist
+    cl = cfg.species.gas_balance_species
+    if cl and cl not in mech_map:
+        raise ValueError(f"gas_balance_species '{cl}' not found in mechanism species.")
+
+    # condensables must exist
+    conds = list(cfg.physics.interface.equilibrium.condensables_gas or [])
+    missing = [s for s in conds if s not in mech_map]
+    if missing:
+        raise ValueError(f"condensables_gas not found in mechanism species: {missing}")
+
+    # solved subset must exist
+    if cfg.species.gas_solved_species:
+        bad = [s for s in cfg.species.gas_solved_species if s not in mech_map]
+        if bad:
+            raise ValueError(f"gas_solved_species not found in mechanism species: {bad}")
+        if cl in cfg.species.gas_solved_species:
+            logger.warning("gas_solved_species contains closure '%s'; it will be ignored in layout.", cl)
+
+    # liquid name map (not mechanism-driven but useful)
+    cfg.species.liq_name_to_index = {nm: i for i, nm in enumerate(cfg.species.liq_species)}
 
 
 def _build_mass_fractions(
@@ -378,6 +423,162 @@ def _log_step(res: StepResult, step_id: int) -> None:
     )
 
 
+def _open_scalars_csv(run_dir: Path, cfg: CaseConfig, cond_names: list[str]):
+    """Open scalars.csv in run_dir and write header."""
+    run_dir.mkdir(parents=True, exist_ok=True)
+    path = run_dir / "scalars.csv"
+    fh = path.open("w", newline="")
+    writer = csv.writer(fh)
+
+    header = [
+        "step",
+        "t_old",
+        "t_new",
+        "dt",
+        "Rd",
+        "mpp",
+        "A_if",
+        "m_dot",
+        "m_evap_cum",
+        "m_drop",
+        "m_drop0",
+        "mass_closure_err",
+        "Ts",
+        "Tg0",
+        "Tg_min",
+        "Tg_max",
+        "Tg_if",
+        "Tl_if",
+        "sumYg0",
+        "cp_g0",
+        "k_g0",
+    ]
+    for name in cond_names:
+        header.append(f"Yg0_{name}")
+        header.append(f"Yg_eq_{name}")
+    writer.writerow(header)
+    fh.flush()
+    return fh, writer, header
+
+
+def _init_mass_integrator(cfg: CaseConfig, state0: State, props0) -> dict:
+    """Initialize cumulative mass bookkeeping."""
+    integ = {
+        "m_evap_cum": 0.0,
+        "m_dot_prev": None,
+        "m_drop0": math.nan,
+    }
+    try:
+        rho_l_mean = float(np.mean(props0.rho_l)) if hasattr(props0, "rho_l") else math.nan
+        Rd0 = float(state0.Rd)
+        if np.isfinite(rho_l_mean) and Rd0 > 0.0:
+            integ["m_drop0"] = 4.0 / 3.0 * math.pi * rho_l_mean * Rd0 ** 3
+    except Exception:
+        pass
+    return integ
+
+
+def _append_scalars_row(
+    writer: csv.writer,
+    fh,
+    cfg: CaseConfig,
+    grid: Grid1D,
+    state: State,
+    props,
+    res: StepResult,
+    integ: dict,
+    step_id: int,
+    eq_model=None,
+    cond_names: list[str] | None = None,
+):
+    """Compute and append one scalars row, then flush."""
+    d = res.diag
+    Rd = float(state.Rd)
+    mpp = float(state.mpp)
+    A_if = 4.0 * math.pi * Rd * Rd
+    m_dot = A_if * mpp
+
+    dt = float(d.dt)
+    if integ.get("m_dot_prev") is None:
+        integ["m_evap_cum"] += m_dot * dt
+    else:
+        integ["m_evap_cum"] += 0.5 * (integ["m_dot_prev"] + m_dot) * dt
+    integ["m_dot_prev"] = m_dot
+
+    rho_l_mean = float(np.mean(props.rho_l)) if hasattr(props, "rho_l") else math.nan
+    m_drop = 4.0 / 3.0 * math.pi * rho_l_mean * Rd ** 3 if np.isfinite(rho_l_mean) else math.nan
+    m_drop0 = integ.get("m_drop0", math.nan)
+    mass_closure_err = (m_drop + integ["m_evap_cum"] - m_drop0) if np.isfinite(m_drop0) else math.nan
+
+    Tg0 = float(state.Tg[0]) if state.Tg.size else math.nan
+    Tg_if = float(state.Tg[0]) if state.Tg.size else math.nan
+    Tl_if = float(state.Tl[-1]) if state.Tl.size else math.nan
+    Yg0 = state.Yg[:, 0] if state.Yg.size else np.array([], dtype=float)
+    sumYg0 = float(np.sum(Yg0)) if Yg0.size else math.nan
+
+    cond_names = cond_names or []
+    Yg0_list = []
+    Yg_eq_list = []
+    for cond_name in cond_names:
+        Yg0_val = math.nan
+        Yg_eq_val = math.nan
+        if cond_name in cfg.species.gas_species:
+            cond_idx = cfg.species.gas_species.index(cond_name)
+            if cond_idx < Yg0.shape[0]:
+                Yg0_val = float(Yg0[cond_idx])
+            if eq_model is not None:
+                try:
+                    il_if = grid.Nl - 1
+                    ig_if = 0
+                    Yl_face = state.Yl[:, il_if] if state.Yl.size else np.zeros((len(cfg.species.liq_species),), float)
+                    Yg_face = state.Yg[:, ig_if] if state.Yg.size else np.zeros((len(cfg.species.gas_species),), float)
+                    Pg = float(getattr(cfg.initial, "P_inf", 101325.0))
+                    Yg_eq, _, _ = compute_interface_equilibrium(
+                        eq_model, Ts=float(state.Ts), Pg=Pg, Yl_face=Yl_face, Yg_face=Yg_face
+                    )
+                    if cond_idx < Yg_eq.shape[0]:
+                        Yg_eq_val = float(Yg_eq[cond_idx])
+                except Exception:
+                    pass
+        Yg0_list.append(Yg0_val)
+        Yg_eq_list.append(Yg_eq_val)
+
+    cp_g0 = float(props.cp_g[0]) if hasattr(props, "cp_g") and props.cp_g.size else math.nan
+    k_g0 = float(props.k_g[0]) if hasattr(props, "k_g") and props.k_g.size else math.nan
+
+    row = [
+        step_id,
+        d.t_old,
+        d.t_new,
+        d.dt,
+        Rd,
+        mpp,
+        A_if,
+        m_dot,
+        integ["m_evap_cum"],
+        m_drop,
+        m_drop0,
+        mass_closure_err,
+        float(state.Ts),
+        Tg0,
+        d.Tg_min,
+        d.Tg_max,
+        Tg_if,
+        Tl_if,
+        sumYg0,
+        cp_g0,
+        k_g0,
+    ]
+    for v0, veq in zip(Yg0_list, Yg_eq_list):
+        row.append(v0)
+        row.append(veq)
+    writer.writerow(row)
+    try:
+        fh.flush()
+    except Exception:
+        pass
+
+
 def _sanity_check_state(state: State) -> Optional[str]:
     """Lightweight driver-level sanity checks."""
     if not np.isfinite(state.Ts):
@@ -465,6 +666,41 @@ def run_case(cfg_path: str, *, max_steps: Optional[int] = None, log_level: int |
         state = _build_initial_state(cfg, grid, gas_model, liq_model)
         props, _ = compute_props(cfg, grid, state)
 
+        # Scalars writer setup
+        cond_names = list(cfg.physics.interface.equilibrium.condensables_gas) or list(
+            getattr(cfg.species, "liq2gas_map", {}).values()
+        )
+        scalars_every = int(getattr(getattr(cfg, "io", object()), "scalars_write_every", 1) or 1)
+        fh_scalars = None
+        writer_scalars = None
+        integ = None
+        eq_model = None
+        try:
+            fh_scalars, writer_scalars, _ = _open_scalars_csv(run_dir, cfg, cond_names)
+            integ = _init_mass_integrator(cfg, state, props)
+            if cfg.physics.include_mpp:
+                Ns_g = len(cfg.species.gas_species)
+                Ns_l = len(cfg.species.liq_species)
+                M_g = np.ones(Ns_g, dtype=float)
+                M_l = np.ones(Ns_l, dtype=float)
+                try:
+                    M_g = np.asarray(gas_model.gas.molecular_weights, dtype=float) / 1000.0
+                except Exception:
+                    pass
+                try:
+                    for i, name in enumerate(cfg.species.liq_species):
+                        if name in cfg.species.mw_kg_per_mol:
+                            M_l[i] = float(cfg.species.mw_kg_per_mol[name])
+                except Exception:
+                    pass
+                try:
+                    eq_model = build_equilibrium_model(cfg, Ns_g=Ns_g, Ns_l=Ns_l, M_g=M_g, M_l=M_l)
+                except Exception as exc:
+                    logger.warning("Failed to build equilibrium model for diagnostics: %s", exc)
+                    eq_model = None
+        except Exception as exc:
+            logger.warning("Failed to initialize scalars writer: %s", exc)
+
         t = float(cfg.time.t0)
         step_id = 0
         effective_max_steps = max_steps if max_steps is not None else cfg.time.max_steps
@@ -503,6 +739,25 @@ def run_case(cfg_path: str, *, max_steps: Optional[int] = None, log_level: int |
             props = res.props_new
             t = res.diag.t_new
 
+            if writer_scalars is not None and integ is not None and scalars_every > 0:
+                if step_id % scalars_every == 0:
+                    try:
+                        _append_scalars_row(
+                            writer_scalars,
+                            fh_scalars,
+                            cfg,
+                            grid,
+                            state,
+                            props,
+                            res,
+                            integ,
+                            step_id=step_id,
+                            eq_model=eq_model,
+                            cond_names=cond_names,
+                        )
+                    except Exception as exc:
+                        logger.warning("Failed to write scalars at step %s: %s", step_id, exc)
+
             _maybe_write_spatial(cfg, grid, state, step_id)
 
         logger.info("Completed run: t=%.6e reached t_end=%.6e after %d steps.", t, cfg.time.t_end, step_id)
@@ -520,6 +775,12 @@ def run_case(cfg_path: str, *, max_steps: Optional[int] = None, log_level: int |
         print(tb, file=sys.stderr)
         print(f"{'='*80}\n", file=sys.stderr)
         return 99
+    finally:
+        try:
+            if "fh_scalars" in locals() and fh_scalars is not None:
+                fh_scalars.close()
+        except Exception:
+            pass
 
 
 def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:

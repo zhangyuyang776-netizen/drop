@@ -165,6 +165,12 @@ def build_layout(cfg: CaseConfig, grid: Grid1D) -> UnknownLayout:
     mode = getattr(cfg.species, "solve_gas_mode", "all_minus_closure")
     gas_closure = cfg.species.gas_balance_species
 
+    gas_solved_subset = list(getattr(cfg.species, "gas_solved_species", []) or [])
+    if gas_solved_subset:
+        mode = "explicit_list"
+        cfg.species.solve_gas_mode = "explicit_list"
+        cfg.species.solve_gas_species = list(gas_solved_subset)
+
     if mode == "all_minus_closure":
         gas_active: Set[str] = set(gas_full)
         gas_active.discard(gas_closure)

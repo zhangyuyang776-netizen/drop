@@ -190,6 +190,34 @@ def advance_one_step_scipy(
         liq_diag=liq_diag,
     )
 
+    # Guard against mpp sign flip vs interface evaluation (diagnostic-only, not altering state)
+    try:
+        diag_sys_evap = diag_sys.get("gas", {}).get("evaporation", {})
+        mpp_eval = float(diag_sys_evap.get("mpp_eval", np.nan))
+        mpp_state = float(state_new.mpp)
+        if np.isfinite(mpp_eval) and np.isfinite(mpp_state):
+            if np.sign(mpp_eval) != np.sign(mpp_state) and max(abs(mpp_eval), abs(mpp_state)) > 0.0:
+                rel_diff = abs(mpp_state - mpp_eval) / max(abs(mpp_eval), 1e-30)
+                if rel_diff > 0.2:
+                    try:
+                        diag.extra = dict(diag.extra)
+                        diag.extra["mpp_mismatch"] = {
+                            "mpp_state": mpp_state,
+                            "mpp_eval": mpp_eval,
+                            "rel_diff": rel_diff,
+                        }
+                    except Exception:
+                        pass
+                    return StepResult(
+                        state_new=state_new,
+                        props_new=props_old,
+                        diag=diag,
+                        success=False,
+                        message=f"mpp sign mismatch: state={mpp_state:.3e}, eval={mpp_eval:.3e}, rel_diff={rel_diff:.3e}",
+                    )
+    except Exception:
+        pass
+
     # Recompute properties based on the updated state (for use by the caller in the next step)
     try:
         props_new, extras_new = compute_props(cfg, grid, state_new)

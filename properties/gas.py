@@ -47,7 +47,8 @@ def build_gas_model(cfg: CaseConfig) -> GasPropertiesModel:
     mech_path = cfg.paths.gas_mech
     if cfg.paths.mechanism_dir is not None:
         mech_path = cfg.paths.mechanism_dir / cfg.paths.gas_mech
-    gas = ct.Solution(str(mech_path))
+    phase = getattr(cfg.species, "gas_mechanism_phase", None)
+    gas = ct.Solution(str(mech_path), phase) if phase else ct.Solution(str(mech_path))
     gas_names = tuple(gas.species_names)
     name_to_idx = {name: i for i, name in enumerate(gas_names)}
     return GasPropertiesModel(
@@ -133,7 +134,12 @@ def compute_gas_props(
         if np.any(~np.isfinite(D_mech)) or np.any(D_mech < 0.0):
             raise ValueError(f"Non-physical gas diffusion coeffs at cell {ig}")
         if np.any(D_mech < 1e-20):
-            raise ValueError(f"Gas diffusion coeffs too small at cell {ig}: min(D)={float(np.min(D_mech))}")
+            bad = np.where(D_mech < 1e-20)[0]
+            bad_names = [gas.species_names[int(i)] for i in bad[:8]]
+            raise ValueError(
+                f"Gas diffusion coeffs too small at cell {ig}: "
+                f"min(D)={float(np.min(D_mech)):.3e}, bad_species={bad_names}, total_bad={int(bad.size)}"
+            )
         if np.any(~np.isfinite(h_species_mech)):
             raise ValueError(f"Non-physical gas species enthalpy at cell {ig}")
 

@@ -70,6 +70,7 @@ class CaseSpecies:
     gas_balance_species: str
     gas_mechanism_phase: str = "gas"
     gas_species: List[str] = field(default_factory=list)
+    gas_solved_species: List[str] = field(default_factory=list)  # optional subset to solve (mechanism order names)
     # Gas solve mode:
     # - all_minus_closure: solve every gas species except gas_balance_species
     # - condensables_only: solve only liq_balance_species mapped via liq2gas_map
@@ -81,6 +82,10 @@ class CaseSpecies:
     liq2gas_map: Mapping[str, str] = field(default_factory=dict)
     mw_kg_per_mol: Mapping[str, float] = field(default_factory=dict)
     molar_volume_cm3_per_mol: Mapping[str, float] = field(default_factory=dict)
+    # Runtime-filled mappings (mechanism order)
+    gas_species_full: List[str] = field(default_factory=list)
+    gas_name_to_index: Mapping[str, int] = field(default_factory=dict)
+    liq_name_to_index: Mapping[str, int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.gas_balance_species:
@@ -260,6 +265,7 @@ class CaseIO:
     formats: List[str]
     save_grid: bool
     fields: CaseIOFields
+    scalars_write_every: int = 1
 
 
 @dataclass(slots=True)
