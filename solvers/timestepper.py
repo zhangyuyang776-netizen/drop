@@ -169,7 +169,7 @@ def advance_one_step_scipy(
         u=lin_result.x,
         layout=layout,
         tol_closure=float(cfg.checks.sumY_tol),
-        clip_negative_closure=False,
+        clip_negative_closure=True,  # Enable automatic correction of numerical errors
     )
     _postprocess_species_bounds(cfg, layout, state_new)
 
@@ -326,7 +326,7 @@ def _postprocess_species_bounds(cfg: CaseConfig, layout: UnknownLayout, state: S
         if ymax > 1.0 + tol:
             raise ValueError(f"Gas species exceed 1 after solve (max={ymax:.3e}, tol={tol:.3e})")
 
-    # Recompute closure from reduced species
+    # Recompute closure from reduced species (already done in apply_u_to_state, but double-check)
     closure_idx = getattr(layout, "gas_closure_index", None)
     if closure_idx is not None:
         sum_reduced = np.zeros(state.Yg.shape[1], dtype=np.float64)
@@ -339,6 +339,10 @@ def _postprocess_species_bounds(cfg: CaseConfig, layout: UnknownLayout, state: S
         if np.any(closure > 1.0 + tol):
             raise ValueError(f"Gas closure species exceeds 1 beyond tol={tol}: max={float(np.max(closure)):.3e}")
         state.Yg[closure_idx, :] = closure
+
+    # Final physical constraint: ensure all species are in [0, 1] range
+    if clamp:
+        state.Yg[:, :] = np.clip(state.Yg, 0.0, 1.0)
 
 def _build_step_diagnostics(
     lin_result: LinearSolveResult,

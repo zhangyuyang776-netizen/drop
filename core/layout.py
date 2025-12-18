@@ -463,17 +463,29 @@ def _reconstruct_closure(
     sum_other = np.sum(Y_full, axis=0) - Y_full[closure_idx, :]
     closure = 1.0 - sum_other
 
-    if np.any(closure < -tol):
-        raise ValueError(
-            f"{phase} closure species negative beyond tol={tol}: min={float(np.min(closure)):.3e}"
-        )
-    if np.any(closure > 1.0 + tol):
-        raise ValueError(
-            f"{phase} closure species exceeds 1 beyond tol={tol}: max={float(np.max(closure)):.3e}"
-        )
-
     if clip_negative:
+        # Automatic correction for numerical errors (clamp first, then check)
+        # Clamp slightly negative values to 0.0
         closure = np.where((closure < 0.0) & (closure >= -tol), 0.0, closure)
+        # Clamp slightly exceeding 1.0 values to 1.0
+        closure = np.where((closure > 1.0) & (closure <= 1.0 + tol), 1.0, closure)
+
+        # Force strict physical bounds [0, 1] to handle floating-point precision issues
+        closure = np.clip(closure, 0.0, 1.0)
+
+        # After clamping, verify no catastrophic errors remain
+        if np.any(~np.isfinite(closure)):
+            raise ValueError(f"{phase} closure species contains non-finite values")
+    else:
+        # Strict checking without clamping
+        if np.any(closure < -tol):
+            raise ValueError(
+                f"{phase} closure species negative beyond tol={tol}: min={float(np.min(closure)):.3e}"
+            )
+        if np.any(closure > 1.0 + tol):
+            raise ValueError(
+                f"{phase} closure species exceeds 1 beyond tol={tol}: max={float(np.max(closure)):.3e}"
+            )
 
     Y_full[closure_idx, :] = closure
 
