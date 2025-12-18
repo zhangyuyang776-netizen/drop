@@ -12,9 +12,9 @@ Responsibilities (current version):
 Direction and sign conventions:
 - Radial coordinate r increases outward (from droplet center to far field).
 - Interface normal n = +e_r, pointing from liquid to gas.
-- All fluxes (mass, heat) and mpp are defined positive along +e_r
-  ("out of the droplet"); mpp > 0 means evaporation (liquid -> gas).
-
+- mpp and face-based Fourier flux diagnostics are defined positive along +e_r  ("out of the droplet"); mpp > 0 means evaporation (liquid -> gas).
+- For the Ts energy jump, we internally use heat *into* the interface as positive when assembling the matrix row. Diagnostics explicitly label which sign convention is used.
+ 
 This module DOES:
 - assemble Ts and mpp interface equations using provided props/eq_result.
 
@@ -233,8 +233,12 @@ def build_interface_coeffs(
     diag["direction_convention"] = {
         "n": "+e_r (liquid -> gas)",
         "mpp_positive": "evaporation (liquid -> gas)",
-        "flux_positive": "outward along +r",
+        "flux_positive": (
+            "outward along +r for face-based fluxes in transport/assembly; "
+            "Ts_energy.balance_into_interface uses 'heat into interface' as positive."
+        ),
     }
+
 
     coeffs = InterfaceCoeffs(rows=rows, diag=diag)
     logger.debug(
@@ -262,23 +266,22 @@ def _build_Ts_row(
     idx_mpp: int,
 ) -> Tuple[InterfaceRow, Dict[str, Any]]:
     """
-    Build Ts interface energy-jump row (single-species, conduction + latent).
+    Energy balance at the interface (heat into interface = latent):
 
-    Discrete form (per unit area):
+        q_g_in + q_l_in - q_lat = 0
 
-        q_g + q_l - q_lat = 0
+    with (heat *into* the interface taken as positive)
+        q_g_in = k_g * (Tg1 - Ts) / dr_g * A_if   # gas -> interface
+        q_l_in = k_l * (TlN - Ts) / dr_l * A_if   # liquid -> interface
+        q_lat  = mpp * L_v * A_if                # interface -> gas (latent, evaporation)
 
-    with
-        q_g   = -k_g * (Tg1 - Ts) / dr_g * A_if
-        q_l   = -k_l * (Ts - TlN) / dr_l * A_if
-        q_lat = mpp * L_v * A_if
+    This is algebraically equivalent to:
 
-    Matrix row (global unknowns: Tg1, TlN, Ts, mpp):
+        (k_g/dr_g) * Tg1
+      + (k_l/dr_l) * TlN
+      - (k_g/dr_g + k_l/dr_l) * Ts
+      - L_v * mpp = 0
 
-        A_if * [(-k_g/dr_g) * Tg1
-                + (k_g/dr_g - k_l/dr_l) * Ts
-                + (k_l/dr_l) * TlN
-                - L_v * mpp] = 0
     """
     A_if = float(grid.A_f[iface_f])
     r_if = float(grid.r_f[iface_f])
@@ -305,9 +308,9 @@ def _build_Ts_row(
     # Unknown indices near the interface
     idx_Tg = layout.idx_Tg(ig_local)
 
-    coeff_Tg = -A_if * k_g / dr_g
+    coeff_Tg = A_if * k_g / dr_g
     coeff_Tl = A_if * k_l / dr_l
-    coeff_Ts = A_if * (k_g / dr_g - k_l / dr_l)
+    coeff_Ts = -A_if * (k_g / dr_g + k_l / dr_l)
     coeff_mpp = -A_if * L_v
 
     # Check if Tl is in layout (coupled) or fixed (explicit Gauss-Seidel)
@@ -330,9 +333,17 @@ def _build_Ts_row(
     Tl_cur = float(state.Tl[il_local]) if state.Tl.size else np.nan
     mpp_cur = float(state.mpp)
 
-    q_g = -k_g * (Tg_cur - Ts_cur) / dr_g * A_if
-    q_l = -k_l * (Ts_cur - Tl_cur) / dr_l * A_if
-    q_lat = mpp_cur * L_v * A_if
+    # 1) Heat INTO the interface (positive), consistent with Ts energy equation
+    q_g_in = k_g * (Tg_cur - Ts_cur) / dr_g * A_if      # gas -> interface
+    q_l_in = k_l * (Tl_cur - Ts_cur) / dr_l * A_if      # liquid -> interface
+    q_lat = mpp_cur * L_v * A_if                        # interface -> gas (latent)
+    balance_eq = q_g_in + q_l_in - q_lat
+
+    # 2) Fourier-style fluxes positive along +r (for transport/assembly consistency)
+    q_g_plus_r = -k_g * (Tg_cur - Ts_cur) / dr_g * A_if
+    q_l_plus_r = -k_l * (Ts_cur - Tl_cur) / dr_l * A_if
+    balance_plus_r = q_g_plus_r + q_l_plus_r - q_lat
+
 
     # Enthalpy-based split diagnostics (no matrix impact)
     if not hasattr(props, "h_g") or props.h_g is None:
@@ -372,10 +383,6 @@ def _build_Ts_row(
             "k_g": k_g,
             "k_l": k_l,
             "L_v": L_v,
-            "q_g": q_g,
-            "q_l": q_l,
-            "q_lat": q_lat,
-            "balance": q_g + q_l - q_lat,
             "coeffs": {
                 "Tg": coeff_Tg,
                 "Ts": coeff_Ts,
@@ -388,6 +395,23 @@ def _build_Ts_row(
                 "Tl_if": Tl_cur,
                 "mpp": mpp_cur,
             },
+            # 1) 与 Ts 方程直接对应的“流入界面为正”能量平衡
+            "balance_into_interface": {
+                "q_g_in": q_g_in,
+                "q_l_in": q_l_in,
+                "q_lat": q_lat,
+                "balance_eq": balance_eq,
+                "sign_convention": "q_g_in/q_l_in > 0 => heat into interface",
+            },
+            # 2) Fourier 版，沿 +r 为正，方便和其它模块 cross-check
+            "fourier_plus_r": {
+                "q_g_plus_r": q_g_plus_r,
+                "q_l_plus_r": q_l_plus_r,
+                "q_lat": q_lat,
+                "balance_plus_r": balance_plus_r,
+                "sign_convention": "flux > 0 => outward along +r",
+            },
+            # 3) enthalpy 分解，仍然用 Fourier 方向（跟 energy_flux 模块一致）
             "enthalpy_split": {
                 "h_g_if": h_g_if,
                 "h_l_if": h_l_if,
@@ -407,8 +431,8 @@ def _build_Ts_row(
                 "q_lat_old_pow": q_lat,
                 "q_lat_eff_pow": q_lat_eff_pow,
                 "latent_mismatch_pow": latent_mismatch_pow,
-                "balance_old_pow": q_g + q_l - q_lat,
-                "balance_eff_pow": q_g + q_l - q_lat_eff_pow,
+                "balance_old_pow": balance_plus_r,
+                "balance_eff_pow": q_g_plus_r + q_l_plus_r - q_lat_eff_pow,
                 "units": {"area": "W/m^2", "pow": "W"},
             },
         }
@@ -490,6 +514,13 @@ def _build_mpp_row(
     else:
         mpp_cur = float(j_corr[k_b_full] / delta_Y)
 
+    # 2b) Apply no_condensation constraint if configured
+    mpp_unconstrained = mpp_cur
+    interface_type = getattr(cfg.physics.interface, "type", "no_condensation")
+    if interface_type == "no_condensation" and mpp_cur < 0.0:
+        # Force evaporation-only: clamp negative mpp (condensation) to zero
+        mpp_cur = 0.0
+
     # 3) total species fluxes for diagnostics
     J_full = mpp_cur * Yg_eq_full + j_corr
 
@@ -544,6 +575,9 @@ def _build_mpp_row(
             "j_raw_sum": float(j_raw.sum()),
             "j_corr_sum": float(j_corr.sum()),
             "mpp_eval": mpp_cur,
+            "mpp_unconstrained": mpp_unconstrained,
+            "no_condensation_applied": (interface_type == "no_condensation" and mpp_unconstrained < 0.0),
+            "interface_type": interface_type,
             "sumJ_minus_mpp": float(J_full.sum() - mpp_cur),
             "A_if": A_if,
             "Yg_eq_full": Yg_eq_full,

@@ -150,9 +150,10 @@ def build_gas_species_system_global(
     }
 
     # Farfield composition map for solved species
+    seed = float(getattr(cfg.initial, "Y_seed", 1e-12))
     Y_far_map: Dict[str, float] = {}
     for name in layout.gas_species_reduced:
-        Y_far_map[name] = float(cfg.initial.Yg.get(name, 0.0))
+        Y_far_map[name] = float(cfg.initial.Yg.get(name, seed))
     diag["bc"]["outer"] = {"type": "Dirichlet_all_solved", "Y_far_preview": Y_far_map}
 
     # Optional convection toggle
@@ -253,9 +254,10 @@ def build_gas_species_system_global(
         u_out = float(u_face[grid.Nc])
         if u_out < 0.0:
             # Build full-length farfield vector in mechanism order
+            seed = float(getattr(cfg.initial, "Y_seed", 1e-12))
             Y_far_full = np.zeros((layout.Ns_g_full,), dtype=np.float64)
             for idx_full, spec_name in enumerate(layout.gas_species_full):
-                Y_far_full[idx_full] = float(cfg.initial.Yg.get(spec_name, 0.0))
+                Y_far_full[idx_full] = float(cfg.initial.Yg.get(spec_name, seed))
             J_conv_all[:, grid.Nc] = float(props.rho_g[-1]) * u_out * Y_far_full
 
         for k_red in range(layout.Ns_g_eff):
@@ -273,11 +275,12 @@ def build_gas_species_system_global(
                 b[row] -= S_conv
 
     # Outer boundary Dirichlet for all solved species
+    seed = float(getattr(cfg.initial, "Y_seed", 1e-12))
     ig_bc = Ng - 1
     for k_red in range(layout.Ns_g_eff):
         row_bc = layout.idx_Yg(k_red, ig_bc)
         name = layout.gas_species_reduced[k_red]
-        Y_far = float(cfg.initial.Yg.get(name, 0.0))
+        Y_far = float(cfg.initial.Yg.get(name, seed))
         A[row_bc, :] = 0.0
         A[row_bc, row_bc] = 1.0
         b[row_bc] = Y_far

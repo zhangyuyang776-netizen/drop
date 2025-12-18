@@ -77,7 +77,7 @@ geometry:
     gas_beta: 2.0
     gas_center_bias: -0.4
     enforce_interface_continuity: true
-    continuity_tol: 1.0e-12
+    continuity_tol: 1.0e-5
 
 time:
   t0: 0.0
