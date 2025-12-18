@@ -264,19 +264,22 @@ def _build_Ts_row(
     """
     Build Ts interface energy-jump row (single-species, conduction + latent).
 
-    Discrete form (per unit area):
+    Energy balance at interface (heat in = heat out + latent heat):
 
-        q_g + q_l - q_lat = 0
+        q_g_in = q_l_out + q_lat
 
     with
-        q_g   = -k_g * (Tg1 - Ts) / dr_g * A_if
-        q_l   = -k_l * (Ts - TlN) / dr_l * A_if
-        q_lat = mpp * L_v * A_if
+        q_g_in  = k_g * (Tg1 - Ts) / dr_g * A_if   (gas to interface, > 0 when Tg > Ts)
+        q_l_out = k_l * (Ts - TlN) / dr_l * A_if   (interface to liquid, > 0 when Ts > Tl)
+        q_lat   = mpp * L_v * A_if                 (latent heat for evaporation)
+
+    Rearranged:
+        k_g/dr_g * (Tg - Ts) - k_l/dr_l * (Ts - Tl) - mpp * L_v = 0
 
     Matrix row (global unknowns: Tg1, TlN, Ts, mpp):
 
-        A_if * [(-k_g/dr_g) * Tg1
-                + (k_g/dr_g - k_l/dr_l) * Ts
+        A_if * [(k_g/dr_g) * Tg1
+                - (k_g/dr_g + k_l/dr_l) * Ts
                 + (k_l/dr_l) * TlN
                 - L_v * mpp] = 0
     """
@@ -305,9 +308,9 @@ def _build_Ts_row(
     # Unknown indices near the interface
     idx_Tg = layout.idx_Tg(ig_local)
 
-    coeff_Tg = -A_if * k_g / dr_g
+    coeff_Tg = A_if * k_g / dr_g
     coeff_Tl = A_if * k_l / dr_l
-    coeff_Ts = A_if * (k_g / dr_g - k_l / dr_l)
+    coeff_Ts = -A_if * (k_g / dr_g + k_l / dr_l)
     coeff_mpp = -A_if * L_v
 
     # Check if Tl is in layout (coupled) or fixed (explicit Gauss-Seidel)
