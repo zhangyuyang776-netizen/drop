@@ -173,6 +173,12 @@ def advance_one_step_scipy(
     )
     _postprocess_species_bounds(cfg, layout, state_new)
 
+    # Apply no_condensation constraint if configured
+    if cfg.physics.include_mpp and layout.has_block("mpp"):
+        interface_type = getattr(cfg.physics.interface, "type", "no_condensation")
+        if interface_type == "no_condensation" and state_new.mpp < 0.0:
+            state_new.mpp = 0.0
+
     # --- Stage 2 removed: Tl is now solved in Stage 1 (coupled mode) ---
     # No separate liquid temperature solve needed
     liq_diag: Dict[str, Any] | None = None

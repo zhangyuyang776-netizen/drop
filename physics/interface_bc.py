@@ -490,6 +490,13 @@ def _build_mpp_row(
     else:
         mpp_cur = float(j_corr[k_b_full] / delta_Y)
 
+    # 2b) Apply no_condensation constraint if configured
+    mpp_unconstrained = mpp_cur
+    interface_type = getattr(cfg.physics.interface, "type", "no_condensation")
+    if interface_type == "no_condensation" and mpp_cur < 0.0:
+        # Force evaporation-only: clamp negative mpp (condensation) to zero
+        mpp_cur = 0.0
+
     # 3) total species fluxes for diagnostics
     J_full = mpp_cur * Yg_eq_full + j_corr
 
@@ -544,6 +551,9 @@ def _build_mpp_row(
             "j_raw_sum": float(j_raw.sum()),
             "j_corr_sum": float(j_corr.sum()),
             "mpp_eval": mpp_cur,
+            "mpp_unconstrained": mpp_unconstrained,
+            "no_condensation_applied": (interface_type == "no_condensation" and mpp_unconstrained < 0.0),
+            "interface_type": interface_type,
             "sumJ_minus_mpp": float(J_full.sum() - mpp_cur),
             "A_if": A_if,
             "Yg_eq_full": Yg_eq_full,
