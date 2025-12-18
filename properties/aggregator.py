@@ -66,6 +66,14 @@ def build_props_from_state(
         h_l = cp_l * state.Tl  # (Nl,) J/kg (MVP mix)
         psat_l = liq_extra.get("psat_l", None)
         hvap_l = liq_extra.get("hvap_l", None)
+
+        # Extract interface latent heat for balance species
+        h_vap_if = None
+        if hvap_l is not None:
+            liq_balance_species = getattr(cfg.species, "liq_balance_species", None)
+            if liq_balance_species in liq_model.liq_names:
+                idx_balance = liq_model.liq_names.index(liq_balance_species)
+                h_vap_if = float(hvap_l[idx_balance])
     else:
         Ns_l = state.Yl.shape[0]
         rho_l = np.zeros(Nl, dtype=np.float64)
@@ -76,6 +84,7 @@ def build_props_from_state(
         h_l = np.zeros(Nl, dtype=np.float64)
         psat_l = None
         hvap_l = None
+        h_vap_if = None
 
     props = Props(
         rho_g=rho_g,
@@ -91,6 +100,7 @@ def build_props_from_state(
         D_l=D_l,
         psat_l=psat_l,
         hvap_l=hvap_l,
+        h_vap_if=h_vap_if,
     )
 
     props.validate_shapes(grid, Ns_g=Ns_g, Ns_l=Ns_l)

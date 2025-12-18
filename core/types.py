@@ -461,6 +461,7 @@ class Props:
     D_l: Optional[FloatArray] = None  # expected shape: (Nspec_l, Nl)
     psat_l: Optional[FloatArray] = None  # (Ns_l,) Pa
     hvap_l: Optional[FloatArray] = None  # (Ns_l,) J/kg
+    h_vap_if: Optional[float] = None  # J/kg, interface latent heat (balance species)
 
     def validate_shapes(self, grid: Grid1D, Ns_g: int, Ns_l: int) -> None:
         """Ensure property arrays match grid and species counts."""
