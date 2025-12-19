@@ -342,10 +342,12 @@ def _build_Ts_row(
     # Unknown indices near the interface
     idx_Tg = layout.idx_Tg(ig_local)
 
-    # Use Fourier-style sign convention (outward +r positive) for the matrix row
-    coeff_Tg = -A_if * k_g / dr_g
+    # Energy balance with heat INTO interface as positive:
+    # q_g_in + q_l_in + q_diff_in - q_lat = 0
+    # => A_if * [(k_g/dr_g) Tg + (k_l/dr_l) Tl - (k_g/dr_g + k_l/dr_l) Ts - L_v mpp] = q_diff_species_pow
+    coeff_Tg = A_if * k_g / dr_g
     coeff_Tl = A_if * k_l / dr_l
-    coeff_Ts = A_if * (k_g / dr_g - k_l / dr_l)
+    coeff_Ts = -A_if * (k_g / dr_g + k_l / dr_l)
     coeff_mpp = -A_if * L_v
 
     # Gas-side diffusive enthalpy term Σ h_k j_corr_k
@@ -381,16 +383,14 @@ def _build_Ts_row(
         idx_Tl = layout.idx_Tl(il_local)
         cols = [idx_Tg, idx_Ts, idx_Tl, idx_mpp]
         vals = [coeff_Tg, coeff_Ts, coeff_Tl, coeff_mpp]
-        # q_g_plus_r + q_l_plus_r + q_diff(+r) - q_lat = 0 -> move q_diff to RHS
-        rhs = -q_diff_species_pow
+        rhs = q_diff_species_pow
     else:
         # Gauss-Seidel split: Tl fixed at old value
         Tl_fixed = float(state.Tl[il_local]) if state.Tl.size > il_local else 0.0
         cols = [idx_Tg, idx_Ts, idx_mpp]
         vals = [coeff_Tg, coeff_Ts, coeff_mpp]
         const_Tl = coeff_Tl * Tl_fixed
-        # Unknowns part + q_diff(+r) = const_Tl  => unknowns = const_Tl - q_diff
-        rhs = const_Tl - q_diff_species_pow
+        rhs = const_Tl + q_diff_species_pow
 
     # Diagnostic preview using current state (not mutating state)
     Ts_cur = float(state.Ts)
