@@ -178,6 +178,7 @@ def build_interface_coeffs(
             props=props,
             layout=layout,
             cfg=cfg,
+            eq_result=eq_result,
             il_global=il_global,
             ig_global=ig_global,
             il_local=il_local,
@@ -229,6 +230,38 @@ def build_interface_coeffs(
     if eq_result is not None:
         diag["equilibrium"] = eq_result
 
+    # Compatibility/legacy diagnostics expected by older tests
+    if "Ts_energy" in diag:
+        fourier = diag["Ts_energy"].get("fourier_plus_r", {})
+        q_g = fourier.get("q_g_plus_r", 0.0)
+        q_l = fourier.get("q_l_plus_r", 0.0)
+        q_lat = fourier.get("q_lat", 0.0)
+        # diffusive enthalpy (species) uses interface sign into balance; compat uses outward sign
+        q_diff = diag["Ts_energy"].get("species_diffusion_enthalpy", {}).get("q_diff_species_pow", 0.0)
+        diag["Ts_energy"]["q_g"] = q_g
+        diag["Ts_energy"]["q_l"] = q_l
+        diag["Ts_energy"]["q_lat"] = q_lat
+        diag["Ts_energy"]["q_diff"] = q_diff
+        diag["Ts_energy"]["balance"] = q_g + q_l - q_lat + q_diff
+
+    if "evaporation" in diag:
+        evap = diag["evaporation"]
+        k_b_full = evap.get("k_b_full", 0)
+        deltaY = float(evap.get("DeltaY_eff", 0.0))
+        j_corr_full = np.asarray(evap.get("j_corr_full", np.zeros(1, dtype=float)), dtype=float)
+        Yg_eq_full = np.asarray(evap.get("Yg_eq_full", np.zeros_like(j_corr_full)), dtype=float)
+        j_sum_val = float(evap.get("j_sum", 0.0))
+        j_raw_full = j_corr_full + Yg_eq_full * j_sum_val
+        j_cond = float(j_raw_full[k_b_full]) if j_raw_full.size > k_b_full else 0.0
+        mpp_val = float(evap.get("mpp_unconstrained", evap.get("mpp_eval", 0.0)))
+        residual = j_cond - deltaY * mpp_val
+        diag["mpp_mass"] = {
+            "J_cond": j_cond,
+            "mpp": mpp_val,
+            "DeltaY": deltaY,
+            "residual": residual,
+        }
+
     # Direction/sign conventions for diagnostics
     diag["direction_convention"] = {
         "n": "+e_r (liquid -> gas)",
@@ -257,6 +290,7 @@ def _build_Ts_row(
     props: Props,
     layout: UnknownLayout,
     cfg: CaseConfig,
+    eq_result: EqResultLike,
     il_global: int,
     ig_global: int,
     il_local: int,
@@ -308,10 +342,38 @@ def _build_Ts_row(
     # Unknown indices near the interface
     idx_Tg = layout.idx_Tg(ig_local)
 
-    coeff_Tg = A_if * k_g / dr_g
+    # Use Fourier-style sign convention (outward +r positive) for the matrix row
+    coeff_Tg = -A_if * k_g / dr_g
     coeff_Tl = A_if * k_l / dr_l
-    coeff_Ts = -A_if * (k_g / dr_g + k_l / dr_l)
+    coeff_Ts = A_if * (k_g / dr_g - k_l / dr_l)
     coeff_mpp = -A_if * L_v
+
+    # Gas-side diffusive enthalpy term Σ h_k j_corr_k
+    q_diff_species_area = 0.0
+    q_diff_species_pow = 0.0
+    if (
+        eq_result is not None
+        and "Yg_eq" in eq_result
+        and getattr(props, "h_gk", None) is not None
+        and props.h_gk is not None
+    ):
+        Yg_eq_full = np.asarray(eq_result["Yg_eq"], dtype=np.float64)
+        Ns_g = Yg_eq_full.shape[0]
+        if state.Yg.shape[0] >= Ns_g:
+            try:
+                rho_g = float(props.rho_g[ig_local])
+                D_full = _get_gas_diffusivity_vec(props, cfg, ig_local=ig_local, Ns_g=Ns_g)
+                Yg_cell_full = np.asarray(state.Yg[:, ig_local], dtype=np.float64).reshape(Ns_g)
+                alpha = rho_g * D_full / dr_g
+                j_raw = -alpha * (Yg_cell_full - Yg_eq_full)
+                j_sum = float(np.sum(j_raw))
+                j_corr = j_raw - Yg_eq_full * j_sum
+                h_gk_vec = np.asarray(props.h_gk[:Ns_g, ig_local], dtype=np.float64).reshape(Ns_g)
+                q_diff_species_area = float(np.dot(h_gk_vec, j_corr))
+                q_diff_species_pow = q_diff_species_area * A_if
+            except Exception:
+                q_diff_species_area = 0.0
+                q_diff_species_pow = 0.0
 
     # Check if Tl is in layout (coupled) or fixed (explicit Gauss-Seidel)
     if layout.has_block("Tl"):
@@ -319,13 +381,16 @@ def _build_Ts_row(
         idx_Tl = layout.idx_Tl(il_local)
         cols = [idx_Tg, idx_Ts, idx_Tl, idx_mpp]
         vals = [coeff_Tg, coeff_Ts, coeff_Tl, coeff_mpp]
-        rhs = 0.0
+        # q_g_plus_r + q_l_plus_r + q_diff(+r) - q_lat = 0 -> move q_diff to RHS
+        rhs = -q_diff_species_pow
     else:
         # Gauss-Seidel split: Tl fixed at old value
         Tl_fixed = float(state.Tl[il_local]) if state.Tl.size > il_local else 0.0
         cols = [idx_Tg, idx_Ts, idx_mpp]
         vals = [coeff_Tg, coeff_Ts, coeff_mpp]
-        rhs = -coeff_Tl * Tl_fixed  # Move Tl term to RHS
+        const_Tl = coeff_Tl * Tl_fixed
+        # Unknowns part + q_diff(+r) = const_Tl  => unknowns = const_Tl - q_diff
+        rhs = const_Tl - q_diff_species_pow
 
     # Diagnostic preview using current state (not mutating state)
     Ts_cur = float(state.Ts)
@@ -337,7 +402,8 @@ def _build_Ts_row(
     q_g_in = k_g * (Tg_cur - Ts_cur) / dr_g * A_if      # gas -> interface
     q_l_in = k_l * (Tl_cur - Ts_cur) / dr_l * A_if      # liquid -> interface
     q_lat = mpp_cur * L_v * A_if                        # interface -> gas (latent)
-    balance_eq = q_g_in + q_l_in - q_lat
+    q_diff_in = -q_diff_species_pow  # into interface >0
+    balance_eq = q_g_in + q_l_in + q_diff_in - q_lat
 
     # 2) Fourier-style fluxes positive along +r (for transport/assembly consistency)
     q_g_plus_r = -k_g * (Tg_cur - Ts_cur) / dr_g * A_if
@@ -346,34 +412,56 @@ def _build_Ts_row(
 
 
     # Enthalpy-based split diagnostics (no matrix impact)
-    if not hasattr(props, "h_g") or props.h_g is None:
-        raise ValueError("Props.h_g is required for Ts enthalpy diagnostics.")
-    if not hasattr(props, "h_l") or props.h_l is None:
-        raise ValueError("Props.h_l is required for Ts enthalpy diagnostics.")
-    h_g_if = float(props.h_g[ig_local])
-    h_l_if = float(props.h_l[il_local])
+    enthalpy_diag = None
+    if hasattr(props, "h_g") and props.h_g is not None and hasattr(props, "h_l") and props.h_l is not None:
+        h_g_if = float(props.h_g[ig_local])
+        h_l_if = float(props.h_l[il_local])
 
-    dTdr_g_if = (Tg_cur - Ts_cur) / dr_g
-    dTdr_l_if = (Ts_cur - Tl_cur) / dr_l
-    J_if = mpp_cur  # outward (+r) positive
+        dTdr_g_if = (Tg_cur - Ts_cur) / dr_g
+        dTdr_l_if = (Ts_cur - Tl_cur) / dr_l
+        J_if = mpp_cur  # outward (+r) positive
 
-    q_tot_g_area, q_cond_g_area, q_diff_g_area = split_energy_flux_cond_diff_single(
-        cfg, k_g, dTdr_g_if, h_g_if, J_if
-    )
-    q_tot_l_area, q_cond_l_area, q_diff_l_area = split_energy_flux_cond_diff_single(
-        cfg, k_l, dTdr_l_if, h_l_if, J_if
-    )
+        q_tot_g_area, q_cond_g_area, q_diff_g_area = split_energy_flux_cond_diff_single(
+            cfg, k_g, dTdr_g_if, h_g_if, J_if
+        )
+        q_tot_l_area, q_cond_l_area, q_diff_l_area = split_energy_flux_cond_diff_single(
+            cfg, k_l, dTdr_l_if, h_l_if, J_if
+        )
 
-    q_cond_g_pow = q_cond_g_area * A_if
-    q_cond_l_pow = q_cond_l_area * A_if
-    q_diff_g_pow = q_diff_g_area * A_if
-    q_diff_l_pow = q_diff_l_area * A_if
-    q_tot_g_pow = q_tot_g_area * A_if
-    q_tot_l_pow = q_tot_l_area * A_if
+        q_cond_g_pow = q_cond_g_area * A_if
+        q_cond_l_pow = q_cond_l_area * A_if
+        q_diff_g_pow = q_diff_g_area * A_if
+        q_diff_l_pow = q_diff_l_area * A_if
+        q_tot_g_pow = q_tot_g_area * A_if
+        q_tot_l_pow = q_tot_l_area * A_if
 
-    Lv_eff = h_g_if - h_l_if
-    q_lat_eff_pow = q_diff_g_pow - q_diff_l_pow
-    latent_mismatch_pow = q_lat - q_lat_eff_pow
+        Lv_eff = h_g_if - h_l_if
+        q_lat_eff_pow = q_diff_g_pow - q_diff_l_pow
+        latent_mismatch_pow = q_lat - q_lat_eff_pow
+
+        enthalpy_diag = {
+            "h_g_if": h_g_if,
+            "h_l_if": h_l_if,
+            "Lv_eff": Lv_eff,
+            "q_cond_g_area": q_cond_g_area,
+            "q_cond_l_area": q_cond_l_area,
+            "q_diff_g_area": q_diff_g_area,
+            "q_diff_l_area": q_diff_l_area,
+            "q_total_g_area": q_tot_g_area,
+            "q_total_l_area": q_tot_l_area,
+            "q_cond_g_pow": q_cond_g_pow,
+            "q_cond_l_pow": q_cond_l_pow,
+            "q_diff_g_pow": q_diff_g_pow,
+            "q_diff_l_pow": q_diff_l_pow,
+            "q_total_g_pow": q_tot_g_pow,
+            "q_total_l_pow": q_tot_l_pow,
+            "q_lat_old_pow": q_lat,
+            "q_lat_eff_pow": q_lat_eff_pow,
+            "latent_mismatch_pow": latent_mismatch_pow,
+            "balance_old_pow": balance_plus_r,
+            "balance_eff_pow": q_g_plus_r + q_l_plus_r - q_lat_eff_pow,
+            "units": {"area": "W/m^2", "pow": "W"},
+        }
 
     diag_update: Dict[str, Any] = {
         "Ts_energy": {
@@ -400,8 +488,12 @@ def _build_Ts_row(
                 "q_g_in": q_g_in,
                 "q_l_in": q_l_in,
                 "q_lat": q_lat,
+                "q_diff_in": q_diff_in,
                 "balance_eq": balance_eq,
-                "sign_convention": "q_g_in/q_l_in > 0 => heat into interface",
+                "sign_convention": (
+                    "q_g_in/q_l_in/q_diff_in > 0 => heat into interface; "
+                    "q_lat > 0 => latent heat leaving interface (evaporation)"
+                ),
             },
             # 2) Fourier 版，沿 +r 为正，方便和其它模块 cross-check
             "fourier_plus_r": {
@@ -412,28 +504,11 @@ def _build_Ts_row(
                 "sign_convention": "flux > 0 => outward along +r",
             },
             # 3) enthalpy 分解，仍然用 Fourier 方向（跟 energy_flux 模块一致）
-            "enthalpy_split": {
-                "h_g_if": h_g_if,
-                "h_l_if": h_l_if,
-                "Lv_eff": Lv_eff,
-                "q_cond_g_area": q_cond_g_area,
-                "q_cond_l_area": q_cond_l_area,
-                "q_diff_g_area": q_diff_g_area,
-                "q_diff_l_area": q_diff_l_area,
-                "q_total_g_area": q_tot_g_area,
-                "q_total_l_area": q_tot_l_area,
-                "q_cond_g_pow": q_cond_g_pow,
-                "q_cond_l_pow": q_cond_l_pow,
-                "q_diff_g_pow": q_diff_g_pow,
-                "q_diff_l_pow": q_diff_l_pow,
-                "q_total_g_pow": q_tot_g_pow,
-                "q_total_l_pow": q_tot_l_pow,
-                "q_lat_old_pow": q_lat,
-                "q_lat_eff_pow": q_lat_eff_pow,
-                "latent_mismatch_pow": latent_mismatch_pow,
-                "balance_old_pow": balance_plus_r,
-                "balance_eff_pow": q_g_plus_r + q_l_plus_r - q_lat_eff_pow,
-                "units": {"area": "W/m^2", "pow": "W"},
+            #    如果缺少 h_g/h_l，则为 None，避免强制要求 props.h_g/props.h_l
+            "enthalpy_split": enthalpy_diag,
+            "species_diffusion_enthalpy": {
+                "q_diff_species_area": q_diff_species_area,
+                "q_diff_species_pow": q_diff_species_pow,
             },
         }
     }
@@ -458,14 +533,10 @@ def _build_mpp_row(
     idx_mpp: int,
 ) -> Tuple[InterfaceRow, Dict[str, Any]]:
     """
-    Build mpp interface mass-balance row using multicomponent Raoult equilibrium.
+    Numeric-Jacobian-friendly mpp row.
 
-    Steps (Step16.2):
-    1) j_raw = -rho_g * D_i/dr_g * (Yg_cell_i - Yg_eq_i)
-    2) j_corr = j_raw - Yg_eq * sum(j_raw)  (enforce sum j = 0)
-    3) mpp = j_corr_b / (Yl_b - Yg_eq_b) using balance species b
-    4) J_i = mpp * Yg_eq_i + j_corr_i (diagnostics; sum J = mpp)
-    5) Linear row couples all reduced Yg (closure eliminated) + mpp.
+    Residual: R = j_corr_b - mpp * DeltaY_eff = 0
+    Only analytic dependence on mpp is retained; j_corr/Yg_eq are treated as constants per residual build.
     """
     if eq_result is None or "Yg_eq" not in eq_result:
         logger.error("mpp equation requires eq_result with 'Yg_eq'.")
@@ -506,60 +577,31 @@ def _build_mpp_row(
     j_sum = float(np.sum(j_raw))
     j_corr = j_raw - Yg_eq_full * j_sum
 
-    # 2) mpp from balance species
-    delta_Y = Yl_b - Yg_eq_b
-    eps_delta = 1e-14
-    if abs(delta_Y) < eps_delta:
-        mpp_cur = 0.0
+    # 2) effective DeltaY with soft regularization to avoid hard zeroing
+    delta_Y_raw = Yl_b - Yg_eq_b
+    iface_cfg = getattr(cfg, "physics", None)
+    iface_cfg = getattr(iface_cfg, "interface", None)
+    deltaY_min = getattr(iface_cfg, "min_deltaY", 1e-6)
+    if abs(delta_Y_raw) < deltaY_min:
+        sign = 1.0 if delta_Y_raw >= 0.0 else -1.0
+        delta_Y_eff = sign * deltaY_min
     else:
-        mpp_cur = float(j_corr[k_b_full] / delta_Y)
+        delta_Y_eff = delta_Y_raw
 
-    # 2b) Apply no_condensation constraint if configured
-    mpp_unconstrained = mpp_cur
+    mpp_unconstrained = float(j_corr[k_b_full] / delta_Y_eff) if delta_Y_eff != 0.0 else 0.0
+
+    # No-condensation handled as diagnostic only (no clamp here)
     interface_type = getattr(cfg.physics.interface, "type", "no_condensation")
-    if interface_type == "no_condensation" and mpp_cur < 0.0:
-        # Force evaporation-only: clamp negative mpp (condensation) to zero
-        mpp_cur = 0.0
+    no_condensation_applied = interface_type == "no_condensation" and mpp_unconstrained < 0.0
 
-    # 3) total species fluxes for diagnostics
-    J_full = mpp_cur * Yg_eq_full + j_corr
+    # Residual row: delta_Y_eff * mpp = j_corr_b
+    cols: List[int] = [idx_mpp]
+    vals: List[float] = [delta_Y_eff]
+    rhs = float(j_corr[k_b_full])
 
-    # Linearization coefficients for j_corr_b vs reduced Yg (closure eliminated)
+    # Diagnostics
+    J_full = mpp_unconstrained * Yg_eq_full + j_corr
     k_cl = layout.gas_closure_index
-    if k_cl is None:
-        raise ValueError("gas_closure_index missing in layout; required to eliminate closure species.")
-
-    a_full = Yg_eq_b * alpha.copy()
-    a_full[k_b_full] = alpha[k_b_full] * (Yg_eq_b - 1.0)
-    S_eq = float(np.sum(alpha * Yg_eq_full))
-    const_j = alpha[k_b_full] * Yg_eq_b - Yg_eq_b * S_eq
-    const2 = const_j + a_full[k_cl]
-
-    cols: List[int] = []
-    vals: List[float] = []
-
-    if abs(delta_Y) < eps_delta:
-        # Degenerate: enforce mpp = 0 directly
-        rhs = 0.0
-        cols.append(idx_mpp)
-        vals.append(1.0)
-    else:
-        coeff_mpp = delta_Y
-        rhs = const2
-        if layout.has_block("Yg"):
-            for k_red in range(layout.Ns_g_eff):
-                k_full = layout.gas_reduced_to_full_idx[k_red]
-                coeff_Yg = -(a_full[k_full] - a_full[k_cl])
-                cols.append(layout.idx_Yg(k_red, ig_local))
-                vals.append(coeff_Yg)
-        else:
-            # Explicit Yg: move contribution to RHS using current state
-            for k_red in range(layout.Ns_g_eff):
-                k_full = layout.gas_reduced_to_full_idx[k_red]
-                rhs -= -(a_full[k_full] - a_full[k_cl]) * float(Yg_cell_full[k_full])
-
-        cols.append(idx_mpp)
-        vals.append(coeff_mpp)
 
     diag_update: Dict[str, Any] = {
         "evaporation": {
@@ -570,15 +612,16 @@ def _build_mpp_row(
             "k_closure_full": k_cl,
             "dr_g": dr_g,
             "rho_g": rho_g,
-            "DeltaY": delta_Y,
+            "DeltaY_raw": delta_Y_raw,
+            "DeltaY_eff": delta_Y_eff,
             "j_sum": j_sum,
             "j_raw_sum": float(j_raw.sum()),
             "j_corr_sum": float(j_corr.sum()),
-            "mpp_eval": mpp_cur,
+            "mpp_eval": mpp_unconstrained,
             "mpp_unconstrained": mpp_unconstrained,
-            "no_condensation_applied": (interface_type == "no_condensation" and mpp_unconstrained < 0.0),
+            "no_condensation_applied": no_condensation_applied,
             "interface_type": interface_type,
-            "sumJ_minus_mpp": float(J_full.sum() - mpp_cur),
+            "sumJ_minus_mpp": float(J_full.sum() - mpp_unconstrained),
             "A_if": A_if,
             "Yg_eq_full": Yg_eq_full,
             "j_corr_full": j_corr,

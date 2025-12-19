@@ -48,22 +48,30 @@ def _segment_widths_to_faces(r0: float, widths: FloatArray) -> FloatArray:
     return faces
 
 
-def build_grid(cfg: CaseConfig) -> Grid1D:
+def _build_grid_for_radius(cfg: CaseConfig, Rd: float, Nl: int | None = None, Ng: int | None = None) -> Grid1D:
     """
-    Build a static 1D spherical grid from CaseConfig.geometry.
+    Build a 1D spherical grid for a given droplet radius Rd.
 
-    Segments:
-      - Liquid: [0, a0] with N_liq cells (tanh, biased to interface)
-      - Gas:    [a0, R_inf] with N_gas cells (tanh, biased to interface)
-    Interface face index = N_liq.
+    Nl/Ng can be specified to enforce consistency with an existing layout/grid.
     """
     gcfg = cfg.geometry
     mesh = gcfg.mesh
 
-    Nl = int(gcfg.N_liq)
-    Ng = int(gcfg.N_gas)
-    a0 = float(gcfg.a0)
+    Nl_base = int(gcfg.N_liq)
+    Ng_base = int(gcfg.N_gas)
+    if Nl is None:
+        Nl = Nl_base
+    if Ng is None:
+        Ng = Ng_base
+    if Nl != Nl_base or Ng != Ng_base:
+        raise ValueError(f"N_liq/N_gas mismatch with geometry: ({Nl},{Ng}) vs ({Nl_base},{Ng_base})")
+
+    a0 = float(Rd)
     Rinf = float(gcfg.R_inf)
+    if a0 <= 0.0:
+        raise ValueError(f"Rd_new must be positive, got {a0}")
+    if a0 >= Rinf:
+        raise ValueError(f"Rd_new={a0} must be less than R_inf={Rinf}")
 
     if mesh.liq_method != "tanh" or mesh.gas_method != "tanh":
         raise ValueError(f"Only 'tanh' mesh methods are supported (liq={mesh.liq_method}, gas={mesh.gas_method}).")
@@ -134,3 +142,14 @@ def build_grid(cfg: CaseConfig) -> Grid1D:
 
     # Grid1D.__post_init__ performs consistency checks.
     return grid
+
+
+def build_grid(cfg: CaseConfig) -> Grid1D:
+    """Build grid for initial radius cfg.geometry.a0."""
+    Rd0 = float(cfg.geometry.a0)
+    return _build_grid_for_radius(cfg, Rd0)
+
+
+def rebuild_grid_with_Rd(cfg: CaseConfig, Rd_new: float, grid_ref: Grid1D) -> Grid1D:
+    """Rebuild grid using updated Rd, keeping Nl/Ng consistent with an existing grid."""
+    return _build_grid_for_radius(cfg, Rd_new, Nl=grid_ref.Nl, Ng=grid_ref.Ng)

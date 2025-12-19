@@ -38,6 +38,7 @@ from core.layout import UnknownLayout
 from core.types import CaseConfig, Grid1D, Props, State
 from physics.stefan_velocity import compute_stefan_velocity
 from physics.flux_convective_gas import compute_gas_convective_flux_T
+from properties.equilibrium import build_equilibrium_model, compute_interface_equilibrium
 from physics.interface_bc import build_interface_coeffs, EqResultLike
 from physics.radius_eq import build_radius_row
 from physics.interface_bc import InterfaceCoeffs  # type hint only
@@ -97,8 +98,9 @@ def build_transport_system(
     state_old: State,
     props: Props,
     dt: float,
-    eq_result: EqResultLike | None = None,
     state_guess: State | None = None,
+    eq_model=None,
+    eq_result: EqResultLike | None = None,
     return_diag: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray] | Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
     """
@@ -153,6 +155,41 @@ def build_transport_system(
     diag_sys: Dict[str, Any] = {}
 
     gas_start = grid.gas_slice.start if grid.gas_slice is not None else grid.Nl
+
+    # Recompute interface equilibrium each residual build (keeps Ts/Yg/Yl coupling fresh)
+    if phys.include_mpp and eq_result is None:
+        if eq_model is None:
+            # Attempt to build an equilibrium model from available data
+            try:
+                Ns_g = state_old.Yg.shape[0]
+                Ns_l = state_old.Yl.shape[0]
+                M_g = np.ones(Ns_g, dtype=float)
+                M_l = np.ones(Ns_l, dtype=float)
+                # Try to pull molar masses from props if present
+                if hasattr(props, "M_g"):
+                    Mg_attr = getattr(props, "M_g")
+                    if Mg_attr is not None:
+                        M_g = np.asarray(Mg_attr, dtype=float)
+                if hasattr(props, "M_l"):
+                    Ml_attr = getattr(props, "M_l")
+                    if Ml_attr is not None:
+                        M_l = np.asarray(Ml_attr, dtype=float)
+                eq_model = build_equilibrium_model(cfg, Ns_g=Ns_g, Ns_l=Ns_l, M_g=M_g, M_l=M_l)
+            except Exception:
+                eq_model = None
+        try:
+            il_if = grid.Nl - 1
+            ig_if = 0
+            Ts_if = float(state_old.Ts)
+            Pg_if = float(getattr(cfg.initial, "P_inf", 101325.0))
+            Yl_face = np.asarray(state_old.Yl[:, il_if], dtype=np.float64)
+            Yg_face = np.asarray(state_old.Yg[:, ig_if], dtype=np.float64)
+            if eq_model is not None:
+                Yg_eq, y_cond, psat = compute_interface_equilibrium(eq_model, Ts_if, Pg_if, Yl_face, Yg_face)
+                eq_result = {"Yg_eq": np.asarray(Yg_eq), "y_cond": np.asarray(y_cond), "psat": np.asarray(psat)}
+        except Exception as exc:
+            logger.warning("Failed to compute interface equilibrium in residual build: %s", exc)
+            eq_result = None
 
     for ig in range(Ng):
         row = layout.idx_Tg(ig)

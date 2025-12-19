@@ -232,6 +232,9 @@ class CaseInitial:
     Yg: Mapping[str, float]
     Yl: Mapping[str, float]
     Y_seed: float
+    t_init_T: float = 1.0e-6
+    t_init_Y: float = 1.0e-6
+    D_init_Y: float = 1.0e-5
 
 
 @dataclass(slots=True)
@@ -252,9 +255,10 @@ class CasePETSc:
 class CaseIOFields:
     """Fields to output."""
 
-    scalars: List[str]
-    gas: List[str]
-    liquid: List[str]
+    scalars: List[str] = field(default_factory=list)
+    gas: List[str] = field(default_factory=list)
+    liquid: List[str] = field(default_factory=list)
+    interface: List[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)

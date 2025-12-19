@@ -25,7 +25,8 @@ from typing import Mapping, Optional, Sequence
 import numpy as np
 import yaml
 
-from core.grid import build_grid
+from core.grid import build_grid, rebuild_grid_with_Rd
+from core.remap import remap_state_to_new_grid
 from core.layout import build_layout
 from core.types import (
     CaseChecks,
@@ -50,6 +51,7 @@ from core.types import (
     State,
 )
 from properties.compute_props import compute_props, get_or_build_models
+from physics.initial import build_initial_state_erfc
 from properties.equilibrium import build_equilibrium_model, compute_interface_equilibrium
 from properties.gas import GasPropertiesModel
 from properties.liquid import LiquidPropertiesModel
@@ -190,6 +192,9 @@ def _load_case_config(cfg_path: str) -> CaseConfig:
         Yg=init_raw["Yg"],
         Yl=init_raw["Yl"],
         Y_seed=init_raw["Y_seed"],
+        t_init_T=init_raw.get("t_init_T", 1.0e-6),
+        t_init_Y=init_raw.get("t_init_Y", 1.0e-6),
+        D_init_Y=init_raw.get("D_init_Y", 1.0e-5),
     )
 
     petsc_raw = raw["petsc"]
@@ -210,6 +215,7 @@ def _load_case_config(cfg_path: str) -> CaseConfig:
         scalars=list(fields_raw.get("scalars", [])),
         gas=list(fields_raw.get("gas", [])),
         liquid=list(fields_raw.get("liquid", [])),
+        interface=list(fields_raw.get("interface", [])),
     )
     io_cfg = CaseIO(
         write_every=io_raw["write_every"],
@@ -335,53 +341,6 @@ def _build_mass_fractions(
         elif Ns > 0:
             Y[0, j] = 1.0
     return Y
-
-
-def _build_initial_state(
-    cfg: CaseConfig,
-    grid: Grid1D,
-    gas_model: GasPropertiesModel,
-    liq_model: Optional[LiquidPropertiesModel],
-) -> State:
-    """Construct initial State from CaseConfig."""
-    T_inf = float(cfg.initial.T_inf)
-    T_d0 = float(cfg.initial.T_d0)
-    if cfg.physics.interface.bc_mode == "Ts_fixed":
-        Ts0 = float(cfg.physics.interface.Ts_fixed)
-    else:
-        Ts0 = float(T_d0)
-    seed = float(cfg.initial.Y_seed)
-
-    gas_names = list(cfg.species.gas_species) or list(gas_model.gas.species_names)
-    liq_names = list(cfg.species.liq_species)
-
-    Tg0 = np.full(grid.Ng, T_inf, dtype=np.float64)
-    Tl0 = np.full(grid.Nl, T_d0, dtype=np.float64)
-
-    Yg0 = _build_mass_fractions(
-        gas_names,
-        cfg.initial.Yg,
-        closure_name=cfg.species.gas_balance_species,
-        seed=seed,
-        n_cells=grid.Ng,
-    )
-    Yl0 = _build_mass_fractions(
-        liq_names,
-        cfg.initial.Yl,
-        closure_name=cfg.species.liq_balance_species,
-        seed=seed,
-        n_cells=grid.Nl,
-    )
-
-    return State(
-        Tg=Tg0,
-        Yg=Yg0,
-        Tl=Tl0,
-        Yl=Yl0,
-        Ts=Ts0,
-        mpp=0.0,
-        Rd=float(cfg.geometry.a0),
-    )
 
 
 def _prepare_run_dir(cfg: CaseConfig, cfg_path: str) -> Path:
@@ -612,7 +571,7 @@ def _load_writers_module():
     return module
 
 
-def _maybe_write_spatial(cfg: CaseConfig, grid: Grid1D, state: State, step_id: int) -> None:
+def _maybe_write_spatial(cfg: CaseConfig, grid: Grid1D, state: State, step_id: int, t: float | None = None) -> None:
     """Write spatial fields at configured frequency."""
     write_every = int(getattr(cfg.io, "write_every", 0) or 0)
     if write_every <= 0:
@@ -624,7 +583,7 @@ def _maybe_write_spatial(cfg: CaseConfig, grid: Grid1D, state: State, step_id: i
         write_fn = getattr(module, "write_step_spatial", None)
         if write_fn is None:
             return
-        write_fn(cfg=cfg, grid=grid, state=state)
+        write_fn(cfg=cfg, grid=grid, state=state, step_id=step_id, t=t)
     except Exception as exc:  # pragma: no cover - best-effort output
         logger.warning("write_step_spatial failed at step %s: %s", step_id, exc)
 
@@ -663,7 +622,7 @@ def run_case(cfg_path: str, *, max_steps: Optional[int] = None, log_level: int |
         grid = build_grid(cfg)
         layout = build_layout(cfg, grid)
 
-        state = _build_initial_state(cfg, grid, gas_model, liq_model)
+        state = build_initial_state_erfc(cfg, grid, gas_model, liq_model)
         props, _ = compute_props(cfg, grid, state)
 
         # Scalars writer setup
@@ -675,9 +634,28 @@ def run_case(cfg_path: str, *, max_steps: Optional[int] = None, log_level: int |
         writer_scalars = None
         integ = None
         eq_model = None
+        Rd_stop = None
         try:
             fh_scalars, writer_scalars, _ = _open_scalars_csv(run_dir, cfg, cond_names)
             integ = _init_mass_integrator(cfg, state, props)
+
+            # Radius-based early stop criterion
+            RD_STOP_FACTOR = 0.1
+            try:
+                Rd0 = float(state.Rd)
+            except Exception:
+                Rd0 = None
+            if Rd0 is not None and np.isfinite(Rd0) and Rd0 > 0.0:
+                Rd_stop = RD_STOP_FACTOR * Rd0
+                logger.info(
+                    "Radius stop criterion enabled: Rd_stop = %.6e = %.3f * Rd0 (Rd0 = %.6e).",
+                    Rd_stop,
+                    RD_STOP_FACTOR,
+                    Rd0,
+                )
+            else:
+                logger.warning("Could not determine initial Rd; radius stop criterion disabled.")
+
             if cfg.physics.include_mpp:
                 Ns_g = len(cfg.species.gas_species)
                 Ns_l = len(cfg.species.liq_species)
@@ -704,8 +682,9 @@ def run_case(cfg_path: str, *, max_steps: Optional[int] = None, log_level: int |
         t = float(cfg.time.t0)
         step_id = 0
         effective_max_steps = max_steps if max_steps is not None else cfg.time.max_steps
+        ended_by_radius = False
 
-        _maybe_write_spatial(cfg, grid, state, step_id)
+        _maybe_write_spatial(cfg, grid, state, step_id, t)
 
         while t < cfg.time.t_end:
             step_id += 1
@@ -739,6 +718,35 @@ def run_case(cfg_path: str, *, max_steps: Optional[int] = None, log_level: int |
             props = res.props_new
             t = res.diag.t_new
 
+            if cfg.physics.include_Rd and bool(getattr(cfg.geometry, "use_moving_grid", True)):
+                try:
+                    grid_new = rebuild_grid_with_Rd(cfg, float(state.Rd), grid_ref=grid)
+                    state = remap_state_to_new_grid(state, grid, grid_new, cfg, layout)
+                    props, _ = compute_props(cfg, grid_new, state)
+                    # Rebuild equilibrium model to stay consistent with remapped state
+                    try:
+                        Ns_g = len(cfg.species.gas_species)
+                        Ns_l = len(cfg.species.liq_species)
+                        M_g = np.ones(Ns_g, dtype=float)
+                        M_l = np.ones(Ns_l, dtype=float)
+                        try:
+                            M_g = np.asarray(gas_model.gas.molecular_weights, dtype=float) / 1000.0
+                        except Exception:
+                            pass
+                        try:
+                            for i, name in enumerate(cfg.species.liq_species):
+                                if name in cfg.species.mw_kg_per_mol:
+                                    M_l[i] = float(cfg.species.mw_kg_per_mol[name])
+                        except Exception:
+                            pass
+                        eq_model = build_equilibrium_model(cfg, Ns_g=Ns_g, Ns_l=Ns_l, M_g=M_g, M_l=M_l)
+                    except Exception as exc:
+                        logger.warning("Failed to rebuild equilibrium model after remeshing: %s", exc)
+                    grid = grid_new
+                except Exception as exc:
+                    logger.error("Failed to remesh with updated Rd: %s", exc)
+                    return 2
+
             if writer_scalars is not None and integ is not None and scalars_every > 0:
                 if step_id % scalars_every == 0:
                     try:
@@ -758,9 +766,34 @@ def run_case(cfg_path: str, *, max_steps: Optional[int] = None, log_level: int |
                     except Exception as exc:
                         logger.warning("Failed to write scalars at step %s: %s", step_id, exc)
 
-            _maybe_write_spatial(cfg, grid, state, step_id)
+            _maybe_write_spatial(cfg, grid, state, step_id, t)
 
-        logger.info("Completed run: t=%.6e reached t_end=%.6e after %d steps.", t, cfg.time.t_end, step_id)
+            if Rd_stop is not None:
+                try:
+                    Rd_now = float(state.Rd)
+                except Exception:
+                    Rd_now = None
+                if Rd_now is not None and np.isfinite(Rd_now) and Rd_now <= Rd_stop:
+                    logger.info(
+                        "Stopping run: Rd=%.6e <= Rd_stop=%.6e at t=%.6e (step %d).",
+                        Rd_now,
+                        Rd_stop,
+                        t,
+                        step_id,
+                    )
+                    ended_by_radius = True
+                    break
+
+        if ended_by_radius:
+            logger.info(
+                "Completed run early: t=%.6e after %d steps; Rd hit threshold Rd_stop=%.6e (final Rd=%.6e).",
+                t,
+                step_id,
+                float(Rd_stop) if Rd_stop is not None else float("nan"),
+                float(state.Rd),
+            )
+        else:
+            logger.info("Completed run: t=%.6e reached t_end=%.6e after %d steps.", t, cfg.time.t_end, step_id)
         return 0
     except Exception as exc:
         tb = traceback.format_exc()

@@ -7,7 +7,6 @@ Minimal output helpers (Step 12.4):
 from __future__ import annotations
 
 import csv
-import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -66,11 +65,67 @@ def write_step_scalars(cfg: CaseConfig, t: float, state: State, diag: "StepDiagn
         writer.writerow(row)
 
 
-def write_step_spatial(cfg: CaseConfig, grid: Grid1D, state: State) -> None:
+def write_step_spatial(cfg: CaseConfig, grid: Grid1D, state: State, step_id: int | None = None, t: float | None = None) -> None:
     """
-    Placeholder for spatial field output.
-    MVP: no-op; can be extended to write npz/csv at selected steps.
+    Write spatial snapshot to ``spatial/snapshot_XXXXXX.npz`` under the case directory.
+
+    - Uses cfg.io.fields.{gas, liquid, interface} as allow-lists.
+    - Includes r_c/r_f (if present) and a running r_index for convenience.
+    - Adds step_id/t when provided by the caller.
     """
-    _ = (cfg, grid, state)
-    # Implement spatial dumps in later steps as needed.
-    return
+    out_dir = (Path(cfg.paths.case_dir) / "spatial") if hasattr(cfg, "paths") else Path("spatial")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    counter_path = out_dir / "_spatial_index.txt"
+    try:
+        idx = int(counter_path.read_text().strip())
+    except FileNotFoundError:
+        idx = 0
+    except ValueError:
+        idx = 0
+    counter_path.write_text(str(idx + 1))
+
+    out_path = out_dir / f"snapshot_{idx:06d}.npz"
+
+    data = {}
+
+    # Grid metadata (best effort)
+    try:
+        rc = getattr(grid, "r_c", None)
+        rf = getattr(grid, "r_f", None)
+        if rc is not None:
+            rc_arr = np.asarray(rc)
+            data["r_c"] = rc_arr
+            data["r_index"] = np.arange(rc_arr.size)
+        if rf is not None:
+            data["r_f"] = np.asarray(rf)
+    except Exception:
+        pass
+
+    if step_id is not None:
+        data["step_id"] = np.asarray(step_id)
+    if t is not None:
+        data["t"] = np.asarray(t)
+
+    fields = getattr(cfg, "io", None)
+    field_cfg = getattr(fields, "fields", None) if fields is not None else None
+
+    gas_fields = getattr(field_cfg, "gas", []) or []
+    for name in gas_fields:
+        if not hasattr(state, name):
+            continue
+        data[name] = np.asarray(getattr(state, name))
+
+    liq_fields = getattr(field_cfg, "liquid", []) or []
+    for name in liq_fields:
+        if not hasattr(state, name):
+            continue
+        data[name] = np.asarray(getattr(state, name))
+
+    iface_fields = getattr(field_cfg, "interface", []) or []
+    for name in iface_fields:
+        if not hasattr(state, name):
+            continue
+        data[name] = np.asarray(getattr(state, name))
+
+    np.savez(out_path, **data)

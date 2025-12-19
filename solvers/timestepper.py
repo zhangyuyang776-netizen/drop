@@ -101,11 +101,6 @@ def advance_one_step_scipy(
     state_old = state.copy()
     props_old = props  # Step 12.2: treat props as quasi-steady (no recompute here)
 
-    eq_result: EqResultLike = None
-    if cfg.physics.include_mpp:
-        eq_result = _build_eq_result_for_step(cfg=cfg, grid=grid, state=state_old, props=props_old)
-        eq_result = _complete_Yg_eq_with_closure(cfg=cfg, layout=layout, eq_result=eq_result)
-
     # initial nonlinear guess (MVP: old state)
     state_guess = state_old
 
@@ -118,7 +113,6 @@ def advance_one_step_scipy(
             state_guess=state_guess,
             props=props_old,
             dt=dt,
-            eq_result=eq_result,
         )
     except Exception as exc:
         logger.exception("Failed to assemble transport system.")
@@ -280,7 +274,6 @@ def _assemble_transport_system_step12(
     state_guess: State,
     props: Props,
     dt: float,
-    eq_result: EqResultLike,
 ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
     """Wrapper for build_transport_system with basic shape checks."""
     result = build_transport_system(
@@ -291,7 +284,6 @@ def _assemble_transport_system_step12(
         state_guess=state_guess,
         props=props,
         dt=dt,
-        eq_result=eq_result,
         return_diag=True,
     )
     # build_transport_system may return a tuple of length 2 or 3 depending on return_diag
@@ -332,18 +324,23 @@ def _postprocess_species_bounds(cfg: CaseConfig, layout: UnknownLayout, state: S
         if ymax > 1.0 + tol:
             raise ValueError(f"Gas species exceed 1 after solve (max={ymax:.3e}, tol={tol:.3e})")
 
-    # Recompute closure from reduced species (already done in apply_u_to_state, but double-check)
+    # Recompute closure from all non-closure species (align with layout/_reconstruct_closure)
     closure_idx = getattr(layout, "gas_closure_index", None)
     if closure_idx is not None:
-        sum_reduced = np.zeros(state.Yg.shape[1], dtype=np.float64)
-        for k_red in range(layout.Ns_g_eff):
-            k_full = layout.gas_reduced_to_full_idx[k_red]
-            sum_reduced += state.Yg[k_full, :]
-        closure = 1.0 - sum_reduced
-        if np.any(closure < -tol):
-            raise ValueError(f"Gas closure species negative beyond tol={tol}: min={float(np.min(closure)):.3e}")
-        if np.any(closure > 1.0 + tol):
-            raise ValueError(f"Gas closure species exceeds 1 beyond tol={tol}: max={float(np.max(closure)):.3e}")
+        sum_other = np.sum(state.Yg, axis=0) - state.Yg[closure_idx, :]
+        closure = 1.0 - sum_other
+
+        if not clamp:
+            if np.any(closure < -tol):
+                raise ValueError(f"Gas closure species negative beyond tol={tol}: min={float(np.min(closure)):.3e}")
+            if np.any(closure > 1.0 + tol):
+                raise ValueError(f"Gas closure species exceeds 1 beyond tol={tol}: max={float(np.max(closure)):.3e}")
+        else:
+            # Soft clamp small violations to stay consistent with layout reconstruction
+            closure = np.where((closure < 0.0) & (closure >= -tol), 0.0, closure)
+            closure = np.where((closure > 1.0) & (closure <= 1.0 + tol), 1.0, closure)
+            closure = np.clip(closure, 0.0, 1.0)
+
         state.Yg[closure_idx, :] = closure
 
     # Final physical constraint: ensure all species are in [0, 1] range

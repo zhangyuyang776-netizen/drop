@@ -1,12 +1,12 @@
 case:
-  id: runD_evap_multiliq
-  title: "RunD: two condensables (n-Dodecane + n-Heptane), Ts+mpp+Rd+Yl"
+  id: evap_single
+  title: "single_component_evap_no_chem"
   version: 1
-  notes: "StepP4: full multi-liquid Raoult, solve_Yl on"
+  notes: "Single-component (NC12H26) evaporation; SciPy linear split; Ts/mpp/Rd on."
 
 paths:
-  output_root: "../out/runD"
-  case_dir: "../out/runD"
+  output_root: "../out"
+  case_dir: "../out/evap_single"
   mechanism_dir: "../mechanism"
   gas_mech: "mech.yaml"
 
@@ -28,7 +28,8 @@ physics:
   solve_Tg: true
   solve_Yg: true
   solve_Tl: true
-  solve_Yl: true          # multi-liquid solve
+  solve_Yl: false
+
   include_Ts: true
   include_mpp: true
   include_Rd: true
@@ -36,40 +37,38 @@ physics:
 
   interface:
     type: "no_condensation"
-    bc_mode: "equilibrium"
+    bc_mode: "Ts_fixed"
     Ts_fixed: 300.0
     equilibrium:
       method: "raoult_psat"
       psat_model: "coolprop"
       background_fill: "farfield"
-      condensables_gas: ["NC12H26", "NC7H16"]
+      condensables_gas: ["NC12H26"]
       coolprop:
         backend: "HEOS"
-        fluids: ["n-Dodecane", "n-Heptane"]
+        fluids: ["n-Dodecane"]
 
 species:
   gas_balance_species: "N2"
   gas_mechanism_phase: "gas"
-  solve_gas_mode: "all_minus_closure"
+  solve_gas_mode: "condensables_only"
   solve_gas_species: []
-  gas_species: ["NC12H26", "NC7H16", "O2", "N2"]
+  gas_species: []               # empty -> use mechanism order
 
-  liq_species: ["n-Dodecane", "n-Heptane"]
-  liq_balance_species: "n-Dodecane"
+  liq_species: ["NC12H26"]
+  liq_balance_species: "NC12H26"
 
   liq2gas_map:
-    n-Dodecane: "NC12H26"
-    n-Heptane: "NC7H16"
+    NC12H26: "NC12H26"
+
   mw_kg_per_mol:
-    n-Dodecane: 0.17034
-    n-Heptane: 0.10021
+    NC12H26: 0.17034
   molar_volume_cm3_per_mol:
-    n-Dodecane: 227.51
-    n-Heptane: 146.5
+    NC12H26: 227.51
 
 geometry:
   a0: 1.0e-4
-  R_inf: 5.0e-3
+  R_inf: 2.0e-3
   N_liq: 6
   N_gas: 60
   mesh:
@@ -84,8 +83,8 @@ geometry:
 
 time:
   t0: 0.0
-  dt: 1.0e-6
-  t_end: 2.0e-4
+  dt: 1.0e-5
+  t_end: 2.0e-2
   max_steps: null
 
 discretization:
@@ -94,13 +93,13 @@ discretization:
   mass_matrix: "rhoVc_p"
 
 initial:
-  T_inf: 900.0
-  P_inf: 101325.0
+  T_inf: 800.0
+  P_inf: 1.0e5
   T_d0: 300.0
-  Yg: {"N2": 0.79, "O2": 0.21}
+  Yg:
+    N2: 1
   Yl:
-    n-Dodecane: 0.5
-    n-Heptane: 0.5
+    NC12H26: 1.0
   Y_seed: 1.0e-12
 
 transport:
@@ -118,13 +117,14 @@ petsc:
   monitor: true
 
 io:
-  write_every: 0
-  formats: []
-  save_grid: false
+  write_every: 10
+  formats: ["csv", "npy"]
+  save_grid: true
   fields:
-    scalars: ["t", "Ts", "mpp", "Rd"]
+    scalars: ["Ts", "Rd", "mpp", "Tg_min", "Tg_max", "Tl_min", "Tl_max"]
     gas: ["Tg", "Yg"]
-    liquid: ["Tl", "Yl"]
+    liquid: ["Tl"]
+    interface: ["Ts", "mpp", "Rd"]
 
 checks:
   enforce_sumY: true
