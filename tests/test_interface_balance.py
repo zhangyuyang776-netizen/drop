@@ -67,7 +67,7 @@ def _make_simple_case(grid: Grid1D) -> CaseConfig:
 
     species = CaseSpecies(
         gas_balance_species="N2",
-        gas_species=["FUEL", "N2"],
+        gas_species_full=["FUEL", "N2"],
         liq_species=["FUEL"],
         liq_balance_species="FUEL",
         liq2gas_map={"FUEL": "FUEL"},
@@ -184,7 +184,7 @@ def interface_test_env():
     rho_g = np.full(grid.Ng, 1.0, dtype=float)
     cp_g = np.full(grid.Ng, 1.0e3, dtype=float)
     k_g = np.full(grid.Ng, 0.1, dtype=float)
-    D_g = np.full((len(cfg.species.gas_species), grid.Ng), 1.0e-5, dtype=float)
+    D_g = np.full((len(cfg.species.gas_species_full), grid.Ng), 1.0e-5, dtype=float)
 
     rho_l = np.full(grid.Nl, 800.0, dtype=float)
     cp_l = np.full(grid.Nl, 2.0e3, dtype=float)
@@ -202,8 +202,8 @@ def interface_test_env():
 
     Tg = np.full(grid.Ng, 300.0, dtype=float)
     Tl = np.full(grid.Nl, 300.0, dtype=float)
-    # Gas species order matches cfg.species.gas_species: ["FUEL", "N2"]
-    Yg = np.zeros((len(cfg.species.gas_species), grid.Ng), dtype=float)
+    # Gas species order matches cfg.species.gas_species_full: ["FUEL", "N2"]
+    Yg = np.zeros((len(cfg.species.gas_species_full), grid.Ng), dtype=float)
     Yl = np.ones((len(cfg.species.liq_species), grid.Nl), dtype=float)
 
     state = State(

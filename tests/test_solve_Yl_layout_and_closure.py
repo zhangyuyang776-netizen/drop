@@ -14,7 +14,7 @@ from core.types import State  # noqa: E402
 
 def _make_cfg(*, solve_Yl: bool):
     species = SimpleNamespace(
-        gas_species=["N2"],
+        gas_species_full=["N2"],
         gas_balance_species="N2",
         liq_species=["A_l", "B_l", "C_l"],
         liq_balance_species="C_l",
@@ -50,7 +50,7 @@ def test_solve_Yl_layout_size_and_closure_reconstruction():
 
     Ng = 0
     Tg = np.zeros((Ng,), float)
-    Yg = np.zeros((len(cfg_on.species.gas_species), Ng), float)
+    Yg = np.zeros((len(cfg_on.species.gas_species_full), Ng), float)
     Tl = np.zeros((Nl,), float)
     Yl0 = np.zeros((Ns_l_full, Nl), float)
 

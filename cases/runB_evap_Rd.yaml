@@ -41,7 +41,6 @@ physics:
     equilibrium:
       method: "raoult_psat"
       psat_model: "coolprop"
-      background_fill: "farfield"
       condensables_gas: ["NC12H26"]
       coolprop:
         backend: "HEOS"
@@ -50,9 +49,6 @@ physics:
 species:
   gas_balance_species: "N2"
   gas_mechanism_phase: "gas"
-  solve_gas_mode: "all_minus_closure"
-  solve_gas_species: []
-  gas_species: ["NC12H26", "NC7H16", "O2", "N2"]
 
   liq_species: ["n-Dodecane"]
   liq_balance_species: "n-Dodecane"
@@ -114,6 +110,7 @@ petsc:
 
 io:
   write_every: 0
+  scalars_write_every: 1
   formats: []
   save_grid: false
   fields:

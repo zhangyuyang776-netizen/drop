@@ -1,5 +1,5 @@
 """
-Interface phase-equilibrium utilities (Raoult + psat) with configurable background fill.
+Interface phase-equilibrium utilities (Raoult + psat) with interface-noncondensables background fill.
 
 Responsibilities:
 - Build an EquilibriumModel from CaseConfig and species data (indices, molar masses, farfield Y).
@@ -53,7 +53,6 @@ def mole_to_mass(X: FloatArray, M: FloatArray) -> FloatArray:
 class EquilibriumModel:
     method: str  # "raoult_psat"
     psat_model: str  # "auto" | "coolprop" | "clausius"
-    background_fill: str  # "farfield" | "interface_noncondensables"
 
     gas_names: List[str]
     liq_names: List[str]
@@ -155,7 +154,7 @@ def build_equilibrium_model(
     sp_cfg = cfg.species
     liq2gas_map = dict(sp_cfg.liq2gas_map)
 
-    gas_names = list(cfg.species.gas_species) if hasattr(cfg.species, "gas_species") else list(eq_cfg.condensables_gas)
+    gas_names = list(cfg.species.gas_species_full)
     liq_names = list(sp_cfg.liq_species)
 
     if len(gas_names) != Ns_g:
@@ -214,7 +213,6 @@ def build_equilibrium_model(
     return EquilibriumModel(
         method=eq_cfg.method,
         psat_model=eq_cfg.psat_model,
-        background_fill=eq_cfg.background_fill,
         gas_names=gas_names,
         liq_names=liq_names,
         idx_cond_l=idx_cond_l_arr,
@@ -245,12 +243,12 @@ def compute_interface_equilibrium_full(
     2) convert liquid mass -> mole fractions.
     3) build psat vector (clipped non-negative).
     4) Raoult partial pressures for condensables (with NaN/neg guards).
-    5) cap total condensable partial pressure to 0.995*Pg.
-    6) condensable gas mole fractions.
-    7) choose background source mole fractions (interface/farfield); normalize on background set.
-    8) allocate background total fraction = 1 - sum(y_cond).
-    9) assemble full gas mole fractions; clip/optional renorm for numerical noise.
-    10) convert mole -> mass fractions for gas.
+     5) cap total condensable partial pressure to 0.995*Pg.
+     6) condensable gas mole fractions.
+     7) choose background source mole fractions from interface gas; normalize on background set.
+     8) allocate background total fraction = 1 - sum(y_cond).
+     9) assemble full gas mole fractions; clip/optional renorm for numerical noise.
+     10) convert mole -> mass fractions for gas.
     """
     Ns_g = len(model.M_g)
     Ns_l = len(model.M_l)
@@ -290,12 +288,7 @@ def compute_interface_equilibrium_full(
     mask_bg[idxG] = False
 
     X_g_face = mass_to_mole(Yg_face, model.M_g)
-    if model.background_fill == "interface_noncondensables":
-        X_source = X_g_face
-    elif model.background_fill == "farfield":
-        X_source = model.Xg_farfield
-    else:
-        raise ValueError(f"Unknown background_fill mode: {model.background_fill}")
+    X_source = X_g_face
 
     X_bg = np.where(mask_bg, X_source, 0.0)
     s_bg = float(np.sum(X_bg))

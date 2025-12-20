@@ -6,7 +6,6 @@ import numpy as np
 from scipy import special
 
 from core.types import CaseConfig, Grid1D, State
-from properties.equilibrium import build_equilibrium_model
 from properties.gas import GasPropertiesModel
 from properties.liquid import LiquidPropertiesModel
 
@@ -42,24 +41,6 @@ def _build_mass_fractions(
     return Y
 
 
-def _get_molar_masses(
-    cfg: CaseConfig, gas_model: GasPropertiesModel, Ns_g: int, Ns_l: int
-) -> tuple[np.ndarray, np.ndarray]:
-    M_g = np.ones(Ns_g, dtype=np.float64)
-    M_l = np.ones(Ns_l, dtype=np.float64)
-    try:
-        M_g = np.asarray(gas_model.gas.molecular_weights, dtype=np.float64) / 1000.0
-    except Exception:
-        pass
-    for i, name in enumerate(cfg.species.liq_species):
-        if name in cfg.species.mw_kg_per_mol:
-            try:
-                M_l[i] = float(cfg.species.mw_kg_per_mol[name])
-            except Exception:
-                continue
-    return M_g, M_l
-
-
 def build_initial_state_erfc(
     cfg: CaseConfig,
     grid: Grid1D,
@@ -79,11 +60,8 @@ def build_initial_state_erfc(
     # Unified initialization time scale for both temperature and species
     t_init = max(float(getattr(cfg.initial, "t_init_T", 1.0e-6)), 0.0)
 
-    # Ts initial
-    if getattr(cfg.physics.interface, "bc_mode", "") == "Ts_fixed":
-        Ts0 = float(getattr(cfg.physics.interface, "Ts_fixed", T_d0))
-    else:
-        Ts0 = T_d0
+    # Ts initial: always equal to droplet initial temperature
+    Ts0 = T_d0
 
     gas_names = list(cfg.species.gas_species_full)
     liq_names = list(cfg.species.liq_species)
@@ -114,6 +92,7 @@ def build_initial_state_erfc(
         if rho_g > 0 and cp_g > 0:
             alpha_g = k_g / (rho_g * cp_g)
     except Exception:
+        print("cantera计算失败使用默认1e-5")
         alpha_g = 1.0e-5
 
     rc = grid.r_c
@@ -125,32 +104,15 @@ def build_initial_state_erfc(
     xi_T = np.maximum(xi_T, 0.0)
     Tg0 = T_inf - (T_inf - T_d0) * special.erfc(xi_T)
 
-    # Species profiles (gas): tiny seeded vapor + background in far-field ratio
+    # Species profiles (gas): condensables seeded near interface, background fills the rest
     Ns_g = len(gas_names)
-    Ns_l = len(liq_names)
-    M_g, M_l = _get_molar_masses(cfg, gas_model, Ns_g, Ns_l)
-
-    # 1) condensable indices from liq2gas_map (all fuel species)
-    cond_idx_from_map: list[int] = []
-    for liq_name in liq_names:
-        g_name = cfg.species.liq2gas_map.get(liq_name, None)
-        if g_name is None:
-            continue
-        if g_name in gas_names:
-            cond_idx_from_map.append(gas_names.index(g_name))
-
-    # 2) optionally augment with equilibrium model indices
-    cond_idx_from_eq: list[int] = []
-    try:
-        eq_model = build_equilibrium_model(cfg, Ns_g=Ns_g, Ns_l=Ns_l, M_g=M_g, M_l=M_l)
-        cond_idx_from_eq = list(np.asarray(eq_model.idx_cond_g, dtype=int))
-    except Exception:
-        eq_model = None
-        cond_idx_from_eq = []
-
-    # 3) union of both sources
-    cond_idx_all = sorted(set(cond_idx_from_map) | set(cond_idx_from_eq))
-    idx_cond_g = np.asarray(cond_idx_all, dtype=int)
+    cond_names = list(cfg.physics.interface.equilibrium.condensables_gas)
+    cond_indices: list[int] = []
+    for name in cond_names:
+        if name not in gas_names:
+            raise ValueError(f"Condensable species '{name}' not found in gas_species_full {gas_names}")
+        cond_indices.append(gas_names.index(name))
+    idx_cond_g = np.asarray(sorted(set(cond_indices)), dtype=int)
 
     Yg_far = np.asarray(Yg_inf_full[:, 0], dtype=np.float64)
 
@@ -169,14 +131,17 @@ def build_initial_state_erfc(
     xi_Y = np.maximum(xi_Y, 0.0)
 
     Y_vap_if0 = float(cfg.initial.Y_vap_if0)
+    if idx_cond_g.size > 0 and Y_vap_if0 * float(idx_cond_g.size) >= 1.0:
+        raise ValueError(
+            f"Total seeded vapor ({idx_cond_g.size} * Y_vap_if0={Y_vap_if0}) must be less than 1.0 for normalization."
+        )
 
     Yg0 = np.zeros((Ns_g, Ng), dtype=np.float64)
 
     if idx_cond_g.size > 0 and Y_vap_if0 > 0.0:
-        share = Y_vap_if0 / float(idx_cond_g.size)
         for k in idx_cond_g:
             Y_inf_k = float(Yg_far[k])
-            Y0_k = share
+            Y0_k = Y_vap_if0
             Yg0[k, :] = Y_inf_k - (Y_inf_k - Y0_k) * special.erfc(xi_Y)
 
     Y_vap_total = np.sum(Yg0, axis=0)

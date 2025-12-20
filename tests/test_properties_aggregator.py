@@ -62,7 +62,6 @@ def simple_cfg():
     eq_cfg = CaseEquilibrium(
         method="raoult_psat",
         psat_model="coolprop",
-        background_fill="farfield",
         condensables_gas=["Water"],
         coolprop=CaseCoolProp(backend="HEOS", fluids=["Water"]),
     )

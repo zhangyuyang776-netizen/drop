@@ -28,7 +28,6 @@ def test_raoult_multicomp_partial_pressures_and_mass_fractions():
     model = EquilibriumModel(
         method="raoult_psat",
         psat_model="clausius",
-        background_fill="farfield",
         gas_names=gas_names,
         liq_names=liq_names,
         idx_cond_l=idx_cond_l,

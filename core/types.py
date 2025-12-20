@@ -15,14 +15,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Literal, Mapping, Optional, Tuple
+from typing import List, Mapping, Optional, Tuple
 
 import numpy as np
 from numpy.typing import NDArray
 
 FloatArray = NDArray[np.float64]
-
-GasSolveMode = Literal["all_minus_closure", "condensables_only", "explicit_list"]
 
 
 @dataclass(slots=True)
@@ -69,14 +67,6 @@ class CaseSpecies:
 
     gas_balance_species: str
     gas_mechanism_phase: str = "gas"
-    gas_species: List[str] = field(default_factory=list)
-    gas_solved_species: List[str] = field(default_factory=list)  # optional subset to solve (mechanism order names)
-    # Gas solve mode:
-    # - all_minus_closure: solve every gas species except gas_balance_species
-    # - condensables_only: solve only liq_balance_species mapped via liq2gas_map
-    # - explicit_list: solve only solve_gas_species (closure still excluded)
-    solve_gas_mode: GasSolveMode = "all_minus_closure"
-    solve_gas_species: List[str] = field(default_factory=list)  # used when solve_gas_mode == "explicit_list"
     liq_species: List[str] = field(default_factory=list)
     liq_balance_species: str = ""
     liq2gas_map: Mapping[str, str] = field(default_factory=dict)
@@ -92,15 +82,15 @@ class CaseSpecies:
             raise ValueError("gas_balance_species must be provided.")
         if not self.liq_balance_species:
             raise ValueError("liq_balance_species must be provided.")
-        allowed_modes = {"all_minus_closure", "condensables_only", "explicit_list"}
-        if self.solve_gas_mode not in allowed_modes:
-            raise ValueError(f"solve_gas_mode must be one of {sorted(allowed_modes)}, got {self.solve_gas_mode}")
-        if self.solve_gas_mode == "explicit_list" and not self.solve_gas_species:
-            raise ValueError("solve_gas_species must be provided when solve_gas_mode='explicit_list'")
         if self.liq_balance_species not in self.liq_species:
             raise ValueError(
                 f"liq_balance_species '{self.liq_balance_species}' must be included in liq_species {self.liq_species}"
             )
+        if self.gas_species_full:
+            if self.gas_balance_species not in self.gas_species_full:
+                raise ValueError(
+                    f"gas_balance_species '{self.gas_balance_species}' must be included in gas_species_full {self.gas_species_full}"
+                )
 
 @dataclass(slots=True)
 class CaseConventions:
@@ -170,7 +160,6 @@ class CaseCoolProp:
 class CaseEquilibrium:
     method: str = "raoult_psat"
     psat_model: str = "coolprop"
-    background_fill: str = "farfield"
     condensables_gas: List[str] = field(default_factory=list)
     coolprop: CaseCoolProp = field(default_factory=CaseCoolProp)
 
@@ -233,8 +222,9 @@ class CaseInitial:
     Yl: Mapping[str, float]
     Y_seed: float
     t_init_T: float = 1.0e-6
-    t_init_Y: float = 1.0e-6
-    D_init_Y: float = 1.0e-5
+    t_init_Y: float = 1.0e-6  # legacy, unused
+    D_init_Y: float = 1.0e-5  # legacy, unused
+    Y_vap_if0: float = 1.0e-6
 
 
 @dataclass(slots=True)

@@ -34,7 +34,7 @@ from core.types import (  # noqa: E402
 )
 
 
-def make_minimal_cfg_single_fuel(background_fill: str = "farfield") -> CaseConfig:
+def make_minimal_cfg_single_fuel() -> CaseConfig:
     meta = CaseMeta(id="test", title="test", version=1, notes=None)
     paths = CasePaths(
         output_root=Path("."),
@@ -44,12 +44,12 @@ def make_minimal_cfg_single_fuel(background_fill: str = "farfield") -> CaseConfi
     )
     species = CaseSpecies(
         gas_balance_species="N2",
-        gas_species=["N2", "FUEL"],
         liq_species=["FUEL_L"],
         liq_balance_species="FUEL_L",
         liq2gas_map={"FUEL_L": "FUEL"},
         mw_kg_per_mol={"N2": 28.0, "FUEL": 170.0, "FUEL_L": 170.0},
         molar_volume_cm3_per_mol={"FUEL_L": 200.0},
+        gas_species_full=["N2", "FUEL"],
     )
     conventions = CaseConventions(
         radial_normal="+er",
@@ -66,7 +66,6 @@ def make_minimal_cfg_single_fuel(background_fill: str = "farfield") -> CaseConfi
     eq_cfg = CaseEquilibrium(
         method="raoult_psat",
         psat_model="coolprop",
-        background_fill=background_fill,
         condensables_gas=["FUEL"],
         coolprop=CaseCoolProp(backend="HEOS", fluids=["FUEL_L"]),
     )
@@ -166,8 +165,8 @@ def test_build_equilibrium_model_basic_mapping():
     assert np.isclose(np.sum(model.Xg_farfield), 1.0)
 
 
-def test_compute_interface_equilibrium_single_condensable_farfield_fill(monkeypatch):
-    cfg = make_minimal_cfg_single_fuel(background_fill="farfield")
+def test_compute_interface_equilibrium_single_condensable_background_from_interface(monkeypatch):
+    cfg = make_minimal_cfg_single_fuel()
     M_g = np.array([28.0, 170.0])
     M_l = np.array([170.0])
     model = build_equilibrium_model(cfg, Ns_g=2, Ns_l=1, M_g=M_g, M_l=M_l)
@@ -195,7 +194,7 @@ def test_compute_interface_equilibrium_single_condensable_farfield_fill(monkeypa
 
 
 def test_compute_interface_equilibrium_pressure_cap(monkeypatch):
-    cfg = make_minimal_cfg_single_fuel(background_fill="farfield")
+    cfg = make_minimal_cfg_single_fuel()
     M_g = np.array([28.0, 170.0])
     M_l = np.array([170.0])
     model = build_equilibrium_model(cfg, Ns_g=2, Ns_l=1, M_g=M_g, M_l=M_l)
@@ -223,7 +222,7 @@ def test_compute_interface_equilibrium_pressure_cap(monkeypatch):
 
 
 def test_compute_interface_equilibrium_interface_noncondensables(monkeypatch):
-    cfg = make_minimal_cfg_single_fuel(background_fill="interface_noncondensables")
+    cfg = make_minimal_cfg_single_fuel()
     M_g = np.array([28.0, 170.0])
     M_l = np.array([170.0])
     model = build_equilibrium_model(cfg, Ns_g=2, Ns_l=1, M_g=M_g, M_l=M_l)

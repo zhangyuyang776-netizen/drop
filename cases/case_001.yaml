@@ -45,7 +45,6 @@ physics:
     equilibrium:
       method: "raoult_psat"
       psat_model: "coolprop"           # auto|coolprop|clausius
-      background_fill: "farfield"      # farfield | interface_noncondensables
       condensables_gas: ["NC12H26"]    # gas-phase names corresponding to liquid species
       coolprop:
         backend: "HEOS"
@@ -55,8 +54,6 @@ species:
   # Gas species list should be read from mechanism (paths.mechanism_dir/paths.gas_mech)
   gas_balance_species: "N2"            # closure species for reduced formulation
   gas_mechanism_phase: "gas"           # optional: default gas phase name in mechanism
-  solve_gas_mode: "all_minus_closure"  # all_minus_closure | condensables_only | explicit_list
-  solve_gas_species: []                # used when solve_gas_mode=explicit_list
 
   # Liquid species are explicitly defined (must include balance species)
   liq_species: ["n-Dodecane"]
@@ -115,6 +112,7 @@ petsc:
 
 io:
   write_every: 1
+  scalars_write_every: 1
   formats: ["csv", "npz"]
   save_grid: true
   fields:

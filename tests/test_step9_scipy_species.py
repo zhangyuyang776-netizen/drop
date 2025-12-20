@@ -25,7 +25,7 @@ def test_species_global_diffusion_with_dirichlet_farfield():
     grid = make_simple_grid(Nl=1, Ng=3)
     species = CaseSpecies(
         gas_balance_species="N2",
-        gas_species=["FUEL", "N2"],
+        gas_species_full=["FUEL", "N2"],
         liq_species=["FUEL"],
         liq_balance_species="FUEL",
         liq2gas_map={"FUEL": "FUEL"},
@@ -41,7 +41,7 @@ def test_species_global_diffusion_with_dirichlet_farfield():
     # Farfield: only N2 specified -> FUEL farfield = 0
 
     layout = build_layout(cfg, grid)
-    Ns_full = len(species.gas_species)
+    Ns_full = len(species.gas_species_full)
     Ng = grid.Ng
 
     Yg = np.zeros((Ns_full, Ng), dtype=float)

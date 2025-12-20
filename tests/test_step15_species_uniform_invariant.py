@@ -16,7 +16,7 @@ def test_species_uniform_stays_constant():
     grid, layout, state, props = build_min_problem(cfg)
 
     # Make solved species uniform and consistent with farfield
-    gas_species = cfg.species.gas_species
+    gas_species = cfg.species.gas_species_full
     cond_name = gas_species[0]
     bal_name = cfg.species.gas_balance_species
     cond_idx = gas_species.index(cond_name)

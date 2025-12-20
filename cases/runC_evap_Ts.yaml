@@ -29,7 +29,7 @@ physics:
   solve_Yg: true
   solve_Tl: true
   solve_Yl: false
-  include_Ts: true       # now Ts coupled
+  include_Ts: true      
   include_mpp: true
   include_Rd: true
   stefan_velocity: true
@@ -41,7 +41,6 @@ physics:
     equilibrium:
       method: "raoult_psat"
       psat_model: "coolprop"
-      background_fill: "farfield"
       condensables_gas: ["NC12H26"]
       coolprop:
         backend: "HEOS"
@@ -50,9 +49,6 @@ physics:
 species:
   gas_balance_species: "N2"
   gas_mechanism_phase: "gas"
-  solve_gas_mode: "all_minus_closure"
-  solve_gas_species: []
-  gas_species: ["NC12H26", "NC7H16", "O2", "N2"]
 
   liq_species: ["n-Dodecane"]
   liq_balance_species: "n-Dodecane"
@@ -94,7 +90,7 @@ initial:
   T_inf: 900.0
   P_inf: 101325.0
   T_d0: 300.0
-  Yg: {"N2": 1.0}
+  Yg: {"N2": 0.79, "O2": 0.21}
   Yl: {"n-Dodecane": 1.0}
   Y_seed: 1.0e-12
 
@@ -114,6 +110,7 @@ petsc:
 
 io:
   write_every: 0
+  scalars_write_every: 1
   formats: []
   save_grid: false
   fields:

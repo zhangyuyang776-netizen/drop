@@ -159,61 +159,17 @@ def build_layout(cfg: CaseConfig, grid: Grid1D) -> UnknownLayout:
       4) liquid species (reduced)
       5) interface scalars (Ts, mpp, Rd in that order if enabled)
     """
-    gas_full = list(cfg.species.gas_species)
+    gas_full = list(cfg.species.gas_species_full)
     if not gas_full:
-        raise ValueError("cfg.species.gas_species is empty. Preprocess must load mechanism and fill it.")
-    mode = getattr(cfg.species, "solve_gas_mode", "all_minus_closure")
+        raise ValueError("cfg.species.gas_species_full is empty. Preprocess must load mechanism and fill it.")
     gas_closure = cfg.species.gas_balance_species
 
-    gas_solved_subset = list(getattr(cfg.species, "gas_solved_species", []) or [])
-    if gas_solved_subset:
-        mode = "explicit_list"
-        cfg.species.solve_gas_mode = "explicit_list"
-        cfg.species.solve_gas_species = list(gas_solved_subset)
-
-    if mode == "all_minus_closure":
-        gas_active: Set[str] = set(gas_full)
-        gas_active.discard(gas_closure)
-    elif mode == "condensables_only":
-        l_name = cfg.species.liq_balance_species
-        g_map = cfg.species.liq2gas_map
-        if l_name not in g_map:
-            raise ValueError(f"liq_balance_species '{l_name}' not found in liq2gas_map {g_map}")
-        g_name = g_map[l_name]
-        if g_name == gas_closure:
-            raise ValueError("Condensable species cannot be closure species")
-        gas_active = {g_name}
-    elif mode == "explicit_list":
-        names = list(getattr(cfg.species, "solve_gas_species", []))
-        if not names:
-            raise ValueError("solve_gas_species is empty for explicit_list")
-        gas_active = set(names)
-        if gas_closure in gas_active:
-            raise ValueError("closure species cannot be solved explicitly")
-        missing = [s for s in gas_active if s not in gas_full]
-        if missing:
-            raise ValueError(f"explicit gas species not in mechanism list: {missing}")
-    else:
-        raise ValueError(f"Unknown solve_gas_mode: {mode}")
+    gas_active: Set[str] = set(gas_full)
+    gas_active.discard(gas_closure)
 
     gas_reduced, gas_full_to_reduced, gas_reduced_to_full_idx, gas_closure_idx = _build_species_mapping(
         gas_full, gas_closure, active=gas_active
     )
-
-    if mode == "condensables_only" and len(gas_reduced) != 1:
-        raise ValueError(
-            f"condensables_only mode expected 1 active species, got {len(gas_reduced)} (full={gas_full})"
-        )
-    if mode == "all_minus_closure":
-        expected = len(gas_full) - (1 if gas_closure is not None else 0)
-        if len(gas_reduced) != expected:
-            raise ValueError(
-                f"all_minus_closure mode expected {expected} active species, got {len(gas_reduced)} (full={gas_full})"
-            )
-    if mode == "explicit_list" and len(gas_reduced) != len(gas_active):
-        raise ValueError(
-            f"explicit_list mode expected {len(gas_active)} active species, got {len(gas_reduced)}"
-        )
 
     liq_full = list(cfg.species.liq_species)
     liq_closure = cfg.species.liq_balance_species

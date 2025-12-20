@@ -11,10 +11,8 @@ Responsibilities:
 from __future__ import annotations
 
 import argparse
-import csv
 import importlib.util
 import logging
-import math
 import shutil
 import sys
 import traceback
@@ -52,9 +50,8 @@ from core.types import (
 )
 from properties.compute_props import compute_props, get_or_build_models
 from physics.initial import build_initial_state_erfc
-from properties.equilibrium import build_equilibrium_model, compute_interface_equilibrium
+from properties.equilibrium import build_equilibrium_model
 from properties.gas import GasPropertiesModel
-from properties.liquid import LiquidPropertiesModel
 from solvers.timestepper import StepResult, advance_one_step_scipy
 
 logger = logging.getLogger(__name__)
@@ -96,6 +93,11 @@ def _load_case_config(cfg_path: str) -> CaseConfig:
 
     phys_raw = raw["physics"]
     eq_raw = phys_raw.get("interface", {}).get("equilibrium", {})
+    if "background_fill" in eq_raw:
+        raise ValueError(
+            "Config key physics.interface.equilibrium.background_fill has been removed; "
+            "interface equilibrium now always uses interface_noncondensables."
+        )
     cp_raw = eq_raw.get("coolprop", {})
     coolprop_cfg = CaseCoolProp(
         backend=cp_raw.get("backend", "HEOS"),
@@ -104,7 +106,6 @@ def _load_case_config(cfg_path: str) -> CaseConfig:
     eq_cfg = CaseEquilibrium(
         method=eq_raw.get("method", "raoult_psat"),
         psat_model=eq_raw.get("psat_model", "coolprop"),
-        background_fill=eq_raw.get("background_fill", "farfield"),
         condensables_gas=list(eq_raw.get("condensables_gas", [])),
         coolprop=coolprop_cfg,
     )
@@ -131,23 +132,22 @@ def _load_case_config(cfg_path: str) -> CaseConfig:
     )
 
     species_raw = raw["species"]
+    deprecated_keys = {"gas_species", "gas_solved_species", "solve_gas_mode", "solve_gas_species"}
+    found = [k for k in deprecated_keys if k in species_raw]
+    if found:
+        raise ValueError(
+            f"Deprecated species keys not allowed: {found}. "
+            "Gas species now come solely from the mechanism; remove these entries from YAML."
+        )
     species_cfg = CaseSpecies(
         gas_balance_species=species_raw["gas_balance_species"],
         gas_mechanism_phase=species_raw.get("gas_mechanism_phase", "gas"),
-        gas_species=list(species_raw.get("gas_species", [])),
-        solve_gas_mode=species_raw.get("solve_gas_mode", "all_minus_closure"),
-        solve_gas_species=list(species_raw.get("solve_gas_species", [])),
         liq_species=list(species_raw.get("liq_species", [])),
         liq_balance_species=species_raw["liq_balance_species"],
         liq2gas_map=species_raw.get("liq2gas_map", {}),
         mw_kg_per_mol=species_raw.get("mw_kg_per_mol", {}),
         molar_volume_cm3_per_mol=species_raw.get("molar_volume_cm3_per_mol", {}),
     )
-    allowed_modes = {"all_minus_closure", "condensables_only", "explicit_list"}
-    if species_cfg.solve_gas_mode not in allowed_modes:
-        raise ValueError(f"solve_gas_mode must be one of {sorted(allowed_modes)}, got {species_cfg.solve_gas_mode}")
-    if species_cfg.solve_gas_mode == "explicit_list" and not species_cfg.solve_gas_species:
-        raise ValueError("solve_gas_species cannot be empty when solve_gas_mode='explicit_list'")
 
     mesh_raw = raw["geometry"]["mesh"]
     mesh_cfg = CaseMesh(
@@ -192,9 +192,9 @@ def _load_case_config(cfg_path: str) -> CaseConfig:
         Yg=init_raw["Yg"],
         Yl=init_raw["Yl"],
         Y_seed=init_raw["Y_seed"],
+        # Unified init time scale; legacy t_init_Y/D_init_Y are ignored downstream
         t_init_T=init_raw.get("t_init_T", 1.0e-6),
-        t_init_Y=init_raw.get("t_init_Y", 1.0e-6),
-        D_init_Y=init_raw.get("D_init_Y", 1.0e-5),
+        Y_vap_if0=init_raw.get("Y_vap_if0", 1.0e-6),
     )
 
     petsc_raw = raw["petsc"]
@@ -259,39 +259,12 @@ def _load_case_config(cfg_path: str) -> CaseConfig:
 # Builders
 # -----------------------------------------------------------------------------
 def _maybe_fill_gas_species(cfg: CaseConfig, gas_model: GasPropertiesModel) -> None:
-    """Mechanism-driven gas species ordering; interpret short YAML list as solved subset."""
+    """Mechanism-driven gas species ordering; always use full mechanism order."""
     mech_names = list(gas_model.gas.species_names)
     mech_map = {nm: i for i, nm in enumerate(mech_names)}
 
-    # Always record mechanism order
     cfg.species.gas_species_full = mech_names
     cfg.species.gas_name_to_index = mech_map
-
-    yaml_list = list(getattr(cfg.species, "gas_species", []) or [])
-    # If YAML absent, adopt mechanism order
-    if not yaml_list:
-        cfg.species.gas_species = mech_names
-    else:
-        # If YAML shorter than mechanism, treat YAML list as solved subset
-        if len(yaml_list) != len(mech_names):
-            logger.warning(
-                "cfg.species.gas_species length %s differs from mechanism %s; interpreting YAML list as solved subset.",
-                len(yaml_list),
-                len(mech_names),
-            )
-            if not cfg.species.gas_solved_species:
-                cfg.species.gas_solved_species = yaml_list
-                cfg.species.solve_gas_mode = "explicit_list"
-                cfg.species.solve_gas_species = list(yaml_list)
-            cfg.species.gas_species = mech_names
-        else:
-            if yaml_list != mech_names:
-                logger.warning("cfg.species.gas_species order differs from mechanism; using mechanism order.")
-                cfg.species.gas_species = mech_names
-            else:
-                cfg.species.gas_species = mech_names
-
-    # Closure must exist
     cl = cfg.species.gas_balance_species
     if cl and cl not in mech_map:
         raise ValueError(f"gas_balance_species '{cl}' not found in mechanism species.")
@@ -301,14 +274,6 @@ def _maybe_fill_gas_species(cfg: CaseConfig, gas_model: GasPropertiesModel) -> N
     missing = [s for s in conds if s not in mech_map]
     if missing:
         raise ValueError(f"condensables_gas not found in mechanism species: {missing}")
-
-    # solved subset must exist
-    if cfg.species.gas_solved_species:
-        bad = [s for s in cfg.species.gas_solved_species if s not in mech_map]
-        if bad:
-            raise ValueError(f"gas_solved_species not found in mechanism species: {bad}")
-        if cl in cfg.species.gas_solved_species:
-            logger.warning("gas_solved_species contains closure '%s'; it will be ignored in layout.", cl)
 
     # liquid name map (not mechanism-driven but useful)
     cfg.species.liq_name_to_index = {nm: i for i, nm in enumerate(cfg.species.liq_species)}
@@ -380,162 +345,6 @@ def _log_step(res: StepResult, step_id: int) -> None:
         d.linear_converged,
         d.linear_rel_residual,
     )
-
-
-def _open_scalars_csv(run_dir: Path, cfg: CaseConfig, cond_names: list[str]):
-    """Open scalars.csv in run_dir and write header."""
-    run_dir.mkdir(parents=True, exist_ok=True)
-    path = run_dir / "scalars.csv"
-    fh = path.open("w", newline="")
-    writer = csv.writer(fh)
-
-    header = [
-        "step",
-        "t_old",
-        "t_new",
-        "dt",
-        "Rd",
-        "mpp",
-        "A_if",
-        "m_dot",
-        "m_evap_cum",
-        "m_drop",
-        "m_drop0",
-        "mass_closure_err",
-        "Ts",
-        "Tg0",
-        "Tg_min",
-        "Tg_max",
-        "Tg_if",
-        "Tl_if",
-        "sumYg0",
-        "cp_g0",
-        "k_g0",
-    ]
-    for name in cond_names:
-        header.append(f"Yg0_{name}")
-        header.append(f"Yg_eq_{name}")
-    writer.writerow(header)
-    fh.flush()
-    return fh, writer, header
-
-
-def _init_mass_integrator(cfg: CaseConfig, state0: State, props0) -> dict:
-    """Initialize cumulative mass bookkeeping."""
-    integ = {
-        "m_evap_cum": 0.0,
-        "m_dot_prev": None,
-        "m_drop0": math.nan,
-    }
-    try:
-        rho_l_mean = float(np.mean(props0.rho_l)) if hasattr(props0, "rho_l") else math.nan
-        Rd0 = float(state0.Rd)
-        if np.isfinite(rho_l_mean) and Rd0 > 0.0:
-            integ["m_drop0"] = 4.0 / 3.0 * math.pi * rho_l_mean * Rd0 ** 3
-    except Exception:
-        pass
-    return integ
-
-
-def _append_scalars_row(
-    writer: csv.writer,
-    fh,
-    cfg: CaseConfig,
-    grid: Grid1D,
-    state: State,
-    props,
-    res: StepResult,
-    integ: dict,
-    step_id: int,
-    eq_model=None,
-    cond_names: list[str] | None = None,
-):
-    """Compute and append one scalars row, then flush."""
-    d = res.diag
-    Rd = float(state.Rd)
-    mpp = float(state.mpp)
-    A_if = 4.0 * math.pi * Rd * Rd
-    m_dot = A_if * mpp
-
-    dt = float(d.dt)
-    if integ.get("m_dot_prev") is None:
-        integ["m_evap_cum"] += m_dot * dt
-    else:
-        integ["m_evap_cum"] += 0.5 * (integ["m_dot_prev"] + m_dot) * dt
-    integ["m_dot_prev"] = m_dot
-
-    rho_l_mean = float(np.mean(props.rho_l)) if hasattr(props, "rho_l") else math.nan
-    m_drop = 4.0 / 3.0 * math.pi * rho_l_mean * Rd ** 3 if np.isfinite(rho_l_mean) else math.nan
-    m_drop0 = integ.get("m_drop0", math.nan)
-    mass_closure_err = (m_drop + integ["m_evap_cum"] - m_drop0) if np.isfinite(m_drop0) else math.nan
-
-    Tg0 = float(state.Tg[0]) if state.Tg.size else math.nan
-    Tg_if = float(state.Tg[0]) if state.Tg.size else math.nan
-    Tl_if = float(state.Tl[-1]) if state.Tl.size else math.nan
-    Yg0 = state.Yg[:, 0] if state.Yg.size else np.array([], dtype=float)
-    sumYg0 = float(np.sum(Yg0)) if Yg0.size else math.nan
-
-    cond_names = cond_names or []
-    Yg0_list = []
-    Yg_eq_list = []
-    for cond_name in cond_names:
-        Yg0_val = math.nan
-        Yg_eq_val = math.nan
-        if cond_name in cfg.species.gas_species:
-            cond_idx = cfg.species.gas_species.index(cond_name)
-            if cond_idx < Yg0.shape[0]:
-                Yg0_val = float(Yg0[cond_idx])
-            if eq_model is not None:
-                try:
-                    il_if = grid.Nl - 1
-                    ig_if = 0
-                    Yl_face = state.Yl[:, il_if] if state.Yl.size else np.zeros((len(cfg.species.liq_species),), float)
-                    Yg_face = state.Yg[:, ig_if] if state.Yg.size else np.zeros((len(cfg.species.gas_species),), float)
-                    Pg = float(getattr(cfg.initial, "P_inf", 101325.0))
-                    Yg_eq, _, _ = compute_interface_equilibrium(
-                        eq_model, Ts=float(state.Ts), Pg=Pg, Yl_face=Yl_face, Yg_face=Yg_face
-                    )
-                    if cond_idx < Yg_eq.shape[0]:
-                        Yg_eq_val = float(Yg_eq[cond_idx])
-                except Exception:
-                    pass
-        Yg0_list.append(Yg0_val)
-        Yg_eq_list.append(Yg_eq_val)
-
-    cp_g0 = float(props.cp_g[0]) if hasattr(props, "cp_g") and props.cp_g.size else math.nan
-    k_g0 = float(props.k_g[0]) if hasattr(props, "k_g") and props.k_g.size else math.nan
-
-    row = [
-        step_id,
-        d.t_old,
-        d.t_new,
-        d.dt,
-        Rd,
-        mpp,
-        A_if,
-        m_dot,
-        integ["m_evap_cum"],
-        m_drop,
-        m_drop0,
-        mass_closure_err,
-        float(state.Ts),
-        Tg0,
-        d.Tg_min,
-        d.Tg_max,
-        Tg_if,
-        Tl_if,
-        sumYg0,
-        cp_g0,
-        k_g0,
-    ]
-    for v0, veq in zip(Yg0_list, Yg_eq_list):
-        row.append(v0)
-        row.append(veq)
-    writer.writerow(row)
-    try:
-        fh.flush()
-    except Exception:
-        pass
 
 
 def _sanity_check_state(state: State) -> Optional[str]:
@@ -625,59 +434,62 @@ def run_case(cfg_path: str, *, max_steps: Optional[int] = None, log_level: int |
         state = build_initial_state_erfc(cfg, grid, gas_model, liq_model)
         props, _ = compute_props(cfg, grid, state)
 
-        # Scalars writer setup
-        cond_names = list(cfg.physics.interface.equilibrium.condensables_gas) or list(
-            getattr(cfg.species, "liq2gas_map", {}).values()
-        )
-        scalars_every = int(getattr(getattr(cfg, "io", object()), "scalars_write_every", 1) or 1)
-        fh_scalars = None
-        writer_scalars = None
-        integ = None
+        # Output writers and diagnostics
+        scalars_writer = None
         eq_model = None
+        need_eq = False
         Rd_stop = None
+
+        # Radius-based early stop criterion
+        RD_STOP_FACTOR = 0.1
         try:
-            fh_scalars, writer_scalars, _ = _open_scalars_csv(run_dir, cfg, cond_names)
-            integ = _init_mass_integrator(cfg, state, props)
+            Rd0 = float(state.Rd)
+        except Exception:
+            Rd0 = None
+        if Rd0 is not None and np.isfinite(Rd0) and Rd0 > 0.0:
+            Rd_stop = RD_STOP_FACTOR * Rd0
+            logger.info(
+                "Radius stop criterion enabled: Rd_stop = %.6e = %.3f * Rd0 (Rd0 = %.6e).",
+                Rd_stop,
+                RD_STOP_FACTOR,
+                Rd0,
+            )
+        else:
+            logger.warning("Could not determine initial Rd; radius stop criterion disabled.")
 
-            # Radius-based early stop criterion
-            RD_STOP_FACTOR = 0.1
-            try:
-                Rd0 = float(state.Rd)
-            except Exception:
-                Rd0 = None
-            if Rd0 is not None and np.isfinite(Rd0) and Rd0 > 0.0:
-                Rd_stop = RD_STOP_FACTOR * Rd0
-                logger.info(
-                    "Radius stop criterion enabled: Rd_stop = %.6e = %.3f * Rd0 (Rd0 = %.6e).",
-                    Rd_stop,
-                    RD_STOP_FACTOR,
-                    Rd0,
-                )
+        try:
+            writers_module = _load_writers_module()
+            writer_cls = getattr(writers_module, "ScalarsWriter", None)
+            if writer_cls is None:
+                logger.warning("ScalarsWriter not found in io.writers; scalar output disabled.")
             else:
-                logger.warning("Could not determine initial Rd; radius stop criterion disabled.")
-
-            if cfg.physics.include_mpp:
-                Ns_g = len(cfg.species.gas_species)
-                Ns_l = len(cfg.species.liq_species)
-                M_g = np.ones(Ns_g, dtype=float)
-                M_l = np.ones(Ns_l, dtype=float)
-                try:
-                    M_g = np.asarray(gas_model.gas.molecular_weights, dtype=float) / 1000.0
-                except Exception:
-                    pass
-                try:
-                    for i, name in enumerate(cfg.species.liq_species):
-                        if name in cfg.species.mw_kg_per_mol:
-                            M_l[i] = float(cfg.species.mw_kg_per_mol[name])
-                except Exception:
-                    pass
-                try:
-                    eq_model = build_equilibrium_model(cfg, Ns_g=Ns_g, Ns_l=Ns_l, M_g=M_g, M_l=M_l)
-                except Exception as exc:
-                    logger.warning("Failed to build equilibrium model for diagnostics: %s", exc)
-                    eq_model = None
+                scalars_writer = writer_cls(cfg, state, props, out_dir=run_dir)
         except Exception as exc:
             logger.warning("Failed to initialize scalars writer: %s", exc)
+
+        io_fields = getattr(getattr(cfg, "io", None), "fields", None)
+        scalars_fields = list(getattr(io_fields, "scalars", []) or [])
+        need_eq = any(name.startswith("Yg_eq_") for name in scalars_fields)
+        if scalars_writer is not None and getattr(scalars_writer, "enabled", False) and need_eq and cfg.physics.include_mpp:
+            Ns_g = len(cfg.species.gas_species_full)
+            Ns_l = len(cfg.species.liq_species)
+            M_g = np.ones(Ns_g, dtype=float)
+            M_l = np.ones(Ns_l, dtype=float)
+            try:
+                M_g = np.asarray(gas_model.gas.molecular_weights, dtype=float) / 1000.0
+            except Exception:
+                pass
+            try:
+                for i, name in enumerate(cfg.species.liq_species):
+                    if name in cfg.species.mw_kg_per_mol:
+                        M_l[i] = float(cfg.species.mw_kg_per_mol[name])
+            except Exception:
+                pass
+            try:
+                eq_model = build_equilibrium_model(cfg, Ns_g=Ns_g, Ns_l=Ns_l, M_g=M_g, M_l=M_l)
+            except Exception as exc:
+                logger.warning("Failed to build equilibrium model for diagnostics: %s", exc)
+                eq_model = None
 
         t = float(cfg.time.t0)
         step_id = 0
@@ -724,47 +536,48 @@ def run_case(cfg_path: str, *, max_steps: Optional[int] = None, log_level: int |
                     state = remap_state_to_new_grid(state, grid, grid_new, cfg, layout)
                     props, _ = compute_props(cfg, grid_new, state)
                     # Rebuild equilibrium model to stay consistent with remapped state
-                    try:
-                        Ns_g = len(cfg.species.gas_species)
-                        Ns_l = len(cfg.species.liq_species)
-                        M_g = np.ones(Ns_g, dtype=float)
-                        M_l = np.ones(Ns_l, dtype=float)
+                    if (
+                        scalars_writer is not None
+                        and getattr(scalars_writer, "enabled", False)
+                        and need_eq
+                        and cfg.physics.include_mpp
+                    ):
                         try:
-                            M_g = np.asarray(gas_model.gas.molecular_weights, dtype=float) / 1000.0
-                        except Exception:
-                            pass
-                        try:
-                            for i, name in enumerate(cfg.species.liq_species):
-                                if name in cfg.species.mw_kg_per_mol:
-                                    M_l[i] = float(cfg.species.mw_kg_per_mol[name])
-                        except Exception:
-                            pass
-                        eq_model = build_equilibrium_model(cfg, Ns_g=Ns_g, Ns_l=Ns_l, M_g=M_g, M_l=M_l)
-                    except Exception as exc:
-                        logger.warning("Failed to rebuild equilibrium model after remeshing: %s", exc)
+                            Ns_g = len(cfg.species.gas_species_full)
+                            Ns_l = len(cfg.species.liq_species)
+                            M_g = np.ones(Ns_g, dtype=float)
+                            M_l = np.ones(Ns_l, dtype=float)
+                            try:
+                                M_g = np.asarray(gas_model.gas.molecular_weights, dtype=float) / 1000.0
+                            except Exception:
+                                pass
+                            try:
+                                for i, name in enumerate(cfg.species.liq_species):
+                                    if name in cfg.species.mw_kg_per_mol:
+                                        M_l[i] = float(cfg.species.mw_kg_per_mol[name])
+                            except Exception:
+                                pass
+                            eq_model = build_equilibrium_model(cfg, Ns_g=Ns_g, Ns_l=Ns_l, M_g=M_g, M_l=M_l)
+                        except Exception as exc:
+                            logger.warning("Failed to rebuild equilibrium model after remeshing: %s", exc)
                     grid = grid_new
                 except Exception as exc:
                     logger.error("Failed to remesh with updated Rd: %s", exc)
                     return 2
 
-            if writer_scalars is not None and integ is not None and scalars_every > 0:
-                if step_id % scalars_every == 0:
-                    try:
-                        _append_scalars_row(
-                            writer_scalars,
-                            fh_scalars,
-                            cfg,
-                            grid,
-                            state,
-                            props,
-                            res,
-                            integ,
-                            step_id=step_id,
-                            eq_model=eq_model,
-                            cond_names=cond_names,
-                        )
-                    except Exception as exc:
-                        logger.warning("Failed to write scalars at step %s: %s", step_id, exc)
+            if scalars_writer is not None:
+                try:
+                    scalars_writer.maybe_write(
+                        step_id=step_id,
+                        grid=grid,
+                        state=state,
+                        props=props,
+                        diag=res.diag,
+                        t=t,
+                        eq_model=eq_model,
+                    )
+                except Exception as exc:
+                    logger.warning("Failed to write scalars at step %s: %s", step_id, exc)
 
             _maybe_write_spatial(cfg, grid, state, step_id, t)
 
@@ -810,8 +623,8 @@ def run_case(cfg_path: str, *, max_steps: Optional[int] = None, log_level: int |
         return 99
     finally:
         try:
-            if "fh_scalars" in locals() and fh_scalars is not None:
-                fh_scalars.close()
+            if "scalars_writer" in locals() and scalars_writer is not None:
+                scalars_writer.close()
         except Exception:
             pass
 

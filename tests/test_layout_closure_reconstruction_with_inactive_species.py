@@ -9,8 +9,7 @@ def test_closure_reconstruction_counts_inactive_species():
     grid = make_simple_grid(Nl=1, Ng=1)
     species = CaseSpecies(
         gas_balance_species="N2",
-        gas_species=["O2", "FUEL", "N2"],
-        solve_gas_mode="condensables_only",
+        gas_species_full=["O2", "FUEL", "N2"],
         liq_species=["FUEL"],
         liq_balance_species="FUEL",
         liq2gas_map={"FUEL": "FUEL"},
@@ -18,10 +17,10 @@ def test_closure_reconstruction_counts_inactive_species():
     cfg = make_case_config(grid, species, solve_Tg=False)
     layout = build_layout(cfg, grid)
 
-    Yg = np.zeros((len(species.gas_species), grid.Ng))
-    Yg[0, :] = 0.21  # inactive species (not solved)
-    Yg[1, :] = 0.01  # active condensable
-    Yg[2, :] = 0.0   # closure placeholder
+    Yg = np.zeros((len(species.gas_species_full), grid.Ng))
+    Yg[0, :] = 0.21  # active
+    Yg[1, :] = 0.01  # active
+    Yg[2, :] = 0.78  # closure placeholder
     state = State(
         Tg=np.full(grid.Ng, 300.0),
         Yg=Yg,

@@ -18,7 +18,7 @@ def test_step17_props_recompute_is_called(monkeypatch):
     )
     grid, layout, state, _ = build_min_problem(cfg)
 
-    Ns_g = len(cfg.species.gas_species)
+    Ns_g = len(cfg.species.gas_species_full)
     Ns_l = len(cfg.species.liq_species)
     props0 = make_props_const(Ns_g, Ns_l, grid, D_g_val=1.0e-5)
 

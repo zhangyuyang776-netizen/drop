@@ -54,7 +54,7 @@ def _make_cfg() -> CaseConfig:
     physics.latent_heat_default = 2.5e6
     species = CaseSpecies(
         gas_balance_species="N2",
-        gas_species=["N2", "H2O"],
+        gas_species_full=["N2", "H2O"],
         liq_species=["H2O_l"],
         liq_balance_species="H2O_l",
         liq2gas_map={"H2O_l": "H2O"},
@@ -179,7 +179,7 @@ def _build_min_interface(monkeypatch: pytest.MonkeyPatch | None = None, *, lv_fr
 
         monkeypatch.setattr(ibc, "_get_latent_heat", fake_lv)
 
-    eq_result = {"Yg_eq": np.zeros((len(cfg.species.gas_species),), dtype=np.float64)}
+    eq_result = {"Yg_eq": np.zeros((len(cfg.species.gas_species_full),), dtype=np.float64)}
     coeffs = build_interface_coeffs(grid, state, props, layout, cfg, eq_result=eq_result)
     return coeffs
 

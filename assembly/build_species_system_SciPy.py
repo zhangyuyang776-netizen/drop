@@ -131,8 +131,8 @@ def build_gas_species_system_global(
     if cfg.physics.include_mpp:
         if k_cond_full is None or k_cond_red is None:
             raise ValueError(
-                "include_mpp=True requires condensable gas species to be solved in Yg unknowns. "
-                "Check species.solve_gas_mode/solve_gas_species and liq2gas_map."
+                "include_mpp=True requires condensable gas species to be present (non-closure) in the mechanism. "
+                "Check liq2gas_map and gas_balance_species."
             )
         if Yg_eq is None or Yg_eq_face is None:
             raise ValueError("include_mpp=True requires eq_result['Yg_eq'] with condensable entry.")

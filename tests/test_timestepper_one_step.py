@@ -70,7 +70,7 @@ def _make_simple_case(grid: Grid1D) -> CaseConfig:
     )
     species = CaseSpecies(
         gas_balance_species="N2",
-        gas_species=["FUEL", "N2"],
+        gas_species_full=["FUEL", "N2"],
         liq_species=["FUEL"],
         liq_balance_species="FUEL",
         liq2gas_map={"FUEL": "FUEL"},
@@ -225,7 +225,7 @@ def _fake_eq_result_for_evap(cfg, grid, state, props):
     """
     ig_if = 0
     Yg_cell = state.Yg[:, ig_if].copy()
-    gas_names = list(cfg.species.gas_species)
+    gas_names = list(cfg.species.gas_species_full)
     cond_name = cfg.species.liq_balance_species if isinstance(cfg.species.liq_balance_species, str) else cfg.species.liq_balance_species[0]
     cond_idx = gas_names.index(cond_name)
 

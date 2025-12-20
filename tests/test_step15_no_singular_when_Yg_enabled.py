@@ -10,7 +10,7 @@ def test_linear_system_not_singular_with_Yg_enabled():
     grid, layout, state, props = build_min_problem(cfg)
 
     # uniform non-zero condensable to avoid all-zero rows
-    gas_species = cfg.species.gas_species
+    gas_species = cfg.species.gas_species_full
     cond_idx = gas_species.index(gas_species[0])
     bal_idx = gas_species.index(cfg.species.gas_balance_species)
     state.Yg[:, :] = 0.0

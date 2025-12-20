@@ -27,7 +27,7 @@ def test_evap_end_to_end_smoke(monkeypatch):
     )
 
     grid, layout, state, _ = build_min_problem(cfg)
-    Ns_g = len(cfg.species.gas_species)
+    Ns_g = len(cfg.species.gas_species_full)
     Ns_l = len(cfg.species.liq_species)
 
     # Constant props for determinism (avoid Cantera/CoolProp in this smoke test)
@@ -38,7 +38,7 @@ def test_evap_end_to_end_smoke(monkeypatch):
         lambda *args, **kwargs: (props_const, {"patched": True}),
     )
 
-    gas_species = cfg.species.gas_species
+    gas_species = cfg.species.gas_species_full
     bal_name = cfg.species.gas_balance_species
     bal_idx = gas_species.index(bal_name)
 

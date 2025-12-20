@@ -25,7 +25,7 @@ def _make_case(include_Ts: bool, Ts_value: float, Tg0: float = 300.0):
     grid = build_grid(cfg)
     layout = build_layout(cfg, grid)
 
-    gas_species = cfg.species.gas_species
+    gas_species = cfg.species.gas_species_full
     Ns_g = len(gas_species)
     Yg = np.zeros((Ns_g, grid.Ng), dtype=np.float64)
     state = make_state_uniform(cfg, grid, gas_species, Yg)
@@ -76,7 +76,7 @@ def test_Tg0_Ts_coupling_matrix_entry():
     grid = build_grid(cfg)
     layout = build_layout(cfg, grid)
 
-    gas_species = cfg.species.gas_species
+    gas_species = cfg.species.gas_species_full
     Ns_g = len(gas_species)
     Yg = np.zeros((Ns_g, grid.Ng), dtype=np.float64)
     state = make_state_uniform(cfg, grid, gas_species, Yg)
@@ -97,7 +97,7 @@ def test_Tg0_Ts_coupling_matrix_entry():
         state_old=state,
         props=props,
         dt=cfg.time.dt,
-        eq_result={"Yg_eq": np.zeros(len(cfg.species.gas_species))},
+        eq_result={"Yg_eq": np.zeros(len(cfg.species.gas_species_full))},
         state_guess=state,
         return_diag=True,
     )

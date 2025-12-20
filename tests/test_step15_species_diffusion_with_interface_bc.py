@@ -18,11 +18,11 @@ def test_species_diffusion_driven_by_interface_bc(monkeypatch):
     cfg = make_cfg_base(include_mpp=True, solve_Yg=True, species_convection=False, include_Ts=False, include_Rd=True,)
     # Species: ["FUEL", "N2"], closure=N2, condensable=FUEL
     grid, layout, state, _ = build_min_problem(cfg)
-    Ns_g = len(cfg.species.gas_species)
+    Ns_g = len(cfg.species.gas_species_full)
     Ns_l = len(cfg.species.liq_species)
     props = make_props_const(Ns_g, Ns_l, grid, D_g_val=1.0e-5)
 
-    gas_species = cfg.species.gas_species
+    gas_species = cfg.species.gas_species_full
     cond_name = gas_species[0]
     bal_name = cfg.species.gas_balance_species
     cond_idx = gas_species.index(cond_name)

@@ -128,7 +128,7 @@ def make_cfg_base(
 
     species_cfg = CaseSpecies(
         gas_balance_species=gas_balance,
-        gas_species=list(gas_species),
+        gas_species_full=list(gas_species),
         liq_species=list(liq_species),
         liq_balance_species=liq_balance,
         liq2gas_map=liq2gas_map,
@@ -201,7 +201,7 @@ def build_min_problem(cfg: CaseConfig):
     """Build grid, layout, and a uniform state/props for tests."""
     grid = build_grid(cfg)
     layout = build_layout(cfg, grid)
-    gas_species = cfg.species.gas_species
+    gas_species = cfg.species.gas_species_full
     Ns_g = len(gas_species)
     Ns_l = len(cfg.species.liq_species)
 

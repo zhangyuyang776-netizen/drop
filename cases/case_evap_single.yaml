@@ -12,7 +12,7 @@ paths:
 
 conventions:
   radial_normal: "+er"
-  flux_sign:  "outward_positive"
+  flux_sign: "outward_positive"
   heat_flux_def: "q=-k*dTdr"
   evap_sign: "mpp_positive_evaporation"
   gas_closure_species: "N2"
@@ -42,7 +42,6 @@ physics:
     equilibrium:
       method: "raoult_psat"
       psat_model: "coolprop"
-      background_fill: "farfield"
       condensables_gas: ["NC12H26"]
       coolprop:
         backend: "HEOS"
@@ -51,20 +50,17 @@ physics:
 species:
   gas_balance_species: "N2"
   gas_mechanism_phase: "gas"
-  solve_gas_mode: "condensables_only"
-  solve_gas_species: []
-  gas_species: []               # empty -> use mechanism order
 
-  liq_species: ["NC12H26"]
-  liq_balance_species: "NC12H26"
+  liq_species: ["n-Dodecane"]
+  liq_balance_species: "n-Dodecane"
 
   liq2gas_map:
-    NC12H26: "NC12H26"
+    n-Dodecane: "NC12H26"
 
   mw_kg_per_mol:
-    NC12H26: 0.17034
+    n-Dodecane: 0.17034
   molar_volume_cm3_per_mol:
-    NC12H26: 227.51
+    n-Dodecane: 227.51
 
 geometry:
   a0: 1.0e-4
@@ -93,19 +89,17 @@ discretization:
   mass_matrix: "rhoVc_p"
 
 initial:
-  T_inf: 800.0
+  T_inf: 1000.0
   P_inf: 1.0e5
   T_d0: 300.0
   Yg:
     O2: 0.21
     N2: 0.79
-    NC12H26: 0.0
   Yl:
     NC12H26: 1.0
   Y_seed: 1.0e-12
-
   t_init_T: 1.0e-6
-  Y_vap_if0: 1.0e-5
+  Y_vap_if0: 1.0e-6
 
 transport:
   D_l_const: 1.0e-9
@@ -123,6 +117,7 @@ petsc:
 
 io:
   write_every: 10
+  scalars_write_every: 10
   formats: ["csv", "npy"]
   save_grid: true
   fields:
