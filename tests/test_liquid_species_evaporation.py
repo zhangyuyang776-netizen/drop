@@ -112,7 +112,7 @@ def test_liquid_species_interface_evap_sign_and_scale():
         Tl=np.zeros(Nl),
         Yl=Yl_full,
         Ts=300.0,
-        mpp=0.0,
+        mpp=0.2,
         Rd=1.0,
     )
     props = SimpleNamespace(
@@ -121,8 +121,6 @@ def test_liquid_species_interface_evap_sign_and_scale():
         k_l=np.ones(Nl),
     )
 
-    mpp = 0.2
-    iface_evap = {"mpp_eval": mpp}
     dt = 0.5
 
     A, b, _ = build_liquid_species_system(
@@ -132,7 +130,7 @@ def test_liquid_species_interface_evap_sign_and_scale():
         state_old=state_old,
         props=props,
         dt=dt,
-        interface_evap=iface_evap,
+        interface_evap=None,
         return_diag=True,
     )
 
@@ -141,6 +139,6 @@ def test_liquid_species_interface_evap_sign_and_scale():
 
     # Only interface cell (il=1) should see divergence A_if * mpp * Yl_face
     A_if = grid.A_f[grid.iface_f]
-    expected_div = A_if * mpp * state_old.Yl[0, -1]
+    expected_div = A_if * state_old.mpp * state_old.Yl[0, -1]
     assert np.isclose(residual[1], expected_div)
     assert np.isclose(residual[0], 0.0)

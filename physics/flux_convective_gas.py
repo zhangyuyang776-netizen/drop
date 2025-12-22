@@ -8,7 +8,8 @@ Scope:
 - Only temperature equation convective term is provided here.
 - Species convective flux is left as a placeholder.
 - No residual assembly, no state mutation, no property evaluation.
-- For future enthalpy-form energy equations, the convective term is rho * u * h; here MVP uses h ≈ cp * T.
+- For future enthalpy-form energy equations, the convective term is rho * u * h; here MVP uses h ~= cp * T.
+- Time discretization (explicit/implicit) is decided by the caller (assembly).
 
 Assumptions/Conventions:
 - radial_normal = "+er" (outward)
@@ -118,10 +119,10 @@ def compute_gas_convective_flux_Y(
     u_face: FloatArray,
 ) -> FloatArray:
     """
-    Gas species convective flux on faces (Stefan velocity explicit).
+    Gas species convective flux on faces.
 
     Definition:
-        J_i = rho * u * Y_i   [kg/(m^2·s)], outward (+er) positive.
+        J_i = rho * u * Y_i   [kg/(m^2*s)], outward (+er) positive.
 
     Parameters
     ----------

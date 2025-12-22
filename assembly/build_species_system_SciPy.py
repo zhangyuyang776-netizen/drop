@@ -1,9 +1,9 @@
 """
 SciPy/Numpy assembly for gas species mass-fraction equations (Yg block, reduced species).
 
-Scope (Step 15.2):
+Scope (Step 19.4.2):
 - Assemble all active gas species (layout.Ns_g_eff) into the global system index space.
-- Implicit time + diffusion; optional explicit convection (Stefan velocity) when enabled.
+- Implicit time + diffusion; optional convection (Stefan velocity) when enabled.
 - Inner boundary (interface): Dirichlet for the single condensable species using Yg_eq; zero flux for others.
 - Outer boundary: strong Dirichlet to farfield composition from cfg.initial.Yg for every solved species.
 
@@ -46,6 +46,7 @@ def build_gas_species_system_global(
     A_out: np.ndarray | None = None,
     b_out: np.ndarray | None = None,
     return_diag: bool = False,
+    state_guess: State | None = None,
 ) -> Tuple[np.ndarray, np.ndarray] | Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
     """
     Assemble gas-species mass-fraction equations into the global system (dense).
@@ -57,6 +58,10 @@ def build_gas_species_system_global(
         If A_out/b_out are provided, assembly is performed in-place on those arrays.
     diag_y : dict, optional
         Diagnostics (condensable info, BC previews, convection flag).
+
+    Notes
+    -----
+    If convection is enabled, the convective term uses state_guess when provided.
     """
     if not layout.has_block("Yg"):
         raise ValueError("layout missing 'Yg' block required for gas species assembly.")
@@ -64,6 +69,9 @@ def build_gas_species_system_global(
     theta = float(cfg.discretization.theta)
     if abs(theta - 1.0) > 1e-12:
         raise ValueError("Species assembly currently assumes theta=1.0 (fully implicit diffusion).")
+
+    if state_guess is None:
+        state_guess = state_old
 
     Ns_full, Ng = state_old.Yg.shape
     if props.D_g is None:
@@ -137,8 +145,11 @@ def build_gas_species_system_global(
         if Yg_eq is None or Yg_eq_face is None:
             raise ValueError("include_mpp=True requires eq_result['Yg_eq'] with condensable entry.")
 
-    if interface_evap is not None and "J_full" in interface_evap:
-        J_iface_full = np.asarray(interface_evap["J_full"], dtype=np.float64).reshape(-1)
+    if interface_evap is not None:
+        if "J_full_state" in interface_evap:
+            J_iface_full = np.asarray(interface_evap["J_full_state"], dtype=np.float64).reshape(-1)
+        elif "J_full" in interface_evap:
+            J_iface_full = np.asarray(interface_evap["J_full"], dtype=np.float64).reshape(-1)
         if J_iface_full.shape[0] != Ns_full:
             raise ValueError(f"interface_evap['J_full'] length {J_iface_full.shape[0]} != Ns_full={Ns_full}")
 
@@ -244,11 +255,12 @@ def build_gas_species_system_global(
             A[row, row] += aP
             b[row] += b_i
 
-    # Explicit convection (optional)
+    # Convective flux (optional)
     if convection_enabled:
-        stefan = compute_stefan_velocity(cfg, grid, props, state_old)
+        # Step 19.4.2: Stefan velocity consistent with Yg^{n+1}
+        stefan = compute_stefan_velocity(cfg, grid, props, state_guess)
         u_face = stefan.u_face
-        J_conv_all = compute_gas_convective_flux_Y(cfg, grid, props, state_old.Yg, u_face)
+        J_conv_all = compute_gas_convective_flux_Y(cfg, grid, props, state_guess.Yg, u_face)
 
         # Optional farfield upwind for outer inflow
         u_out = float(u_face[grid.Nc])

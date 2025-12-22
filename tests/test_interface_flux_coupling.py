@@ -187,15 +187,14 @@ def test_energy_rhs_receives_interface_enthalpy_flux():
     )
 
     evap = diag.get("evaporation", {})
-    mpp_eval = float(evap.get("mpp_eval", 0.0))
+    mpp_state = float(state_old.mpp)
     assert "j_corr_full" in evap
     row_Tg0 = layout.idx_Tg(0)
     # With cp=k=0, the only source in b for Tg0 should come from enthalpy flux
-    if not np.isclose(mpp_eval, 0.0):
-        A_if = float(grid.A_f[grid.iface_f])
-        h_mix_if = float(props.h_g[0])
-        h_k_if = np.array([1.0, 2.0])
-        j_corr = np.asarray(evap["j_corr_full"], dtype=float)
-        q_iface = mpp_eval * h_mix_if + float(np.dot(h_k_if, j_corr))
-        expected_rhs = -A_if * q_iface
-        assert np.isclose(b[row_Tg0], expected_rhs)
+    A_if = float(grid.A_f[grid.iface_f])
+    h_mix_if = float(props.h_g[0])
+    h_k_if = np.array([1.0, 2.0])
+    j_corr = np.asarray(evap["j_corr_full"], dtype=float)
+    q_iface = mpp_state * h_mix_if + float(np.dot(h_k_if, j_corr))
+    expected_rhs = -A_if * q_iface
+    assert np.isclose(b[row_Tg0], expected_rhs)

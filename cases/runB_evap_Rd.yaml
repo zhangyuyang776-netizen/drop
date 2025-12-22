@@ -55,6 +55,7 @@ species:
 
   liq2gas_map:
     n-Dodecane: "NC12H26"
+  # Liquid molar masses (kg/mol); gas MW comes from Cantera.
   mw_kg_per_mol:
     n-Dodecane: 0.17034
   molar_volume_cm3_per_mol:

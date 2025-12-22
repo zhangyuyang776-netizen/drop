@@ -5,11 +5,11 @@ Differences vs PETSc build_system:
 - Returns dense numpy arrays (A, b) for SciPy-based solvers.
 - No PETSc dependency; intended for Windows / SciPy workflow.
 
-Scope (Step 11+12, SciPy backend):
+Scope (Step 19.4.4, SciPy backend):
 - Gas temperature Tg:
   - fully implicit time term (theta = 1.0),
   - implicit diffusion in gas cells,
-  - explicit Stefan convection (using physics.stefan_velocity + flux_convective_gas),
+  - convective term uses Stefan velocity and Tg from state_guess (implicit in Tg),
   - outer boundary: strong Dirichlet T = T_inf.
 - Interface conditions (optional, controlled by cfg.physics.include_Ts / include_mpp):
   - Ts energy jump: gas/liquid conduction + latent heat (single-condensable MVP, no diffusion enthalpy yet),
@@ -20,7 +20,7 @@ Scope (Step 11+12, SciPy backend):
 
 Inputs:
 - cfg, grid, layout, state_old, props, dt,
-- optional eq_result (interface equilibrium Yg_eq) and state_guess (for interface / radius diagnostics).
+- optional eq_result (interface equilibrium Yg_eq) and state_guess (current nonlinear guess).
 
 Contract:
 - layout must contain Tg block; Ts / mpp / Rd blocks only used if cfg.physics.include_* is True.
@@ -30,6 +30,7 @@ Contract:
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, Tuple
 
 import numpy as np
@@ -38,13 +39,14 @@ from core.layout import UnknownLayout
 from core.types import CaseConfig, Grid1D, Props, State
 from physics.stefan_velocity import compute_stefan_velocity
 from physics.flux_convective_gas import compute_gas_convective_flux_T
-from properties.equilibrium import build_equilibrium_model, compute_interface_equilibrium
 from physics.interface_bc import build_interface_coeffs, EqResultLike
 from physics.radius_eq import build_radius_row
 from physics.interface_bc import InterfaceCoeffs  # type hint only
 from physics.radius_eq import RadiusCoeffs  # type hint only
 from assembly.build_species_system_SciPy import build_gas_species_system_global
 from assembly.build_liquid_species_system_SciPy import build_liquid_species_system
+
+logger = logging.getLogger(__name__)
 
 
 def _apply_center_bc_Tg(A: np.ndarray, row: int, coeff: float, col_neighbor: int) -> None:
@@ -114,7 +116,7 @@ def build_transport_system(
 
     Contents:
     - Tg block:
-      time term + implicit diffusion + explicit Stefan convection;
+      time term + implicit diffusion + Stefan convection from state_guess;
       outer gas cell has strong Dirichlet T = cfg.initial.T_inf.
     - Interface block (via physics.interface_bc.build_interface_coeffs):
       Ts energy jump (q_g + q_l - q_lat = 0),
@@ -128,8 +130,9 @@ def build_transport_system(
         Core problem definition and previous time level state.
     eq_result : mapping, optional
         Must contain 'Yg_eq' (full gas mass-fraction vector) if include_mpp is True.
+        No internal fallback is provided when include_mpp is enabled.
     state_guess : State, optional
-        Current nonlinear guess used in interface / radius diagnostics (MVP: coefficients do not depend on it).
+        Current nonlinear guess; used for interface and radius assembly when provided.
     return_diag : bool, default False
         If True, returns (A, b, diag_sys) where diag_sys aggregates diagnostics
         from interface_bc and radius_eq; otherwise returns (A, b) only.
@@ -147,6 +150,8 @@ def build_transport_system(
         state_guess = state_old
 
     phys = cfg.physics
+    if phys.include_mpp and layout.has_block("mpp") and eq_result is None:
+        raise ValueError("include_mpp=True requires eq_result with 'Yg_eq' (no internal fallback).")
     Ng = grid.Ng
     Nc = grid.Nc
     N = layout.n_dof()
@@ -155,41 +160,6 @@ def build_transport_system(
     diag_sys: Dict[str, Any] = {}
 
     gas_start = grid.gas_slice.start if grid.gas_slice is not None else grid.Nl
-
-    # Recompute interface equilibrium each residual build (keeps Ts/Yg/Yl coupling fresh)
-    if phys.include_mpp and eq_result is None:
-        if eq_model is None:
-            # Attempt to build an equilibrium model from available data
-            try:
-                Ns_g = state_old.Yg.shape[0]
-                Ns_l = state_old.Yl.shape[0]
-                M_g = np.ones(Ns_g, dtype=float)
-                M_l = np.ones(Ns_l, dtype=float)
-                # Try to pull molar masses from props if present
-                if hasattr(props, "M_g"):
-                    Mg_attr = getattr(props, "M_g")
-                    if Mg_attr is not None:
-                        M_g = np.asarray(Mg_attr, dtype=float)
-                if hasattr(props, "M_l"):
-                    Ml_attr = getattr(props, "M_l")
-                    if Ml_attr is not None:
-                        M_l = np.asarray(Ml_attr, dtype=float)
-                eq_model = build_equilibrium_model(cfg, Ns_g=Ns_g, Ns_l=Ns_l, M_g=M_g, M_l=M_l)
-            except Exception:
-                eq_model = None
-        try:
-            il_if = grid.Nl - 1
-            ig_if = 0
-            Ts_if = float(state_old.Ts)
-            Pg_if = float(getattr(cfg.initial, "P_inf", 101325.0))
-            Yl_face = np.asarray(state_old.Yl[:, il_if], dtype=np.float64)
-            Yg_face = np.asarray(state_old.Yg[:, ig_if], dtype=np.float64)
-            if eq_model is not None:
-                Yg_eq, y_cond, psat = compute_interface_equilibrium(eq_model, Ts_if, Pg_if, Yl_face, Yg_face)
-                eq_result = {"Yg_eq": np.asarray(Yg_eq), "y_cond": np.asarray(y_cond), "psat": np.asarray(psat)}
-        except Exception as exc:
-            logger.warning("Failed to compute interface equilibrium in residual build: %s", exc)
-            eq_result = None
 
     for ig in range(Ng):
         row = layout.idx_Tg(ig)
@@ -261,15 +231,16 @@ def build_transport_system(
         A[row, row] += aP
         b[row] += b_i
 
-    # --- Stefan velocity and convective flux (explicit) ---
-    stefan = compute_stefan_velocity(cfg, grid, props, state_old)
+    # --- Stefan velocity and convective flux (implicit in Tg via state_guess) ---
+    # Step 19.4.1: use state_guess (~= T^{n+1}) for Stefan velocity and convective heat flux.
+    stefan = compute_stefan_velocity(cfg, grid, props, state_guess)
     u_face = stefan.u_face
 
     q_conv = compute_gas_convective_flux_T(
         cfg=cfg,
         grid=grid,
         props=props,
-        Tg=state_old.Tg,  # explicit in time
+        Tg=state_guess.Tg,  # implicit in Tg: depends on current state_guess
         u_face=u_face,
     )
 
@@ -277,7 +248,7 @@ def build_transport_system(
     iface_coeffs = None
     iface_evap = None
 
-    # Add explicit convective source to RHS: b[row] -= (A_R*q_R - A_L*q_L)
+    # Add convective source to RHS: b[row] -= (A_R*q_R - A_L*q_L)
     for ig in range(Ng):
         row = layout.idx_Tg(ig)
         cell_idx = gas_start + ig
@@ -309,7 +280,7 @@ def build_transport_system(
             couple_interface=True,  # Coupled mode: no Dirichlet BC at interface
         )
 
-        # Embed local Tl system (Nl×Nl) into global matrix (N×N)
+        # Embed local Tl system (Nl-by-Nl) into global matrix (N-by-N)
         Nl = grid.Nl
         for il in range(Nl):
             row_global = layout.idx_Tl(il)
@@ -360,7 +331,7 @@ def build_transport_system(
         if iface_evap is not None and state_old.Tg.size > 0:
             iface_f = grid.iface_f
             A_if = float(grid.A_f[iface_f])
-            mpp_evap = float(iface_evap.get("mpp_eval", 0.0))
+            mpp_evap = float(iface_evap.get("mpp_state", iface_evap.get("mpp_eval", 0.0)))
             j_corr_full = np.asarray(iface_evap.get("j_corr_full", []), dtype=np.float64)
             Yg_eq_full = np.asarray(iface_evap.get("Yg_eq_full", []), dtype=np.float64)
             Ns_full = state_old.Yg.shape[0]
@@ -383,7 +354,7 @@ def build_transport_system(
             row_Tg0 = layout.idx_Tg(0)
             b[row_Tg0] -= A_if * q_iface
 
-    # --- Radius evolution equation (Rd–mpp coupling) ---
+    # --- Radius evolution equation (Rd-mpp coupling) ---
     if phys.include_Rd and layout.has_block("Rd"):
         rad_coeffs = build_radius_row(
             grid=grid,
@@ -415,6 +386,7 @@ def build_transport_system(
                 A_out=A,
                 b_out=b,
                 return_diag=True,
+                state_guess=state_guess,
             )
             diag_sys.setdefault("blocks", {})["Yg"] = diag_y
         else:
@@ -430,6 +402,7 @@ def build_transport_system(
                 A_out=A,
                 b_out=b,
                 return_diag=False,
+                state_guess=state_guess,
             )
 
         # Sanity checks on Yg rows
@@ -442,7 +415,7 @@ def build_transport_system(
         if not (np.isclose(row_vals[row_bc], 1.0) and np.allclose(np.delete(row_vals, row_bc), 0.0)):
             raise RuntimeError("Outer Dirichlet row for Yg (k=0) is not an identity row.")
 
-    # --- Liquid species equations: Yl (explicit flux, implicit time) ---
+    # --- Liquid species equations: Yl (implicit diffusion + evaporation flux, implicit time) ---
     if getattr(cfg.physics, "solve_Yl", False) and layout.has_block("Yl") and layout.Ns_l_eff > 0:
         if props.D_l is None:
             raise ValueError("solve_Yl=True requires props.D_l to be provided.")
@@ -459,6 +432,7 @@ def build_transport_system(
                 A_out=A,
                 b_out=b,
                 return_diag=True,
+                state_guess=state_guess,
             )
             diag_sys.setdefault("blocks", {})["Yl"] = diag_yl
         else:
@@ -473,6 +447,7 @@ def build_transport_system(
                 A_out=A,
                 b_out=b,
                 return_diag=False,
+                state_guess=state_guess,
             )
 
     if return_diag:

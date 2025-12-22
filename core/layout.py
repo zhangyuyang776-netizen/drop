@@ -19,7 +19,11 @@ import numpy as np
 from .types import CaseConfig, Grid1D, State
 
 FloatArray = np.ndarray
-LAYOUT_VERSION = "step2-final"
+UnknownVector = np.ndarray
+ScaleVector = np.ndarray
+
+# Global unknown vector for Step 19 fully implicit Newton
+LAYOUT_VERSION = "step19-global-newton"
 
 
 @dataclass(slots=True)
@@ -341,6 +345,11 @@ def pack_state(
 ) -> Tuple[np.ndarray, np.ndarray, List[VarEntry]]:
     """
     Pack State into a 1D unknown vector following the given layout.
+
+    Typical usage:
+      - For a fully implicit Newton step, call pack_state(state_old, layout) once to
+        get u0 (initial guess) and scale_u (variable scales) for the solver/context.
+      - For residual evaluations, map u back to State with apply_u_to_state.
 
     refs:
       - "T_ref": temperature scaling reference (default 298.15)

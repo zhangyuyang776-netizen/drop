@@ -40,6 +40,7 @@ from core.types import (
     CaseInterface,
     CaseMesh,
     CaseMeta,
+    CaseNonlinear,
     CasePaths,
     CasePETSc,
     CasePhysics,
@@ -239,6 +240,21 @@ def _load_case_config(cfg_path: str) -> CaseConfig:
         enforce_assembly_purity=checks_raw.get("enforce_assembly_purity", True),
     )
 
+    nonlinear_raw = raw.get("nonlinear", {}) or {}
+    nonlinear_cfg = CaseNonlinear(
+        enabled=bool(nonlinear_raw.get("enabled", False)),
+        backend=str(nonlinear_raw.get("backend", "scipy")),
+        solver=str(nonlinear_raw.get("solver", "newton_krylov")),
+        krylov_method=str(nonlinear_raw.get("krylov_method", "lgmres")),
+        max_outer_iter=int(nonlinear_raw.get("max_outer_iter", 20)),
+        inner_maxiter=int(nonlinear_raw.get("inner_maxiter", 20)),
+        f_rtol=float(nonlinear_raw.get("f_rtol", 1.0e-6)),
+        f_atol=float(nonlinear_raw.get("f_atol", 1.0e-10)),
+        use_scaled_unknowns=bool(nonlinear_raw.get("use_scaled_unknowns", True)),
+        use_scaled_residual=bool(nonlinear_raw.get("use_scaled_residual", True)),
+        verbose=bool(nonlinear_raw.get("verbose", False)),
+    )
+
     return CaseConfig(
         case=case_cfg,
         paths=paths_cfg,
@@ -252,6 +268,7 @@ def _load_case_config(cfg_path: str) -> CaseConfig:
         petsc=petsc_cfg,
         io=io_cfg,
         checks=checks_cfg,
+        nonlinear=nonlinear_cfg,
     )
 
 
@@ -331,20 +348,38 @@ def _prepare_run_dir(cfg: CaseConfig, cfg_path: str) -> Path:
 def _log_step(res: StepResult, step_id: int) -> None:
     """Emit one-line step summary."""
     d = res.diag
-    logger.info(
-        "step=%d t=[%.6e -> %.6e] dt=%.3e Ts=%.3f Rd=%.3e mpp=%.3e Tg[min,max]=[%.3f, %.3f] lin_conv=%s rel=%.3e",
-        step_id,
-        d.t_old,
-        d.t_new,
-        d.dt,
-        d.Ts,
-        d.Rd,
-        d.mpp,
-        d.Tg_min,
-        d.Tg_max,
-        d.linear_converged,
-        d.linear_rel_residual,
-    )
+    if getattr(d, "nonlinear_method", ""):
+        logger.info(
+            "step=%d t=[%.6e -> %.6e] dt=%.3e Ts=%.3f Rd=%.3e mpp=%.3e Tg[min,max]=[%.3f, %.3f] "
+            "nl_conv=%s nl_iter=%d nl_res_inf=%.3e",
+            step_id,
+            d.t_old,
+            d.t_new,
+            d.dt,
+            d.Ts,
+            d.Rd,
+            d.mpp,
+            d.Tg_min,
+            d.Tg_max,
+            d.nonlinear_converged,
+            d.nonlinear_n_iter,
+            d.nonlinear_residual_inf,
+        )
+    else:
+        logger.info(
+            "step=%d t=[%.6e -> %.6e] dt=%.3e Ts=%.3f Rd=%.3e mpp=%.3e Tg[min,max]=[%.3f, %.3f] lin_conv=%s rel=%.3e",
+            step_id,
+            d.t_old,
+            d.t_new,
+            d.dt,
+            d.Ts,
+            d.Rd,
+            d.mpp,
+            d.Tg_min,
+            d.Tg_max,
+            d.linear_converged,
+            d.linear_rel_residual,
+        )
 
 
 def _sanity_check_state(state: State) -> Optional[str]:
@@ -421,6 +456,19 @@ def run_case(cfg_path: str, *, max_steps: Optional[int] = None, log_level: int |
         if cfg.time.t_end <= cfg.time.t0:
             logger.error("cfg.time.t_end must exceed t0 (t0=%s, t_end=%s)", cfg.time.t0, cfg.time.t_end)
             return 2
+
+        nl_cfg = getattr(cfg, "nonlinear", None)
+        use_nonlinear = bool(getattr(nl_cfg, "enabled", False))
+        if use_nonlinear:
+            logger.info(
+                "Global nonlinear solve enabled (backend=%s, solver=%s, krylov=%s, max_outer_iter=%d).",
+                getattr(nl_cfg, "backend", "scipy"),
+                getattr(nl_cfg, "solver", "newton_krylov"),
+                getattr(nl_cfg, "krylov_method", "lgmres"),
+                int(getattr(nl_cfg, "max_outer_iter", 0)),
+            )
+        else:
+            logger.info("Global nonlinear solve disabled; using linear SciPy stepper only.")
 
         run_dir = _prepare_run_dir(cfg, cfg_path)
         logger.info("Run directory: %s", run_dir)
@@ -517,9 +565,14 @@ def run_case(cfg_path: str, *, max_steps: Optional[int] = None, log_level: int |
                 if res.diag.extra:
                     logger.error("Diagnostics extra: %s", res.diag.extra)
                 return 2
-            if not res.diag.linear_converged:
-                logger.error("Linear solver not converged at step %s (diag)", step_id)
-                return 2
+            if use_nonlinear:
+                if not res.diag.nonlinear_converged:
+                    logger.error("Nonlinear solver not converged at step %s (diag)", step_id)
+                    return 2
+            else:
+                if not res.diag.linear_converged:
+                    logger.error("Linear solver not converged at step %s (diag)", step_id)
+                    return 2
 
             sanity_msg = _sanity_check_state(res.state_new)
             if sanity_msg is not None:

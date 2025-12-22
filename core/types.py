@@ -242,6 +242,27 @@ class CasePETSc:
 
 
 @dataclass(slots=True)
+class CaseNonlinear:
+    """Nonlinear solver options (global Newton)."""
+
+    enabled: bool = False
+    backend: str = "scipy"
+
+    solver: str = "newton_krylov"
+    krylov_method: str = "lgmres"
+    inner_maxiter: int = 20
+
+    max_outer_iter: int = 20
+    f_rtol: float = 1.0e-6
+    f_atol: float = 1.0e-10
+
+    use_scaled_unknowns: bool = True
+    use_scaled_residual: bool = True
+
+    verbose: bool = False
+
+
+@dataclass(slots=True)
 class CaseIOFields:
     """Fields to output."""
 
@@ -294,6 +315,7 @@ class CaseConfig:
     io: CaseIO
     checks: CaseChecks
     transport: CaseTransport = field(default_factory=CaseTransport)
+    nonlinear: CaseNonlinear = field(default_factory=CaseNonlinear)
 
     def __post_init__(self) -> None:
         if not isinstance(self.conventions, CaseConventions):
@@ -304,6 +326,8 @@ class CaseConfig:
             raise TypeError("physics must be CasePhysics (loader must build dataclass).")
         if not isinstance(self.transport, CaseTransport):
             raise TypeError("transport must be CaseTransport (loader must build dataclass).")
+        if not isinstance(self.nonlinear, CaseNonlinear):
+            raise TypeError("nonlinear must be CaseNonlinear (loader must build dataclass).")
         if self.conventions.gas_closure_species != self.species.gas_balance_species:
             raise ValueError(
                 f"gas closure species mismatch: conventions='{self.conventions.gas_closure_species}' "

@@ -28,10 +28,13 @@ import numpy as np
 
 from core.types import CaseConfig, Grid1D, Props, State
 from core.layout import UnknownLayout, pack_state, apply_u_to_state
+from assembly.residual_global import build_global_residual
 from assembly.build_system_SciPy import build_transport_system
 from properties.equilibrium import build_equilibrium_model, compute_interface_equilibrium
-from properties.compute_props import compute_props
+from properties.compute_props import compute_props, get_or_build_models
 from physics.interface_bc import EqResultLike
+from solvers.nonlinear_context import build_nonlinear_context_for_step
+from solvers.newton_scipy import solve_nonlinear_scipy
 from solvers.scipy_linear import LinearSolveResult, solve_linear_system_scipy
 
 logger = logging.getLogger(__name__)
@@ -59,6 +62,13 @@ class StepDiagnostics:
     mpp: float
     Tg_min: float
     Tg_max: float
+
+    # Nonlinear solve info (global Newton)
+    nonlinear_converged: bool = False
+    nonlinear_method: str = ""
+    nonlinear_n_iter: int = 0
+    nonlinear_residual_norm: float = float("nan")
+    nonlinear_residual_inf: float = float("nan")
 
     # Interface/radius diagnostics
     energy_balance_if: Optional[float] = None
@@ -88,9 +98,11 @@ def advance_one_step_scipy(
     t: float,
 ) -> StepResult:
     """
-    Advance coupled unknowns (Tg, Tl, Yg, Ts, mpp, Rd) by one fixed dt using SciPy linear solver.
+    Advance coupled unknowns (Tg, Tl, Yg, Ts, mpp, Rd) by one fixed dt.
 
-    Inputs state/props are treated as t^n; outputs are t^{n+1}. Does not mutate inputs.
+    Uses the global nonlinear solver if cfg.nonlinear.enabled is True; otherwise uses
+    the existing linear SciPy assembly/solve path. Inputs state/props are treated as
+    t^n; outputs are t^{n+1}. Does not mutate inputs.
     """
     dt = float(cfg.time.dt)
     if dt <= 0.0:
@@ -100,6 +112,19 @@ def advance_one_step_scipy(
 
     state_old = state.copy()
     props_old = props  # Step 12.2: treat props as quasi-steady (no recompute here)
+
+    nl_cfg = getattr(cfg, "nonlinear", None)
+    use_nonlinear = bool(getattr(nl_cfg, "enabled", False))
+    if use_nonlinear:
+        return _advance_one_step_nonlinear_scipy(
+            cfg=cfg,
+            grid=grid,
+            layout=layout,
+            state_old=state_old,
+            props_old=props_old,
+            t_old=t_old,
+            dt=dt,
+        )
 
     # initial nonlinear guess (MVP: old state)
     state_guess = state_old
@@ -190,6 +215,190 @@ def advance_one_step_scipy(
         liq_diag=liq_diag,
     )
 
+    # Guard against mpp sign flip vs interface evaluation (diagnostic-only, no failure in nonlinear mode)
+    try:
+        diag_sys_evap = diag_sys.get("gas", {}).get("evaporation", {})
+        mpp_eval = float(diag_sys_evap.get("mpp_eval", np.nan))
+        mpp_state = float(state_new.mpp)
+        if np.isfinite(mpp_eval) and np.isfinite(mpp_state):
+            if np.sign(mpp_eval) != np.sign(mpp_state) and max(abs(mpp_eval), abs(mpp_state)) > 0.0:
+                rel_diff = abs(mpp_state - mpp_eval) / max(abs(mpp_eval), 1e-30)
+                if rel_diff > 0.2:
+                    try:
+                        diag.extra = dict(diag.extra)
+                        diag.extra["mpp_mismatch"] = {
+                            "mpp_state": mpp_state,
+                            "mpp_eval": mpp_eval,
+                            "rel_diff": rel_diff,
+                        }
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    # Recompute properties based on the updated state (for use by the caller in the next step)
+    try:
+        props_new, extras_new = compute_props(cfg, grid, state_new)
+        try:
+            diag.extra = dict(diag.extra)
+            diag.extra["props_extra"] = extras_new
+        except Exception:
+            pass
+    except Exception as exc:
+        try:
+            diag.extra = dict(diag.extra)
+            diag.extra["props_error"] = {"type": type(exc).__name__, "message": str(exc)}
+        except Exception:
+            pass
+        return StepResult(
+            state_new=state_new,
+            props_new=props_old,
+            diag=diag,
+            success=False,
+            message=f"compute_props failed: {exc}",
+        )
+
+    sanity_msg = _sanity_check_step(cfg=cfg, grid=grid, state_new=state_new, props_new=props_new, diag=diag)
+    if sanity_msg is not None:
+        try:
+            diag.extra = dict(diag.extra)
+            diag.extra["sanity"] = {"reason": sanity_msg}
+        except Exception:
+            pass
+        return StepResult(
+            state_new=state_new,
+            props_new=props_new,
+            diag=diag,
+            success=False,
+            message=sanity_msg,
+        )
+
+    _write_step_scalars_safe(cfg=cfg, t=t_new, state=state_new, diag=diag)
+
+    return StepResult(
+        state_new=state_new,
+        props_new=props_new,
+        diag=diag,
+        success=True,
+        message=None,
+    )
+
+
+def _advance_one_step_nonlinear_scipy(
+    cfg: CaseConfig,
+    grid: Grid1D,
+    layout: UnknownLayout,
+    state_old: State,
+    props_old: Props,
+    t_old: float,
+    dt: float,
+) -> StepResult:
+    """Advance one step using global nonlinear solve (SciPy)."""
+    t_new = t_old + dt
+
+    try:
+        ctx, u0 = build_nonlinear_context_for_step(
+            cfg=cfg,
+            grid=grid,
+            layout=layout,
+            state_old=state_old,
+            props_old=props_old,
+            t_old=t_old,
+            dt=dt,
+        )
+    except Exception as exc:
+        logger.exception("Failed to build nonlinear context.")
+        diag = _build_step_diagnostics_fail(t_old, t_new, dt, message=str(exc))
+        diag.nonlinear_converged = False
+        diag.nonlinear_method = "build_context"
+        return StepResult(
+            state_new=state_old,
+            props_new=props_old,
+            diag=diag,
+            success=False,
+            message=f"nonlinear context build failed: {exc}",
+        )
+
+    try:
+        nl_result = solve_nonlinear_scipy(ctx, u0)
+    except Exception as exc:
+        logger.exception("Nonlinear solve raised an exception.")
+        diag = _build_step_diagnostics_fail(t_old, t_new, dt, message=str(exc))
+        diag.nonlinear_converged = False
+        diag.nonlinear_method = getattr(getattr(cfg, "nonlinear", None), "solver", "unknown")
+        return StepResult(
+            state_new=state_old,
+            props_new=props_old,
+            diag=diag,
+            success=False,
+            message=f"nonlinear solve error: {exc}",
+        )
+
+    if not nl_result.diag.converged:
+        diag = _build_step_diagnostics_fail(
+            t_old,
+            t_new,
+            dt,
+            message=nl_result.diag.message or "Nonlinear solver did not converge",
+        )
+        _apply_nonlinear_diag(diag, nl_result.diag)
+        return StepResult(
+            state_new=state_old,
+            props_new=props_old,
+            diag=diag,
+            success=False,
+            message=diag.extra.get("message", "Nonlinear solver did not converge"),
+        )
+
+    u_final = nl_result.u
+    state_new = ctx.make_state_from_u(u_final, clip_negative_closure=True)
+    _postprocess_species_bounds(cfg, layout, state_new)
+
+    # Apply no_condensation constraint if configured
+    if cfg.physics.include_mpp and layout.has_block("mpp"):
+        interface_type = getattr(cfg.physics.interface, "type", "no_condensation")
+        if interface_type == "no_condensation" and state_new.mpp < 0.0:
+            state_new.mpp = 0.0
+
+    diag_sys: Dict[str, Any] = {}
+    try:
+        _, diag_res = build_global_residual(u_final, ctx)
+        if isinstance(diag_res, dict):
+            diag_sys = dict(diag_res.get("assembly", {}) or {})
+    except Exception as exc:
+        logger.warning("Failed to assemble diagnostics for nonlinear step: %s", exc)
+
+    lin_stub = LinearSolveResult(
+        x=np.asarray(u_final, dtype=np.float64),
+        converged=True,
+        n_iter=0,
+        residual_norm=0.0,
+        rel_residual=0.0,
+        method="nonlinear-global",
+        message=None,
+    )
+
+    diag = _build_step_diagnostics(
+        lin_result=lin_stub,
+        state_new=state_new,
+        diag_sys=diag_sys,
+        t_old=t_old,
+        dt=dt,
+        layout=layout,
+        cfg=cfg,
+        grid=grid,
+        liq_diag=None,
+    )
+    _apply_nonlinear_diag(diag, nl_result.diag)
+    try:
+        diag.extra = dict(diag.extra)
+        diag.extra["nonlinear"] = {
+            "history_res_inf": list(nl_result.diag.history_res_inf),
+            "message": nl_result.diag.message,
+        }
+    except Exception:
+        pass
+
     # Guard against mpp sign flip vs interface evaluation (diagnostic-only, not altering state)
     try:
         diag_sys_evap = diag_sys.get("gas", {}).get("evaporation", {})
@@ -276,6 +485,10 @@ def _assemble_transport_system_step12(
     dt: float,
 ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
     """Wrapper for build_transport_system with basic shape checks."""
+    eq_result = None
+    if cfg.physics.include_mpp and layout.has_block("mpp"):
+        eq_result = _build_eq_result_for_step(cfg, grid, state_guess, props)
+        eq_result = _complete_Yg_eq_with_closure(cfg, layout, eq_result)
     result = build_transport_system(
         cfg=cfg,
         grid=grid,
@@ -284,6 +497,7 @@ def _assemble_transport_system_step12(
         state_guess=state_guess,
         props=props,
         dt=dt,
+        eq_result=eq_result,
         return_diag=True,
     )
     # build_transport_system may return a tuple of length 2 or 3 depending on return_diag
@@ -414,6 +628,18 @@ def _build_step_diagnostics(
         mass_balance_rd=mass_balance_rd,
         extra=extra,
     )
+
+
+def _apply_nonlinear_diag(diag: StepDiagnostics, nl_diag: Any) -> None:
+    """Copy nonlinear diagnostics into StepDiagnostics."""
+    try:
+        diag.nonlinear_converged = bool(getattr(nl_diag, "converged", False))
+        diag.nonlinear_method = str(getattr(nl_diag, "method", ""))
+        diag.nonlinear_n_iter = int(getattr(nl_diag, "n_iter", 0))
+        diag.nonlinear_residual_norm = float(getattr(nl_diag, "res_norm_2", np.nan))
+        diag.nonlinear_residual_inf = float(getattr(nl_diag, "res_norm_inf", np.nan))
+    except Exception:
+        pass
 
 
 def _sanity_check_step(cfg: CaseConfig, grid: Grid1D, state_new: State, props_new: Props, diag: StepDiagnostics) -> Optional[str]:
@@ -604,22 +830,32 @@ def _get_molar_masses_from_cfg(cfg: CaseConfig, Ns_g: int, Ns_l: int) -> Tuple[n
     """Build molar mass arrays (kg/mol) aligned with species order in cfg."""
     mw_map = dict(getattr(cfg.species, "mw_kg_per_mol", {}))
 
-    gas_names = list(cfg.species.gas_species)
-    liq_names = list(cfg.species.liq_species)
+    gas_names = list(getattr(cfg.species, "gas_species_full", []) or [])
+    liq_names = list(getattr(cfg.species, "liq_species", []) or [])
+    if len(gas_names) != Ns_g:
+        raise ValueError(f"gas_species_full length {len(gas_names)} != Ns_g {Ns_g}")
+    if len(liq_names) != Ns_l:
+        raise ValueError(f"liq_species length {len(liq_names)} != Ns_l {Ns_l}")
+    missing_l = [name for name in liq_names if name not in mw_map]
+    if missing_l:
+        raise ValueError(f"mw_kg_per_mol missing liquid entries: {missing_l}")
+
+    gas_model, _ = get_or_build_models(cfg)
+    mech_names = list(getattr(gas_model.gas, "species_names", []))
+    if mech_names and mech_names != gas_names:
+        raise ValueError("gas_species_full does not match Cantera mechanism species order.")
+    M_g = np.asarray(gas_model.gas.molecular_weights, dtype=np.float64) / 1000.0
+    if M_g.size != Ns_g:
+        raise ValueError(f"Cantera molecular_weights size {M_g.size} != Ns_g {Ns_g}")
 
     def _build(names: list[str], Ns: int) -> np.ndarray:
         arr = np.ones(Ns, dtype=np.float64)
         for i, name in enumerate(names):
             if i >= Ns:
                 break
-            if name in mw_map:
-                try:
-                    arr[i] = float(mw_map[name])
-                except Exception:
-                    arr[i] = 1.0
+            arr[i] = float(mw_map[name])
         return arr
 
-    M_g = _build(gas_names, Ns_g)
     M_l = _build(liq_names, Ns_l)
     return M_g, M_l
 

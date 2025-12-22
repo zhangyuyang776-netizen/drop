@@ -126,12 +126,16 @@ def make_cfg_base(
     # Provide latent heat fallback to avoid Ts-row assembly failures in tests
     physics.latent_heat_default = 2.5e6
 
+    mw_map = {name: 0.1 for name in gas_species}
+    mw_map.update({name: 0.1 for name in liq_species})
+
     species_cfg = CaseSpecies(
         gas_balance_species=gas_balance,
         gas_species_full=list(gas_species),
         liq_species=list(liq_species),
         liq_balance_species=liq_balance,
         liq2gas_map=liq2gas_map,
+        mw_kg_per_mol=mw_map,
     )
 
     return CaseConfig(

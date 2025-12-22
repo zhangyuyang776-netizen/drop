@@ -1,9 +1,9 @@
 """
 SciPy/Numpy assembly for liquid species mass-fraction equations (Yl block, reduced species).
 
-Scope (Step 16.4.A):
-- Time term implicit; diffusion flux evaluated explicitly from current state.
-- Interface evaporation enters as a boundary face flux: J_if = mpp * Yl_face.
+Scope (Step 19.4.3):
+- Time term implicit (theta = 1.0, backward Euler).
+- Diffusion + interface evaporation flux evaluated from state_guess (implicit in Yl).
 - No convection; interface diffusive flux placeholder zero (Neumann).
 """
 
@@ -30,17 +30,21 @@ def build_liquid_species_system(
     A_out: np.ndarray | None = None,
     b_out: np.ndarray | None = None,
     return_diag: bool = False,
+    state_guess: State | None = None,
 ) -> Tuple[np.ndarray, np.ndarray] | Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
     """
     Assemble liquid-species mass-fraction equations (reduced species) into global system.
 
-    Time + divergence of (diffusive + interface evaporation) fluxes; explicit fluxes, implicit time.
+    Time + divergence of (diffusive + interface evaporation) fluxes; implicit time.
     """
     if not layout.has_block("Yl"):
         raise ValueError("layout missing 'Yl' block required for liquid species assembly.")
     theta = float(cfg.discretization.theta)
     if abs(theta - 1.0) > 1e-12:
         raise ValueError("Liquid species assembly assumes theta=1.0 (fully implicit time term).")
+
+    if state_guess is None:
+        state_guess = state_old
 
     Ns_full, Nl = state_old.Yl.shape
     if props.D_l is None:
@@ -65,16 +69,21 @@ def build_liquid_species_system(
     gas_start = grid.Nl  # liquid cells start at 0, but keep symmetry with gas indexing
     iface_f = grid.iface_f
 
-    # Fluxes evaluated explicitly from current state_old
-    J_diff = compute_liq_diffusive_flux_Y(cfg, grid, props, state_old.Yl)
+    # Fluxes evaluated from state_guess (implicit in Yl)
+    J_diff = compute_liq_diffusive_flux_Y(cfg, grid, props, state_guess.Yl)
     J_tot = np.array(J_diff, copy=True)
 
-    mpp = float(interface_evap.get("mpp_eval", 0.0)) if interface_evap is not None else 0.0
+    mpp = float(getattr(state_guess, "mpp", 0.0))
+    if interface_evap is not None:
+        diag["evap"]["mpp_eval"] = float(interface_evap.get("mpp_eval", 0.0))
+        diag["evap"]["mpp_state"] = mpp
     if mpp != 0.0:
-        Yl_face = np.asarray(state_old.Yl[:, Nl - 1], dtype=np.float64)
+        # Use Yl at n+1 guess on the last liquid cell next to interface
+        Yl_face = np.asarray(state_guess.Yl[:, Nl - 1], dtype=np.float64)
         J_evap = mpp * Yl_face
         J_tot[:, iface_f] += J_evap
         diag["evap"]["mpp"] = mpp
+        diag["evap"]["Yl_face"] = Yl_face
 
     rho_l = props.rho_l
     V_c = grid.V_c

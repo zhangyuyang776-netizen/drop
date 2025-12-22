@@ -589,6 +589,7 @@ def _build_mpp_row(
         delta_Y_eff = delta_Y_raw
 
     mpp_unconstrained = float(j_corr[k_b_full] / delta_Y_eff) if delta_Y_eff != 0.0 else 0.0
+    mpp_state = float(state.mpp)
 
     # No-condensation handled as diagnostic only (no clamp here)
     interface_type = getattr(cfg.physics.interface, "type", "no_condensation")
@@ -601,6 +602,7 @@ def _build_mpp_row(
 
     # Diagnostics
     J_full = mpp_unconstrained * Yg_eq_full + j_corr
+    J_full_state = mpp_state * Yg_eq_full + j_corr
     k_cl = layout.gas_closure_index
 
     diag_update: Dict[str, Any] = {
@@ -619,13 +621,16 @@ def _build_mpp_row(
             "j_corr_sum": float(j_corr.sum()),
             "mpp_eval": mpp_unconstrained,
             "mpp_unconstrained": mpp_unconstrained,
+            "mpp_state": mpp_state,
             "no_condensation_applied": no_condensation_applied,
             "interface_type": interface_type,
             "sumJ_minus_mpp": float(J_full.sum() - mpp_unconstrained),
+            "sumJ_minus_mpp_state": float(J_full_state.sum() - mpp_state),
             "A_if": A_if,
             "Yg_eq_full": Yg_eq_full,
             "j_corr_full": j_corr,
             "J_full": J_full,
+            "J_full_state": J_full_state,
         }
     }
 
