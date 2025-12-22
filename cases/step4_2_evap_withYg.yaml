@@ -64,9 +64,9 @@ species:
 
 geometry:
   a0: 1.0e-4
-  R_inf: 5.0e-3
-  N_liq: 4
-  N_gas: 20
+  R_inf: 1.0e-2
+  N_liq: 5
+  N_gas: 40
   mesh:
     liq_method: "tanh"
     liq_beta: 2.0
@@ -79,9 +79,9 @@ geometry:
 
 time:
   t0: 0.0
-  dt: 1.0e-7
-  t_end: 1.0e-6
-  max_steps: 20
+  dt: 5.0e-7
+  t_end: 1.0e-3
+  max_steps: 10000
 
 discretization:
   time_scheme: "BE"
@@ -89,7 +89,7 @@ discretization:
   mass_matrix: "rhoVc_p"
 
 initial:
-  T_inf: 900.0
+  T_inf: 1000.0
   P_inf: 101325.0
   T_d0: 300.0
   Yg: {"N2": 0.79, "O2": 0.21}
@@ -107,8 +107,8 @@ nonlinear:
   krylov_method: "lgmres"
   max_outer_iter: 200
   inner_maxiter: 30
-  f_rtol: 1.0e-6
-  f_atol: 1.0e-8
+  f_rtol: 1.0e-5
+  f_atol: 1.0e-7
   use_scaled_unknowns: true
   use_scaled_residual: false
   verbose: true
@@ -125,7 +125,7 @@ petsc:
   monitor: false
 
 io:
-  write_every: 0
+  write_every: 5
   scalars_write_every: 1
   formats: []
   save_grid: false
