@@ -14,7 +14,7 @@ import numpy as np
 from scipy import optimize
 
 from solvers.nonlinear_context import NonlinearContext
-from assembly.residual_global import residual_only
+from assembly.residual_global import build_global_residual, residual_only
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +57,12 @@ def solve_nonlinear_scipy(
     use_scaled_u = bool(getattr(nl, "use_scaled_unknowns", True))
     use_scaled_res = bool(getattr(nl, "use_scaled_residual", True))
     verbose = bool(getattr(nl, "verbose", False))
+    log_every = int(getattr(nl, "log_every", 5))
+    if log_every < 1:
+        log_every = 1
+
+    t_old = float(getattr(ctx, "t_old", 0.0))
+    t_new = t_old + float(getattr(ctx, "dt", 0.0))
 
     if use_scaled_u:
         u0_s = ctx.to_scaled_u(u0)
@@ -73,12 +79,57 @@ def solve_nonlinear_scipy(
         else:
             u_phys = u_s
 
-        res = residual_only(u_phys, ctx)
+        res_raw, diag = build_global_residual(u_phys, ctx)
+        res = res_raw
         if use_scaled_res:
             res = res / scale_safe
 
         res_norm_inf = float(np.linalg.norm(res, ord=np.inf))
         history.append(res_norm_inf)
+        if verbose:
+            iter_id = len(history)
+            if iter_id % log_every == 0:
+                arg = (diag or {}).get("residual_argmax", {})
+                arg_name = str(arg.get("name") or "")
+                if not arg_name:
+                    arg_kind = str(arg.get("kind") or "")
+                    arg_idx = arg.get("idx", "")
+                    arg_name = f"{arg_kind}#{arg_idx}" if arg_kind else str(arg_idx)
+                arg_abs = float(arg.get("abs", np.nan))
+
+                clamp = (diag or {}).get("clamp", {})
+                clamp_flags: List[str] = []
+                if clamp.get("no_condensation_applied", False):
+                    clamp_flags.append("no_cond")
+                if clamp.get("deltaY_min_applied", False):
+                    clamp_flags.append("deltaY_min")
+                gas_oob = int(clamp.get("gas_closure_oob_any", 0))
+                liq_oob = int(clamp.get("liq_closure_oob_any", 0))
+                if gas_oob > 0:
+                    clamp_flags.append(f"gas_oob={gas_oob}")
+                if liq_oob > 0:
+                    clamp_flags.append(f"liq_oob={liq_oob}")
+                clamp_str = ",".join(clamp_flags) if clamp_flags else "none"
+
+                eq_source = str((diag or {}).get("eq_result", {}).get("source", ""))
+                props_source = str((diag or {}).get("props", {}).get("source", ""))
+                raw_inf = float((diag or {}).get("residual_norm_inf", np.nan))
+                if use_scaled_res:
+                    res_msg = f"{res_norm_inf:.3e} raw={raw_inf:.3e}"
+                else:
+                    res_msg = f"{res_norm_inf:.3e}"
+                logger.info(
+                    "nonlinear iter=%d t=[%.6e -> %.6e] res_inf=%s argmax=%s(%.3e) clamp=%s eq=%s props=%s",
+                    iter_id,
+                    t_old,
+                    t_new,
+                    res_msg,
+                    arg_name,
+                    arg_abs,
+                    clamp_str,
+                    eq_source,
+                    props_source,
+                )
         return res
 
     converged = False

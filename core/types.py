@@ -260,6 +260,7 @@ class CaseNonlinear:
     use_scaled_residual: bool = True
 
     verbose: bool = False
+    log_every: int = 5
 
 
 @dataclass(slots=True)

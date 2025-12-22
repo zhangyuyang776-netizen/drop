@@ -253,6 +253,7 @@ def _load_case_config(cfg_path: str) -> CaseConfig:
         use_scaled_unknowns=bool(nonlinear_raw.get("use_scaled_unknowns", True)),
         use_scaled_residual=bool(nonlinear_raw.get("use_scaled_residual", True)),
         verbose=bool(nonlinear_raw.get("verbose", False)),
+        log_every=int(nonlinear_raw.get("log_every", 5)),
     )
 
     return CaseConfig(
@@ -472,6 +473,23 @@ def run_case(cfg_path: str, *, max_steps: Optional[int] = None, log_level: int |
 
         run_dir = _prepare_run_dir(cfg, cfg_path)
         logger.info("Run directory: %s", run_dir)
+        try:
+            log_path = run_dir / "run.log"
+            root_logger = logging.getLogger()
+            existing = [
+                h for h in root_logger.handlers
+                if isinstance(h, logging.FileHandler) and Path(h.baseFilename) == log_path
+            ]
+            if not existing:
+                file_handler = logging.FileHandler(log_path, mode="w", encoding="utf-8")
+                file_handler.setLevel(level)
+                file_handler.setFormatter(
+                    logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
+                )
+                root_logger.addHandler(file_handler)
+                logger.info("Logging to file: %s", log_path)
+        except Exception as exc:
+            logger.warning("Failed to set up file logging: %s", exc)
 
         gas_model, liq_model = get_or_build_models(cfg)
         _maybe_fill_gas_species(cfg, gas_model)

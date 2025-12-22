@@ -79,6 +79,28 @@ def _get_or_build_eq_model(
     return eq_model
 
 
+def _closure_clamp_diag(
+    Y_full: np.ndarray,
+    closure_idx: int,
+    *,
+    tol: float,
+    phase: str,
+) -> Dict[str, Any]:
+    """Compute closure diagnostics to detect out-of-bounds closure before clamping."""
+    sum_other = np.sum(Y_full, axis=0) - Y_full[closure_idx, :]
+    closure_raw = 1.0 - sum_other
+    soft = ((closure_raw < 0.0) & (closure_raw >= -tol)) | ((closure_raw > 1.0) & (closure_raw <= 1.0 + tol))
+    hard = (closure_raw < -tol) | (closure_raw > 1.0 + tol)
+    any_out = (closure_raw < 0.0) | (closure_raw > 1.0)
+    return {
+        f"{phase}_closure_raw_min": float(np.min(closure_raw)) if closure_raw.size else np.nan,
+        f"{phase}_closure_raw_max": float(np.max(closure_raw)) if closure_raw.size else np.nan,
+        f"{phase}_closure_oob_any": int(np.count_nonzero(any_out)),
+        f"{phase}_closure_oob_soft": int(np.count_nonzero(soft)),
+        f"{phase}_closure_oob_hard": int(np.count_nonzero(hard)),
+    }
+
+
 def build_global_residual(
     u: np.ndarray,
     ctx: NonlinearContext,
@@ -126,6 +148,7 @@ def build_global_residual(
 
     eq_result = None
     eq_model = None
+    eq_source = "none"
     phys = cfg.physics
     needs_eq = bool(getattr(phys, "include_mpp", False) and layout.has_block("mpp"))
     if needs_eq:
@@ -146,13 +169,17 @@ def build_global_residual(
                 Yg_face=Yg_face,
             )
             eq_result = {"Yg_eq": np.asarray(Yg_eq), "y_cond": np.asarray(y_cond), "psat": np.asarray(psat)}
+            eq_source = "computed"
             ctx.meta["eq_result_cache"] = dict(eq_result)
         except Exception as exc:
             if cache is not None:
                 logger.warning("compute_interface_equilibrium failed; using cached eq_result: %s", exc)
                 eq_result = cache
+                eq_source = "cached"
             else:
                 raise
+    else:
+        eq_source = "disabled"
 
     result = build_transport_system(
         cfg=cfg,
@@ -194,6 +221,7 @@ def build_global_residual(
     }
 
     diag["props"] = {"source": props_source}
+    diag["eq_result"] = {"source": eq_source, "enabled": needs_eq}
     try:
         diag["props"]["rho_g_min"] = float(np.min(props.rho_g)) if props.rho_g.size else np.nan
         diag["props"]["rho_g_max"] = float(np.max(props.rho_g)) if props.rho_g.size else np.nan
@@ -206,6 +234,61 @@ def build_global_residual(
             diag["props"]["extras_keys"] = list(props_extras.keys())
         except Exception:
             pass
+
+    clamp_diag: Dict[str, Any] = {}
+    tol_sumY = float(getattr(cfg.checks, "sumY_tol", 1e-12))
+    if layout.has_block("Yg") and layout.gas_closure_index is not None:
+        try:
+            clamp_diag.update(
+                _closure_clamp_diag(
+                    state_guess.Yg,
+                    layout.gas_closure_index,
+                    tol=tol_sumY,
+                    phase="gas",
+                )
+            )
+        except Exception:
+            logger.debug("Failed to compute gas closure clamp diagnostics.", exc_info=True)
+    if layout.has_block("Yl") and layout.liq_closure_index is not None:
+        try:
+            clamp_diag.update(
+                _closure_clamp_diag(
+                    state_guess.Yl,
+                    layout.liq_closure_index,
+                    tol=tol_sumY,
+                    phase="liq",
+                )
+            )
+        except Exception:
+            logger.debug("Failed to compute liquid closure clamp diagnostics.", exc_info=True)
+
+    evap_diag = diag_sys.get("evaporation", {}) if isinstance(diag_sys, dict) else {}
+    try:
+        no_cond = bool(evap_diag.get("no_condensation_applied", False))
+        deltaY_raw = float(evap_diag.get("DeltaY_raw", np.nan))
+        deltaY_eff = float(evap_diag.get("DeltaY_eff", np.nan))
+        clamp_diag["no_condensation_applied"] = no_cond
+        if np.isfinite(deltaY_raw) and np.isfinite(deltaY_eff):
+            clamp_diag["deltaY_min_applied"] = abs(deltaY_eff) > abs(deltaY_raw)
+    except Exception:
+        pass
+
+    if clamp_diag:
+        diag["clamp"] = clamp_diag
+
+    if res.size:
+        idx_max = int(np.argmax(np.abs(res)))
+        entry = layout.entries[idx_max] if idx_max < len(layout.entries) else None
+        diag["residual_argmax"] = {
+            "idx": idx_max,
+            "abs": float(abs(res[idx_max])),
+            "value": float(res[idx_max]),
+            "kind": getattr(entry, "kind", ""),
+            "name": getattr(entry, "name", ""),
+            "phase": getattr(entry, "phase", ""),
+            "cell": getattr(entry, "cell", None),
+            "spec": getattr(entry, "spec", None),
+        }
 
     try:
         if layout.has_block("Ts"):

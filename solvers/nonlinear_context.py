@@ -35,7 +35,6 @@ class NonlinearContext:
 
     # Time info
     dt: float
-    t_old: float = 0.0
 
     # State/props at time n
     state_old: State
@@ -43,6 +42,9 @@ class NonlinearContext:
 
     # Variable scaling and metadata (from layout.pack_state)
     scale_u: np.ndarray
+
+    # Reference time level for state_old
+    t_old: float = 0.0
     entries: List[VarEntry] = field(default_factory=list)
 
     # Extension point for diagnostics/counters
