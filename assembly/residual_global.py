@@ -101,6 +101,122 @@ def _closure_clamp_diag(
     }
 
 
+def build_transport_system_from_ctx(
+    ctx: NonlinearContext,
+    u: np.ndarray,
+    *,
+    return_diag: bool = False,
+) -> Tuple[np.ndarray, np.ndarray] | Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+    """
+    Assemble dense A(u), b(u) using the same logic as build_global_residual.
+
+    Parameters
+    ----------
+    ctx : NonlinearContext
+        Timestep context containing cfg/grid/layout/state_old/props_old/dt.
+    u : ndarray
+        Global unknown vector aligned with ctx.layout.
+    return_diag : bool
+        If True, also return assembly diagnostics from build_transport_system.
+    """
+    u = np.asarray(u, dtype=np.float64)
+    N = ctx.layout.n_dof()
+    if u.shape != (N,):
+        raise ValueError(f"Global unknown vector shape {u.shape} != ({N},)")
+
+    cfg = ctx.cfg
+    grid = ctx.grid_ref
+    layout = ctx.layout
+    state_old = ctx.state_old
+    props_old = ctx.props_old
+    dt = float(ctx.dt)
+
+    try:
+        state_guess = ctx.make_state(u)
+    except Exception as exc:
+        logger.warning("make_state(u) failed in residual_global: %s; fallback to state_old.", exc)
+        state_guess = state_old
+
+    t_min_cfg = float(getattr(getattr(cfg, "checks", None), "T_min", 1.0))
+    if not np.isfinite(t_min_cfg) or t_min_cfg <= 0.0:
+        t_min_cfg = 1.0
+
+    state_props = state_guess.copy()
+    if state_props.Tg.size:
+        state_props.Tg = np.maximum(state_props.Tg, t_min_cfg)
+    if state_props.Tl.size:
+        state_props.Tl = np.maximum(state_props.Tl, t_min_cfg)
+    state_props.Ts = max(float(state_props.Ts), t_min_cfg)
+
+    try:
+        props, _props_extras = compute_props(cfg, grid, state_props)
+    except Exception:
+        logger.exception("compute_props failed in residual_global; falling back to props_old.")
+        props = props_old
+
+    eq_result = None
+    eq_model = None
+    phys = cfg.physics
+    needs_eq = bool(getattr(phys, "include_mpp", False) and layout.has_block("mpp"))
+    if needs_eq:
+        cache = ctx.meta.get("eq_result_cache")
+        eq_model = _get_or_build_eq_model(ctx, state_guess)
+        try:
+            il_if = grid.Nl - 1
+            ig_if = 0
+            Ts_if = float(state_props.Ts)
+            Pg_if = float(getattr(cfg.initial, "P_inf", 101325.0))
+            Yl_face = np.asarray(state_props.Yl[:, il_if], dtype=np.float64)
+            Yg_face = np.asarray(state_props.Yg[:, ig_if], dtype=np.float64)
+            Yg_eq, y_cond, psat = compute_interface_equilibrium(
+                eq_model,
+                Ts=Ts_if,
+                Pg=Pg_if,
+                Yl_face=Yl_face,
+                Yg_face=Yg_face,
+            )
+            eq_result = {"Yg_eq": np.asarray(Yg_eq), "y_cond": np.asarray(y_cond), "psat": np.asarray(psat)}
+            ctx.meta["eq_result_cache"] = dict(eq_result)
+        except Exception as exc:
+            if cache is not None:
+                logger.warning("compute_interface_equilibrium failed; using cached eq_result: %s", exc)
+                eq_result = cache
+            else:
+                raise
+
+    result = build_transport_system(
+        cfg=cfg,
+        grid=grid,
+        layout=layout,
+        state_old=state_old,
+        props=props,
+        dt=dt,
+        state_guess=state_guess,
+        eq_model=eq_model,
+        eq_result=eq_result,
+        return_diag=bool(return_diag),
+    )
+
+    if return_diag:
+        if isinstance(result, tuple) and len(result) == 3:
+            A, b, diag_sys = result
+        else:
+            A, b = result  # type: ignore[misc]
+            diag_sys = {}
+        if A.shape != (N, N):
+            raise ValueError(f"Assembly produced A shape {A.shape}, expected {(N, N)}")
+        if b.shape != (N,):
+            raise ValueError(f"Assembly produced b shape {b.shape}, expected {(N,)}")
+        return A, b, diag_sys
+
+    A, b = result  # type: ignore[misc]
+    if A.shape != (N, N):
+        raise ValueError(f"Assembly produced A shape {A.shape}, expected {(N, N)}")
+    if b.shape != (N,):
+        raise ValueError(f"Assembly produced b shape {b.shape}, expected {(N,)}")
+    return A, b
+
+
 def build_global_residual(
     u: np.ndarray,
     ctx: NonlinearContext,
@@ -136,11 +252,29 @@ def build_global_residual(
         logger.warning("make_state(u) failed in residual_global: %s; fallback to state_old.", exc)
         state_guess = state_old
 
+    t_min_cfg = float(getattr(getattr(cfg, "checks", None), "T_min", 1.0))
+    if not np.isfinite(t_min_cfg) or t_min_cfg <= 0.0:
+        t_min_cfg = 1.0
+
+    state_props = state_guess.copy()
+    Tg_raw_min = float(np.min(state_props.Tg)) if state_props.Tg.size else np.nan
+    Tl_raw_min = float(np.min(state_props.Tl)) if state_props.Tl.size else np.nan
+    Ts_raw = float(state_props.Ts)
+    Tg_clamped = int(np.count_nonzero(state_props.Tg < t_min_cfg)) if state_props.Tg.size else 0
+    Tl_clamped = int(np.count_nonzero(state_props.Tl < t_min_cfg)) if state_props.Tl.size else 0
+    Ts_clamped = int(Ts_raw < t_min_cfg)
+    if Tg_clamped:
+        state_props.Tg = np.maximum(state_props.Tg, t_min_cfg)
+    if Tl_clamped:
+        state_props.Tl = np.maximum(state_props.Tl, t_min_cfg)
+    if Ts_clamped:
+        state_props.Ts = t_min_cfg
+
     props_source = "props_old"
     props_extras = None
     try:
-        props, props_extras = compute_props(cfg, grid, state_guess)
-        props_source = "state_guess"
+        props, props_extras = compute_props(cfg, grid, state_props)
+        props_source = "state_guess_clamped" if (Tg_clamped or Tl_clamped or Ts_clamped) else "state_guess"
     except Exception:
         logger.exception("compute_props failed in residual_global; falling back to props_old.")
         props = props_old
@@ -157,10 +291,10 @@ def build_global_residual(
         try:
             il_if = grid.Nl - 1
             ig_if = 0
-            Ts_if = float(state_guess.Ts)
+            Ts_if = float(state_props.Ts)
             Pg_if = float(getattr(cfg.initial, "P_inf", 101325.0))
-            Yl_face = np.asarray(state_guess.Yl[:, il_if], dtype=np.float64)
-            Yg_face = np.asarray(state_guess.Yg[:, ig_if], dtype=np.float64)
+            Yl_face = np.asarray(state_props.Yl[:, il_if], dtype=np.float64)
+            Yg_face = np.asarray(state_props.Yg[:, ig_if], dtype=np.float64)
             Yg_eq, y_cond, psat = compute_interface_equilibrium(
                 eq_model,
                 Ts=Ts_if,
@@ -227,6 +361,13 @@ def build_global_residual(
         diag["props"]["rho_g_max"] = float(np.max(props.rho_g)) if props.rho_g.size else np.nan
         diag["props"]["state_Tg_min"] = float(np.min(state_guess.Tg)) if state_guess.Tg.size else np.nan
         diag["props"]["state_Tg_max"] = float(np.max(state_guess.Tg)) if state_guess.Tg.size else np.nan
+        diag["props"]["T_min_used"] = float(t_min_cfg)
+        diag["props"]["Tg_min_raw"] = Tg_raw_min
+        diag["props"]["Tl_min_raw"] = Tl_raw_min
+        diag["props"]["Ts_raw"] = Ts_raw
+        diag["props"]["Tg_clamped_count"] = Tg_clamped
+        diag["props"]["Tl_clamped_count"] = Tl_clamped
+        diag["props"]["Ts_clamped"] = Ts_clamped
     except Exception:
         pass
     if isinstance(props_extras, dict):

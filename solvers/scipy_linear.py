@@ -10,7 +10,6 @@ Design goals:
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
@@ -18,20 +17,9 @@ import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 
 from core.types import CaseConfig
+from solvers.linear_types import LinearSolveResult
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class LinearSolveResult:
-    x: np.ndarray
-    converged: bool
-    n_iter: int
-    residual_norm: float
-    rel_residual: float
-    method: str
-    message: Optional[str] = None
-
 
 def _as_csr(A) -> sp.csr_matrix:
     """Ensure matrix is CSR sparse format."""

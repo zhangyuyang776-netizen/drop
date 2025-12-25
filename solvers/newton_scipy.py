@@ -7,39 +7,26 @@ This module only coordinates solver calls; residual assembly is handled elsewher
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List
 
 import numpy as np
 from scipy import optimize
 
 from solvers.nonlinear_context import NonlinearContext
 from assembly.residual_global import build_global_residual, residual_only
+from solvers.nonlinear_types import NonlinearDiagnostics, NonlinearSolveResult
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass(slots=True)
-class NewtonDiagnostics:
-    converged: bool
-    method: str
-    n_iter: int
-    res_norm_2: float
-    res_norm_inf: float
-    history_res_inf: List[float] = field(default_factory=list)
-    message: Optional[str] = None
-
-
-@dataclass(slots=True)
-class NewtonSolveResult:
-    u: np.ndarray
-    diag: NewtonDiagnostics
+NewtonDiagnostics = NonlinearDiagnostics
+NewtonSolveResult = NonlinearSolveResult
 
 
 def solve_nonlinear_scipy(
     ctx: NonlinearContext,
     u0: np.ndarray,
-) -> NewtonSolveResult:
+) -> NonlinearSolveResult:
     """
     Solve F(u)=0 using SciPy nonlinear solvers with optional scaling.
     """
@@ -56,6 +43,7 @@ def solve_nonlinear_scipy(
     f_atol = float(getattr(nl, "f_atol", 1.0e-10))
     use_scaled_u = bool(getattr(nl, "use_scaled_unknowns", True))
     use_scaled_res = bool(getattr(nl, "use_scaled_residual", True))
+    residual_scale_floor = float(getattr(nl, "residual_scale_floor", 1.0e-12))
     verbose = bool(getattr(nl, "verbose", False))
     log_every = int(getattr(nl, "log_every", 5))
     if log_every < 1:
@@ -70,8 +58,73 @@ def solve_nonlinear_scipy(
         u0_s = np.asarray(u0, dtype=np.float64)
 
     history: List[float] = []
-    scale = np.asarray(ctx.scale_u, dtype=np.float64)
-    scale_safe = np.where(scale > 0.0, scale, 1.0)
+
+    # Residual scaling based on block-wise reference residual magnitudes.
+    scale_F = np.ones_like(u0_s, dtype=np.float64)
+    if use_scaled_res:
+        try:
+            if use_scaled_u:
+                u_ref = ctx.from_scaled_u(u0_s)
+            else:
+                u_ref = np.asarray(u0_s, dtype=np.float64)
+
+            res_ref = residual_only(u_ref, ctx)
+            if res_ref.shape != u0_s.shape:
+                raise ValueError(
+                    f"residual_only shape {res_ref.shape} incompatible with unknown shape {u0_s.shape}"
+                )
+
+            abs_ref = np.abs(res_ref)
+            finite_all = abs_ref[np.isfinite(abs_ref)]
+            if finite_all.size == 0:
+                logger.warning(
+                    "residual_only returned no finite entries; disabling use_scaled_residual."
+                )
+                use_scaled_res = False
+                scale_F = np.ones_like(u0_s, dtype=np.float64)
+            else:
+                global_max = float(finite_all.max())
+                if global_max <= 0.0:
+                    use_scaled_res = False
+                    scale_F = np.ones_like(u0_s, dtype=np.float64)
+                else:
+                    block_rel_threshold = 1.0e-3
+                    scale_F = np.ones_like(abs_ref, dtype=np.float64)
+
+                    blocks = getattr(ctx.layout, "blocks", {}) or {}
+                    for blk_name, sl in blocks.items():
+                        blk = abs_ref[sl]
+                        finite = blk[np.isfinite(blk)]
+                        if finite.size == 0:
+                            continue
+
+                        s_blk = float(np.percentile(finite, 90.0))
+                        if not np.isfinite(s_blk) or s_blk <= 0.0:
+                            continue
+
+                        if s_blk < block_rel_threshold * global_max:
+                            continue
+
+                        if s_blk < residual_scale_floor:
+                            s_blk = residual_scale_floor
+
+                        scale_F[sl] = s_blk
+
+                    bad_mask = ~(np.isfinite(scale_F) & (scale_F > 0.0))
+                    if np.any(bad_mask):
+                        scale_F[bad_mask] = 1.0
+
+                ctx.meta["residual_scale_F"] = scale_F.copy()
+
+        except Exception as exc:
+            logger.warning(
+                "Failed to build residual scaling; disabling use_scaled_residual. err=%s",
+                exc,
+            )
+            use_scaled_res = False
+            scale_F = np.ones_like(u0_s, dtype=np.float64)
+
+    scale_F_safe = np.where(scale_F > 0.0, scale_F, 1.0)
 
     def _F_scaled(u_s: np.ndarray) -> np.ndarray:
         if use_scaled_u:
@@ -82,7 +135,7 @@ def solve_nonlinear_scipy(
         res_raw, diag = build_global_residual(u_phys, ctx)
         res = res_raw
         if use_scaled_res:
-            res = res / scale_safe
+            res = res / scale_F_safe
 
         res_norm_inf = float(np.linalg.norm(res, ord=np.inf))
         history.append(res_norm_inf)
@@ -182,7 +235,7 @@ def solve_nonlinear_scipy(
     res_norm_inf = float(np.linalg.norm(res_final, ord=np.inf))
     n_iter = len(history)
 
-    diag = NewtonDiagnostics(
+    diag = NonlinearDiagnostics(
         converged=converged,
         method=solver,
         n_iter=n_iter,
@@ -191,4 +244,4 @@ def solve_nonlinear_scipy(
         history_res_inf=history,
         message=msg,
     )
-    return NewtonSolveResult(u=u_final, diag=diag)
+    return NonlinearSolveResult(u=u_final, diag=diag)

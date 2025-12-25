@@ -79,7 +79,7 @@ geometry:
 
 time:
   t0: 0.0
-  dt: 1.0e-7
+  dt: 1.0e-6
   t_end: 5.0e-5
   max_steps: null
 
@@ -110,7 +110,7 @@ nonlinear:
   f_rtol: 1.0e-5
   f_atol: 1.0e-8
   use_scaled_unknowns: true
-  use_scaled_residual: false
+  use_scaled_residual: true
   verbose: true
   log_every: 5
 
