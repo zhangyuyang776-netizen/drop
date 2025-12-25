@@ -13,6 +13,7 @@ Future extensions:
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -28,6 +29,7 @@ else:
 from core.types import CaseConfig, Grid1D, State
 
 FloatArray = np.ndarray
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -63,20 +65,43 @@ def build_liquid_model(cfg: CaseConfig) -> LiquidPropertiesModel:
 
 def _pure_liquid_props(fluid: str, T: float, P: float) -> Tuple[float, float, float, float]:
     """Return rho [kg/m3], cp [J/kg/K], k [W/m/K], h [J/kg] for pure fluid at T,P."""
-    rho = float(CP.PropsSI("D", "T", T, "P", P, fluid))
-    cp = float(CP.PropsSI("Cpmass", "T", T, "P", P, fluid))
-    k = float(CP.PropsSI("L", "T", T, "P", P, fluid))
-    h = float(CP.PropsSI("H", "T", T, "P", P, fluid))
+    T_safe = _cp_safe_T(fluid, T)
+    rho = float(CP.PropsSI("D", "T", T_safe, "P", P, fluid))
+    cp = float(CP.PropsSI("Cpmass", "T", T_safe, "P", P, fluid))
+    k = float(CP.PropsSI("L", "T", T_safe, "P", P, fluid))
+    h = float(CP.PropsSI("H", "T", T_safe, "P", P, fluid))
     return rho, cp, k, h
 
 
 def _psat_hvap(fluid: str, T: float) -> Tuple[float, float]:
     """Return psat [Pa] and hvap [J/kg] at temperature T."""
-    psat = float(CP.PropsSI("P", "T", T, "Q", 0, fluid))
-    hV = float(CP.PropsSI("H", "T", T, "Q", 1, fluid))
-    hL = float(CP.PropsSI("H", "T", T, "Q", 0, fluid))
+    T_safe = _cp_safe_T(fluid, T)
+    try:
+        psat = float(CP.PropsSI("P", "T", T_safe, "Q", 0, fluid))
+        hV = float(CP.PropsSI("H", "T", T_safe, "Q", 1, fluid))
+        hL = float(CP.PropsSI("H", "T", T_safe, "Q", 0, fluid))
+    except Exception as exc:
+        logger.warning(
+            "CoolProp psat/hvap failed for %s at T=%.3f (T_safe=%.3f): %s",
+            fluid,
+            T,
+            T_safe,
+            exc,
+        )
+        return 0.0, 0.0
     hvap = max(hV - hL, 0.0)
-    return psat, hvap
+    return max(psat, 0.0), hvap
+
+
+def _cp_safe_T(fluid: str, T: float) -> float:
+    """Clamp temperature to CoolProp Tmin to avoid domain errors."""
+    try:
+        tmin = float(CP.PropsSI("Tmin", fluid))
+    except Exception:
+        tmin = None
+    if tmin is not None and np.isfinite(tmin) and T < tmin:
+        return tmin + 1.0e-3
+    return T
 
 
 def compute_liquid_props(

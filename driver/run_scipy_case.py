@@ -43,9 +43,11 @@ from core.types import (
     CaseNonlinear,
     CasePaths,
     CasePETSc,
+    CaseSolver,
     CasePhysics,
     CaseSpecies,
     CaseTime,
+    LinearSolverConfig,
     Grid1D,
     State,
 )
@@ -198,17 +200,34 @@ def _load_case_config(cfg_path: str) -> CaseConfig:
         Y_vap_if0=init_raw.get("Y_vap_if0", 1.0e-6),
     )
 
-    petsc_raw = raw["petsc"]
+    petsc_raw = raw.get("petsc", {}) or {}
     petsc_cfg = CasePETSc(
-        options_prefix=petsc_raw["options_prefix"],
-        ksp_type=petsc_raw["ksp_type"],
-        pc_type=petsc_raw["pc_type"],
-        rtol=petsc_raw["rtol"],
-        atol=petsc_raw["atol"],
-        max_it=petsc_raw["max_it"],
-        restart=petsc_raw["restart"],
-        monitor=petsc_raw["monitor"],
+        options_prefix=str(petsc_raw.get("options_prefix", "")),
+        ksp_type=str(petsc_raw.get("ksp_type", "gmres")),
+        pc_type=str(petsc_raw.get("pc_type", "ilu")),
+        rtol=float(petsc_raw.get("rtol", 1.0e-8)),
+        atol=float(petsc_raw.get("atol", 1.0e-12)),
+        max_it=int(petsc_raw.get("max_it", 200)),
+        restart=int(petsc_raw.get("restart", 30)),
+        monitor=bool(petsc_raw.get("monitor", False)),
+        snes_type=str(petsc_raw.get("snes_type", "newtonls")),
+        linesearch_type=str(petsc_raw.get("linesearch_type", "bt")),
+        jacobian_mode=str(petsc_raw.get("jacobian_mode", "fd")),
+        fd_eps=float(petsc_raw.get("fd_eps", 1.0e-8)),
+        snes_monitor=bool(petsc_raw.get("snes_monitor", False)),
     )
+
+    solver_raw = raw.get("solver", {}) or {}
+    linear_raw = solver_raw.get("linear", {}) or {}
+    linear_cfg = LinearSolverConfig(
+        backend=str(linear_raw.get("backend", "scipy")),
+        method=linear_raw.get("method", None),
+        assembly_mode=str(linear_raw.get("assembly_mode", "bridge_dense")),
+        pc_type=linear_raw.get("pc_type", None),
+        asm_overlap=linear_raw.get("asm_overlap", None),
+        fieldsplit=linear_raw.get("fieldsplit", None),
+    )
+    solver_cfg = CaseSolver(linear=linear_cfg)
 
     io_raw = raw["io"]
     fields_raw = io_raw.get("fields", {})
@@ -252,6 +271,7 @@ def _load_case_config(cfg_path: str) -> CaseConfig:
         f_atol=float(nonlinear_raw.get("f_atol", 1.0e-10)),
         use_scaled_unknowns=bool(nonlinear_raw.get("use_scaled_unknowns", True)),
         use_scaled_residual=bool(nonlinear_raw.get("use_scaled_residual", True)),
+        residual_scale_floor=float(nonlinear_raw.get("residual_scale_floor", 1.0e-12)),
         verbose=bool(nonlinear_raw.get("verbose", False)),
         log_every=int(nonlinear_raw.get("log_every", 5)),
     )
@@ -270,6 +290,7 @@ def _load_case_config(cfg_path: str) -> CaseConfig:
         io=io_cfg,
         checks=checks_cfg,
         nonlinear=nonlinear_cfg,
+        solver=solver_cfg,
     )
 
 
@@ -461,13 +482,27 @@ def run_case(cfg_path: str, *, max_steps: Optional[int] = None, log_level: int |
         nl_cfg = getattr(cfg, "nonlinear", None)
         use_nonlinear = bool(getattr(nl_cfg, "enabled", False))
         if use_nonlinear:
-            logger.info(
-                "Global nonlinear solve enabled (backend=%s, solver=%s, krylov=%s, max_outer_iter=%d).",
-                getattr(nl_cfg, "backend", "scipy"),
-                getattr(nl_cfg, "solver", "newton_krylov"),
-                getattr(nl_cfg, "krylov_method", "lgmres"),
-                int(getattr(nl_cfg, "max_outer_iter", 0)),
-            )
+            backend = str(getattr(nl_cfg, "backend", "scipy")).lower()
+            if backend in ("petsc", "snes", "petsc_snes"):
+                petsc_cfg = getattr(cfg, "petsc", None)
+                logger.info(
+                    "Global nonlinear solve enabled (backend=%s, snes=%s, linesearch=%s, jacobian=%s, ksp=%s, pc=%s, max_outer_iter=%d).",
+                    backend,
+                    getattr(petsc_cfg, "snes_type", "newtonls"),
+                    getattr(petsc_cfg, "linesearch_type", "bt"),
+                    getattr(petsc_cfg, "jacobian_mode", "fd"),
+                    getattr(petsc_cfg, "ksp_type", "gmres"),
+                    getattr(petsc_cfg, "pc_type", "ilu"),
+                    int(getattr(nl_cfg, "max_outer_iter", 0)),
+                )
+            else:
+                logger.info(
+                    "Global nonlinear solve enabled (backend=%s, solver=%s, krylov=%s, max_outer_iter=%d).",
+                    backend,
+                    getattr(nl_cfg, "solver", "newton_krylov"),
+                    getattr(nl_cfg, "krylov_method", "lgmres"),
+                    int(getattr(nl_cfg, "max_outer_iter", 0)),
+                )
         else:
             logger.info("Global nonlinear solve disabled; using linear SciPy stepper only.")
 
@@ -577,6 +612,24 @@ def run_case(cfg_path: str, *, max_steps: Optional[int] = None, log_level: int |
 
             res = advance_one_step_scipy(cfg, grid, layout, state, props, t)
             _log_step(res, step_id)
+            if use_nonlinear and bool(getattr(nl_cfg, "verbose", False)):
+                try:
+                    nl_info = res.diag.extra.get("nonlinear", {}) or {}
+                    extra = nl_info.get("extra", {}) or {}
+                except Exception:
+                    extra = {}
+                if extra:
+                    logger.info(
+                        "[NL extra] n_func_eval=%s n_jac_eval=%s ksp_its_total=%s "
+                        "time_total=%.3e time_func=%.3e time_jac=%.3e time_linear=%.3e",
+                        extra.get("n_func_eval", "NA"),
+                        extra.get("n_jac_eval", "NA"),
+                        extra.get("ksp_its_total", "NA"),
+                        float(extra.get("time_total", float("nan"))),
+                        float(extra.get("time_func", float("nan"))),
+                        float(extra.get("time_jac", float("nan"))),
+                        float(extra.get("time_linear_total", float("nan"))),
+                    )
 
             if not res.success:
                 logger.error("Step %s failed: %s", step_id, res.message)

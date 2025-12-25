@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Mapping, Optional, Tuple
+from typing import Any, List, Mapping, Optional, Tuple
 
 import numpy as np
 from numpy.typing import NDArray
@@ -231,14 +231,42 @@ class CaseInitial:
 class CasePETSc:
     """PETSc solver options (minimal)."""
 
-    options_prefix: str
-    ksp_type: str
-    pc_type: str
-    rtol: float
-    atol: float
-    max_it: int
-    restart: int
-    monitor: bool
+    options_prefix: str = ""
+    ksp_type: str = "gmres"
+    pc_type: str = "ilu"
+    rtol: float = 1.0e-8
+    atol: float = 1.0e-12
+    max_it: int = 200
+    restart: int = 30
+    monitor: bool = False
+
+    # SNES-specific options (used by PETSc nonlinear backend)
+    snes_type: str = "newtonls"
+    linesearch_type: str = "bt"
+    jacobian_mode: str = "fd"
+    fd_eps: float = 1.0e-8
+    snes_monitor: bool = False
+    precond_drop_tol: float = 0.0
+    precond_max_nnz_row: Optional[int] = None
+
+
+@dataclass(slots=True)
+class LinearSolverConfig:
+    """Linear solver options (backend + assembly mode)."""
+
+    backend: str = "scipy"
+    method: Optional[str] = None
+    assembly_mode: str = "bridge_dense"
+    pc_type: Optional[str] = None
+    asm_overlap: Optional[int] = None
+    fieldsplit: Optional[Any] = None
+
+
+@dataclass(slots=True)
+class CaseSolver:
+    """Solver configuration container."""
+
+    linear: LinearSolverConfig = field(default_factory=LinearSolverConfig)
 
 
 @dataclass(slots=True)
@@ -258,6 +286,7 @@ class CaseNonlinear:
 
     use_scaled_unknowns: bool = True
     use_scaled_residual: bool = True
+    residual_scale_floor: float = 1.0e-12
 
     verbose: bool = False
     log_every: int = 5
@@ -317,6 +346,7 @@ class CaseConfig:
     checks: CaseChecks
     transport: CaseTransport = field(default_factory=CaseTransport)
     nonlinear: CaseNonlinear = field(default_factory=CaseNonlinear)
+    solver: CaseSolver = field(default_factory=CaseSolver)
 
     def __post_init__(self) -> None:
         if not isinstance(self.conventions, CaseConventions):
@@ -329,6 +359,8 @@ class CaseConfig:
             raise TypeError("transport must be CaseTransport (loader must build dataclass).")
         if not isinstance(self.nonlinear, CaseNonlinear):
             raise TypeError("nonlinear must be CaseNonlinear (loader must build dataclass).")
+        if not isinstance(self.solver, CaseSolver):
+            raise TypeError("solver must be CaseSolver (loader must build dataclass).")
         if self.conventions.gas_closure_species != self.species.gas_balance_species:
             raise ValueError(
                 f"gas closure species mismatch: conventions='{self.conventions.gas_closure_species}' "

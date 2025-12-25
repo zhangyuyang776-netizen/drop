@@ -1,16 +1,16 @@
 """
-Single-step timestepper (SciPy backend) with coupled Tg/Tl/Yg/Ts/mpp/Rd solve.
+Single-step timestepper (linear backend dispatch) with coupled Tg/Tl/Yg/Ts/mpp/Rd solve.
 
 Current scope:
-- Assemble once via build_transport_system (already embeds Yg via global layout).
+- Assemble once via numpy/PETSc bridge build_transport_system (already embeds Yg via global layout).
 - Use layout pack/apply to map between State and global unknown vector (no hand indexing).
 - Per-step property recomputation enabled (props are treated as given for the current step,
   then recomputed from the updated state for the next step).
 - No grid remeshing for Rd changes.
 
 This module:
-- Delegates assembly to assembly.build_system_SciPy.build_transport_system.
-- Delegates linear solve to solvers.scipy_linear.solve_linear_system_scipy.
+- Delegates assembly to numpy or PETSc bridge based on cfg.solver.linear.backend.
+- Delegates linear solve to solvers.solver_linear.solve_linear_system.
 - Packs/apply state via core.layout helpers.
 - Computes interface equilibrium per-step to supply eq_result for mpp equation.
 """
@@ -29,13 +29,18 @@ import numpy as np
 from core.types import CaseConfig, Grid1D, Props, State
 from core.layout import UnknownLayout, pack_state, apply_u_to_state
 from assembly.residual_global import build_global_residual
-from assembly.build_system_SciPy import build_transport_system
+from assembly.build_system_SciPy import build_transport_system as build_transport_system_numpy
+from assembly.build_system_petsc import (
+    build_transport_system_petsc_bridge,
+    build_transport_system_petsc_native,
+)
 from properties.equilibrium import build_equilibrium_model, compute_interface_equilibrium
 from properties.compute_props import compute_props, get_or_build_models
 from physics.interface_bc import EqResultLike
 from solvers.nonlinear_context import build_nonlinear_context_for_step
-from solvers.newton_scipy import solve_nonlinear_scipy
-from solvers.scipy_linear import LinearSolveResult, solve_linear_system_scipy
+from solvers.solver_nonlinear import solve_nonlinear
+from solvers.solver_linear import solve_linear_system
+from solvers.linear_types import LinearSolveResult
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +94,18 @@ class StepResult:
     message: Optional[str] = None
 
 
+def advance_one_step(
+    cfg: CaseConfig,
+    grid: Grid1D,
+    layout: UnknownLayout,
+    state: State,
+    props: Props,
+    t: float,
+) -> StepResult:
+    """Advance one step using linear backend dispatch (SciPy/PETSc)."""
+    return advance_one_step_scipy(cfg=cfg, grid=grid, layout=layout, state=state, props=props, t=t)
+
+
 def advance_one_step_scipy(
     cfg: CaseConfig,
     grid: Grid1D,
@@ -101,8 +118,8 @@ def advance_one_step_scipy(
     Advance coupled unknowns (Tg, Tl, Yg, Ts, mpp, Rd) by one fixed dt.
 
     Uses the global nonlinear solver if cfg.nonlinear.enabled is True; otherwise uses
-    the existing linear SciPy assembly/solve path. Inputs state/props are treated as
-    t^n; outputs are t^{n+1}. Does not mutate inputs.
+    the linear backend dispatch path. The name is kept for compatibility; inputs
+    state/props are treated as t^n; outputs are t^{n+1}. Does not mutate inputs.
     """
     dt = float(cfg.time.dt)
     if dt <= 0.0:
@@ -154,7 +171,7 @@ def advance_one_step_scipy(
     u0, _, _ = pack_state(state_old, layout)
 
     try:
-        lin_result: LinearSolveResult = solve_linear_system_scipy(A=A, b=b, cfg=cfg, x0=u0)
+        lin_result: LinearSolveResult = solve_linear_system(A=A, b=b, cfg=cfg, x0=u0, layout=layout)
     except Exception as exc:
         logger.exception("Linear solve raised an exception.")
         diag = _build_step_diagnostics_fail(t_old, t_new, dt, message=str(exc))
@@ -293,7 +310,7 @@ def _advance_one_step_nonlinear_scipy(
     t_old: float,
     dt: float,
 ) -> StepResult:
-    """Advance one step using global nonlinear solve (SciPy)."""
+    """Advance one step using global nonlinear solve (backend dispatch)."""
     t_new = t_old + dt
 
     try:
@@ -320,7 +337,7 @@ def _advance_one_step_nonlinear_scipy(
         )
 
     try:
-        nl_result = solve_nonlinear_scipy(ctx, u0)
+        nl_result = solve_nonlinear(ctx, u0)
     except Exception as exc:
         logger.exception("Nonlinear solve raised an exception.")
         diag = _build_step_diagnostics_fail(t_old, t_new, dt, message=str(exc))
@@ -342,6 +359,15 @@ def _advance_one_step_nonlinear_scipy(
             message=nl_result.diag.message or "Nonlinear solver did not converge",
         )
         _apply_nonlinear_diag(diag, nl_result.diag)
+        try:
+            diag.extra = dict(diag.extra)
+            diag.extra["nonlinear"] = {
+                "history_res_inf": list(nl_result.diag.history_res_inf),
+                "message": nl_result.diag.message,
+                "extra": dict(getattr(nl_result.diag, "extra", {}) or {}),
+            }
+        except Exception:
+            pass
         return StepResult(
             state_new=state_old,
             props_new=props_old,
@@ -351,6 +377,30 @@ def _advance_one_step_nonlinear_scipy(
         )
 
     u_final = nl_result.u
+    if not np.all(np.isfinite(u_final)):
+        diag = _build_step_diagnostics_fail(
+            t_old,
+            t_new,
+            dt,
+            message="Nonlinear solver returned non-finite u",
+        )
+        _apply_nonlinear_diag(diag, nl_result.diag)
+        try:
+            diag.extra = dict(diag.extra)
+            diag.extra["nonlinear"] = {
+                "history_res_inf": list(nl_result.diag.history_res_inf),
+                "message": nl_result.diag.message,
+                "extra": dict(getattr(nl_result.diag, "extra", {}) or {}),
+            }
+        except Exception:
+            pass
+        return StepResult(
+            state_new=state_old,
+            props_new=props_old,
+            diag=diag,
+            success=False,
+            message="Nonlinear returned non-finite u",
+        )
     state_new = ctx.make_state_from_u(u_final, clip_negative_closure=True)
     _postprocess_species_bounds(cfg, layout, state_new)
 
@@ -395,6 +445,7 @@ def _advance_one_step_nonlinear_scipy(
         diag.extra["nonlinear"] = {
             "history_res_inf": list(nl_result.diag.history_res_inf),
             "message": nl_result.diag.message,
+            "extra": dict(getattr(nl_result.diag, "extra", {}) or {}),
         }
     except Exception:
         pass
@@ -483,34 +534,82 @@ def _assemble_transport_system_step12(
     state_guess: State,
     props: Props,
     dt: float,
-) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+) -> Tuple[Any, Any, Dict[str, Any]]:
     """Wrapper for build_transport_system with basic shape checks."""
     eq_result = None
     if cfg.physics.include_mpp and layout.has_block("mpp"):
         eq_result = _build_eq_result_for_step(cfg, grid, state_guess, props)
         eq_result = _complete_Yg_eq_with_closure(cfg, layout, eq_result)
-    result = build_transport_system(
-        cfg=cfg,
-        grid=grid,
-        layout=layout,
-        state_old=state_old,
-        state_guess=state_guess,
-        props=props,
-        dt=dt,
-        eq_result=eq_result,
-        return_diag=True,
-    )
-    # build_transport_system may return a tuple of length 2 or 3 depending on return_diag
-    if len(result) == 3:
-        A, b, diag_sys = result
-    else:
-        A, b = result  # type: ignore[misc]
-        diag_sys = {}
     N = layout.n_dof()
-    if A.shape != (N, N):
-        raise ValueError(f"Assembly produced A shape {A.shape}, expected {(N, N)}")
-    if b.shape != (N,):
-        raise ValueError(f"Assembly produced b shape {b.shape}, expected {(N,)}")
+    solver_cfg = getattr(cfg, "solver", None)
+    linear_cfg = getattr(solver_cfg, "linear", None)
+    backend = getattr(linear_cfg, "backend", None)
+    if backend is None:
+        backend = getattr(getattr(cfg, "nonlinear", None), "backend", "scipy")
+    backend = str(backend).lower()
+    assembly_mode = str(getattr(linear_cfg, "assembly_mode", "bridge_dense")).lower()
+    if backend == "petsc":
+        if assembly_mode == "bridge_dense":
+            result = build_transport_system_petsc_bridge(
+                cfg=cfg,
+                grid=grid,
+                layout=layout,
+                state_old=state_old,
+                state_guess=state_guess,
+                props=props,
+                dt=dt,
+                eq_result=eq_result,
+                return_diag=True,
+            )
+        elif assembly_mode == "native_aij":
+            result = build_transport_system_petsc_native(
+                cfg=cfg,
+                grid=grid,
+                layout=layout,
+                state_old=state_old,
+                state_guess=state_guess,
+                props=props,
+                dt=dt,
+                eq_result=eq_result,
+                return_diag=True,
+            )
+        else:
+            raise ValueError(
+                f"Unknown PETSc linear assembly_mode '{assembly_mode}' "
+                " (expected 'bridge_dense' or 'native_aij')."
+            )
+        if len(result) == 3:
+            A, b, diag_sys = result
+        else:
+            A, b = result  # type: ignore[misc]
+            diag_sys = {}
+        m, n = A.getSize()
+        if (m, n) != (N, N):
+            raise ValueError(f"Assembly produced A size {(m, n)}, expected {(N, N)}")
+        if b.getSize() != N:
+            raise ValueError(f"Assembly produced b size {b.getSize()}, expected {N}")
+    else:
+        result = build_transport_system_numpy(
+            cfg=cfg,
+            grid=grid,
+            layout=layout,
+            state_old=state_old,
+            state_guess=state_guess,
+            props=props,
+            dt=dt,
+            eq_result=eq_result,
+            return_diag=True,
+        )
+        # build_transport_system_numpy may return a tuple of length 2 or 3 depending on return_diag
+        if len(result) == 3:
+            A, b, diag_sys = result
+        else:
+            A, b = result  # type: ignore[misc]
+            diag_sys = {}
+        if A.shape != (N, N):
+            raise ValueError(f"Assembly produced A shape {A.shape}, expected {(N, N)}")
+        if b.shape != (N,):
+            raise ValueError(f"Assembly produced b shape {b.shape}, expected {(N,)}")
     if diag_sys is None:
         diag_sys = {}
     return A, b, diag_sys

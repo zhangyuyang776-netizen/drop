@@ -11,8 +11,8 @@ Principles:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, List, Mapping, Optional, Set, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Set, Tuple
 
 import numpy as np
 
@@ -38,6 +38,13 @@ class VarEntry:
     name: str
 
 
+@dataclass(frozen=True, slots=True)
+class SplitDef:
+    name: str
+    blocks: Tuple[str, ...]
+    policy: str = "by_layout"
+
+
 @dataclass(slots=True)
 class UnknownLayout:
     """Layout of the global unknown vector."""
@@ -45,6 +52,7 @@ class UnknownLayout:
     size: int
     entries: List[VarEntry]
     blocks: Dict[str, slice]
+    block_slices: Dict[str, slice] = field(init=False)
     Ng: int
     Nl: int
     Ns_g_full: int
@@ -64,16 +72,70 @@ class UnknownLayout:
     liq_reduced_to_full_idx: List[int]
     liq_closure_index: Optional[int]
 
+    def __post_init__(self) -> None:
+        self.block_slices = self._build_block_slices_from_entries()
+
     def n_dof(self) -> int:
         return self.size
 
     def has_block(self, name: str) -> bool:
-        return name in self.blocks
+        return name in self.block_slices
 
     def require_block(self, name: str) -> slice:
-        if name not in self.blocks:
+        if name not in self.block_slices:
             raise ValueError(f"Unknown block '{name}' not present in layout.")
-        return self.blocks[name]
+        return self.block_slices[name]
+
+    def _build_block_slices_from_entries(self) -> Dict[str, slice]:
+        """
+        Build contiguous slices for each VarEntry.kind.
+        Requires: for each kind, indices are a single contiguous span.
+        """
+        kind_to_indices: Dict[str, List[int]] = {}
+        for entry in self.entries:
+            k = str(entry.kind)
+            kind_to_indices.setdefault(k, []).append(int(entry.i))
+
+        out: Dict[str, slice] = {}
+        for k, idxs in kind_to_indices.items():
+            if not idxs:
+                continue
+            idxs_sorted = sorted(idxs)
+            i_min, i_max = idxs_sorted[0], idxs_sorted[-1]
+            count = len(idxs_sorted)
+
+            span = i_max - i_min + 1
+            if span != count:
+                missing = sorted(set(range(i_min, i_max + 1)) - set(idxs_sorted))
+                raise RuntimeError(
+                    f"Layout block '{k}' is not contiguous: "
+                    f"min={i_min}, max={i_max}, count={count}, missing={missing[:10]}"
+                )
+
+            out[k] = slice(i_min, i_max + 1)
+
+        return out
+
+    def block_slice(self, name: str) -> slice:
+        if name not in self.block_slices:
+            raise KeyError(f"Unknown block '{name}'. Available: {list(self.block_slices)}")
+        return self.block_slices[name]
+
+    def block_size(self, name: str) -> int:
+        sl = self.block_slice(name)
+        return int(sl.stop - sl.start)
+
+    def block_range(self, name: str) -> Tuple[int, int]:
+        """Return (start, end_exclusive) for a base block."""
+        sl = self.block_slice(name)
+        return int(sl.start), int(sl.stop)
+
+    def iter_blocks(self) -> Iterator[Tuple[str, slice]]:
+        """Iterate base blocks in layout order (by slice.start)."""
+        items = list(self.block_slices.items())
+        items.sort(key=lambda kv: int(kv[1].start))
+        for name, sl in items:
+            yield name, sl
 
     def idx_Tg(self, ig: int) -> int:
         sl = self.require_block("Tg")
@@ -114,6 +176,178 @@ class UnknownLayout:
     def idx_Rd(self) -> int:
         sl = self.require_block("Rd")
         return sl.start
+
+    def default_fieldsplit_plan(
+        self,
+        cfg: Optional[CaseConfig] = None,
+        *,
+        scheme: str = "by_layout",
+    ) -> List[SplitDef]:
+        """
+        Return a list of SplitDef describing the recommended FieldSplit splits.
+
+        scheme:
+          - "by_layout": Tg, Yg, Tl, Yl, iface(Ts+mpp+Rd)
+          - "bulk_iface": bulk(Tg+Yg+Tl+Yl), iface(Ts+mpp+Rd)
+        """
+        scheme = str(scheme).lower()
+        if cfg is not None:
+            solver_cfg = getattr(cfg, "solver", None)
+            linear_cfg = getattr(solver_cfg, "linear", None)
+            fs_cfg = getattr(linear_cfg, "fieldsplit", None)
+            if fs_cfg is not None:
+                if isinstance(fs_cfg, Mapping):
+                    scheme = fs_cfg.get("scheme", fs_cfg.get("split_mode", scheme))
+                else:
+                    scheme = getattr(fs_cfg, "scheme", getattr(fs_cfg, "split_mode", scheme))
+            scheme = str(scheme).lower()
+
+        def exists(block: str) -> bool:
+            return (block in self.block_slices) and (self.block_size(block) > 0)
+
+        iface_blocks = tuple(b for b in ("Ts", "mpp", "Rd") if exists(b))
+
+        if scheme == "bulk_iface":
+            bulk_blocks = tuple(b for b in ("Tg", "Yg", "Tl", "Yl") if exists(b))
+            splits: List[SplitDef] = []
+            if bulk_blocks:
+                splits.append(SplitDef(name="bulk", blocks=bulk_blocks, policy=scheme))
+            if iface_blocks:
+                splits.append(SplitDef(name="iface", blocks=iface_blocks, policy=scheme))
+            return splits
+
+        if scheme != "by_layout":
+            raise ValueError(f"Unknown fieldsplit scheme '{scheme}'")
+
+        splits = []
+        for b in ("Tg", "Yg", "Tl", "Yl"):
+            if exists(b):
+                splits.append(SplitDef(name=b, blocks=(b,), policy=scheme))
+        if iface_blocks:
+            splits.append(SplitDef(name="iface", blocks=iface_blocks, policy=scheme))
+        return splits
+
+    def describe_fieldsplits(self, plan: Optional[List[SplitDef]] = None) -> Dict[str, object]:
+        if plan is None:
+            plan = self.default_fieldsplit_plan()
+
+        def blocks_span(blocks: Tuple[str, ...]) -> Dict[str, object]:
+            parts = []
+            size = 0
+            for b in blocks:
+                sl = self.block_slice(b)
+                part_size = int(sl.stop - sl.start)
+                parts.append(
+                    {
+                        "block": b,
+                        "start": int(sl.start),
+                        "stop": int(sl.stop),
+                        "size": part_size,
+                    }
+                )
+                size += part_size
+            return {"size": size, "parts": parts}
+
+        return {
+            "n_dof": int(self.n_dof()),
+            "blocks": {
+                k: {"start": int(v.start), "stop": int(v.stop), "size": int(v.stop - v.start)}
+                for k, v in self.block_slices.items()
+            },
+            "splits": [{"name": s.name, "policy": s.policy, **blocks_span(s.blocks)} for s in plan],
+        }
+
+    def build_is_petsc(
+        self,
+        comm,
+        ownership_range: Optional[Tuple[int, int]] = None,
+        plan: str = "by_layout",
+    ) -> Dict[str, Any]:
+        """
+        Build PETSc IS for FieldSplit plan.
+
+        Returns: dict[split_name] = PETSc.IS
+
+        If comm size == 1: prefer Stride IS for contiguous ranges.
+        If parallel OR ownership_range is provided: create General IS with local owned indices.
+        """
+        from petsc4py import PETSc
+
+        if comm is None:
+            comm = PETSc.COMM_SELF
+
+        comm_size = int(comm.getSize())
+        is_parallel = comm_size > 1
+
+        plan_name = str(plan).lower()
+        plan_defs = self.default_fieldsplit_plan(cfg=None, scheme=plan_name)
+
+        def _split_global_indices(split_blocks: Tuple[str, ...]) -> np.ndarray:
+            parts = []
+            for b in split_blocks:
+                sl = self.block_slice(b)
+                parts.append(np.arange(int(sl.start), int(sl.stop), dtype=np.int64))
+            if not parts:
+                return np.zeros((0,), dtype=np.int64)
+            return np.concatenate(parts)
+
+        def _is_contiguous(idxs: np.ndarray) -> bool:
+            if idxs.size == 0:
+                return True
+            idxs_sorted = np.sort(idxs)
+            return bool(idxs_sorted[-1] - idxs_sorted[0] + 1 == idxs_sorted.size)
+
+        def _apply_ownership(idxs: np.ndarray) -> np.ndarray:
+            if ownership_range is None:
+                return idxs
+            r0, r1 = int(ownership_range[0]), int(ownership_range[1])
+            if idxs.size == 0:
+                return idxs
+            mask = (idxs >= r0) & (idxs < r1)
+            return idxs[mask]
+
+        out: Dict[str, Any] = {}
+
+        for sd in plan_defs:
+            name = sd.name
+            idxs_global = _split_global_indices(sd.blocks)
+            if idxs_global.size == 0:
+                continue
+
+            if is_parallel or ownership_range is not None:
+                idxs_local = _apply_ownership(idxs_global).astype(PETSc.IntType, copy=False)
+                out[name] = PETSc.IS().createGeneral(idxs_local, comm=comm)
+                continue
+
+            if _is_contiguous(idxs_global):
+                i0 = int(np.min(idxs_global))
+                n = int(idxs_global.size)
+                out[name] = PETSc.IS().createStride(size=n, first=i0, step=1, comm=comm)
+            else:
+                out[name] = PETSc.IS().createGeneral(
+                    idxs_global.astype(PETSc.IntType, copy=False),
+                    comm=comm,
+                )
+
+        return out
+
+    def debug_dump_is(self, is_dict: Mapping[str, Any]) -> Dict[str, Dict[str, Optional[int]]]:
+        out: Dict[str, Dict[str, Optional[int]]] = {}
+        for name, iset in is_dict.items():
+            idx = iset.getIndices()
+            try:
+                arr = np.asarray(idx, dtype=np.int64)
+                if arr.size:
+                    out[name] = {"n": int(arr.size), "min": int(arr.min()), "max": int(arr.max())}
+                else:
+                    out[name] = {"n": 0, "min": None, "max": None}
+            finally:
+                if hasattr(iset, "restoreIndices"):
+                    try:
+                        iset.restoreIndices()
+                    except TypeError:
+                        iset.restoreIndices(idx)
+        return out
 
 
 def _build_species_mapping(full: List[str], closure: Optional[str], active: Optional[Set[str]] = None):

@@ -1,27 +1,25 @@
 """
-Interface boundary conditions (Step 11.2+ with Ts energy jump).
+Interface boundary conditions with Ts energy jump and Stefan mass flux.
 
 Responsibilities (current version):
 - Resolve interface geometry and unknown indices (Ts / mpp / Rd).
-- Provide matrix-row definitions:
-  * Ts: conduction (gas/liquid) + latent heat jump.
-  * mpp: simplified single-condensable Stefan condition (diffusion-only).
-  * Rd: index recorded only; equation elsewhere.
-- Record diagnostic info (geometry, indices, equilibrium preview).
+- Build fully physical matrix-row definitions:
+  * Ts: gas/liquid conduction + gas-side diffusive enthalpy + latent heat jump,
+        aligned with the framework R_energy_if.
+  * mpp: single-condensable Stefan condition using zero-sum-corrected
+        gas diffusive flux at the interface (R_mass_if).
+  * Rd: index recorded only; its evolution equation is handled elsewhere
+        (e.g. radius_eq.py).
+- Record diagnostic info (geometry, indices, equilibrium preview, flux splits).
 
 Direction and sign conventions:
 - Radial coordinate r increases outward (from droplet center to far field).
 - Interface normal n = +e_r, pointing from liquid to gas.
-- mpp and face-based Fourier flux diagnostics are defined positive along +e_r  ("out of the droplet"); mpp > 0 means evaporation (liquid -> gas).
-- For the Ts energy jump, we internally use heat *into* the interface as positive when assembling the matrix row. Diagnostics explicitly label which sign convention is used.
- 
-This module DOES:
-- assemble Ts and mpp interface equations using provided props/eq_result.
-
-This module MUST NOT:
-- compute thermophysical properties,
-- normalize mass fractions,
-- mutate State or Props.
+- mpp and face-based Fourier flux diagnostics are defined positive along +e_r
+  ("out of the droplet"); mpp > 0 means evaporation (liquid -> gas).
+- For the Ts energy jump, we internally use "heat into the interface" as
+  positive when assembling the matrix row; diagnostics expose both this
+  convention and the outward (+r) Fourier convention.
 """
 
 from __future__ import annotations
@@ -36,7 +34,7 @@ from core.types import CaseConfig, Grid1D, State, Props
 from core.layout import UnknownLayout
 from physics.energy_flux import split_energy_flux_cond_diff_single
 
-# Placeholder type for equilibrium results; echoed into diag only.
+# Placeholder type for equilibrium results; used in interface rows and diagnostics.
 EqResultLike = Optional[Mapping[str, np.ndarray]]
 
 logger = logging.getLogger(__name__)
@@ -88,35 +86,47 @@ def build_interface_coeffs(
     eq_result: EqResultLike = None,
 ) -> InterfaceCoeffs:
     """
-    Build skeleton matrix-row definitions for interface unknowns (Ts, mpp, Rd).
+    Build matrix-row definitions for interface unknowns (Ts, mpp, Rd).
 
-    This Step 11.2 version:
-    - does NOT implement physical formulas,
-    - does NOT modify state/props,
-    - only resolves indices/geometry and prepares empty rows.
+    This version:
+    - assembles the Ts energy-jump equation using:
+      gas/liquid conduction + gas-side diffusive enthalpy (from j_corr)
+      + latent heat term (mpp * L_v),
+      consistent with the framework R_energy_if.
+    - assembles the mpp Stefan equation in the form
+         j_corr,b - mpp * DeltaY_eff = 0
+      where j_corr,b is the zero-sum-corrected diffusive flux of the
+      balance gas species at the interface (R_mass_if).
+    - records Rd index (its time evolution is handled elsewhere).
+    - does not mutate State or Props.
 
     Parameters
     ----------
     grid : Grid1D
         Spherical mesh with liquid and gas segments; iface_f defines the interface face.
     state : State
-        Current state (Tg, Yg, Tl, Yl, Ts, mpp, Rd); Ts/mpp/Rd values are not changed.
+        Current state (Tg, Yg, Tl, Yl, Ts, mpp, Rd); values are read but not
+        modified.
     props : Props
-        Cell-centered properties (rho, cp, k, D); not used in the skeleton version.
+        Cell-centered properties (rho, cp, k, D, h_gk, etc.) used to build
+        conductive and diffusive fluxes at the interface; not modified.
     layout : UnknownLayout
         Global unknown layout; used to query indices for Ts/mpp/Rd and nearby cells.
     cfg : CaseConfig
-        Full case configuration; `cfg.physics.include_*` toggles decide which rows exist.
+        Full case configuration; `cfg.physics.include_*` toggles decide which
+        rows exist, and `cfg.species` / `cfg.physics.interface` supply the
+        balance-species mapping and DeltaY regularization.
     eq_result : EqResultLike, optional
-        Optional interface-equilibrium result produced by `properties.equilibrium`.
-        Only passed through into diagnostics in this skeleton version.
+        Interface-equilibrium result produced by `properties.equilibrium`
+        (must provide Yg_eq in full mechanism order) and required when
+        `cfg.physics.include_mpp` (and Ts) are enabled.
 
     Returns
     -------
     InterfaceCoeffs
         Container with:
         - rows: list of InterfaceRow (one per interface scalar unknown),
-        - diag: diagnostic dictionary (geometry, indices, optional equilibrium preview).
+        - diag: diagnostic dictionary (geometry, indices, flux splits, etc.).
     """
     rows: List[InterfaceRow] = []
     diag: Dict[str, Any] = {}
@@ -300,21 +310,27 @@ def _build_Ts_row(
     idx_mpp: int,
 ) -> Tuple[InterfaceRow, Dict[str, Any]]:
     """
-    Energy balance at the interface (heat into interface = latent):
+    Energy balance at the interface with "heat into interface" as positive.
 
-        q_g_in + q_l_in - q_lat = 0
+    Continuous form (framework R_energy_if, rearranged):
 
-    with (heat *into* the interface taken as positive)
-        q_g_in = k_g * (Tg1 - Ts) / dr_g * A_if   # gas -> interface
-        q_l_in = k_l * (TlN - Ts) / dr_l * A_if   # liquid -> interface
-        q_lat  = mpp * L_v * A_if                # interface -> gas (latent, evaporation)
+        q_g,in + q_l,in + q_diff,in - q_lat = 0
 
-    This is algebraically equivalent to:
+    where
+        q_g,in    = k_g * (Tg1 - Ts) / dr_g * A_if      # gas -> interface (conduction)
+        q_l,in    = k_l * (TlN - Ts) / dr_l * A_if      # liquid -> interface (conduction)
+        q_diff,in = - A_if * sum_k( h_gk * j_corr,k )   # gas diffusive enthalpy into interface
+        q_lat     = mpp * L_v * A_if                   # latent heat to gas (evaporation)
 
-        (k_g/dr_g) * Tg1
-      + (k_l/dr_l) * TlN
-      - (k_g/dr_g + k_l/dr_l) * Ts
-      - L_v * mpp = 0
+    Discretely we move q_diff,in to the RHS and build:
+
+        A_if * [ (k_g/dr_g) * Tg1
+                + (k_l/dr_l) * TlN
+                - (k_g/dr_g + k_l/dr_l) * Ts
+                - L_v * mpp ] = q_diff_species_pow
+
+    with q_diff_species_pow = A_if * sum_k( h_gk * j_corr,k ), where j_corr is the
+    zero-sum-corrected diffusive flux vector at the interface (sum_k j_corr,k = 0).
 
     """
     A_if = float(grid.A_f[iface_f])
@@ -535,8 +551,19 @@ def _build_mpp_row(
     """
     Numeric-Jacobian-friendly mpp row.
 
-    Residual: R = j_corr_b - mpp * DeltaY_eff = 0
-    Only analytic dependence on mpp is retained; j_corr/Yg_eq are treated as constants per residual build.
+    Discrete Stefan condition for the balance species b:
+
+        R_mass_if,b = j_corr,b - mpp * DeltaY_eff = 0
+
+    where j_corr,b is the zero-sum-corrected diffusive flux of species b
+    at the interface (sum_k j_corr,k = 0), and
+
+        DeltaY_eff approx Y_l,b,s - Y_g,b,eq
+
+    with a small regularization to avoid division by ~0.
+
+    Only the analytic dependence on mpp is kept in the Jacobian; j_corr and
+    Yg_eq are frozen per residual build (good for numeric Jacobian).
     """
     if eq_result is None or "Yg_eq" not in eq_result:
         logger.error("mpp equation requires eq_result with 'Yg_eq'.")
