@@ -12,7 +12,7 @@ Current status:
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 
@@ -448,3 +448,65 @@ def residual_only(u: np.ndarray, ctx: NonlinearContext) -> np.ndarray:
     """
     res, _ = build_global_residual(u, ctx)
     return res
+
+
+def residual_petsc(
+    mgr,
+    ld,
+    ctx: NonlinearContext,
+    Xg,
+    *,
+    Fg=None,
+):
+    """
+    Assemble residual into a PETSc Vec (DMComposite ordering) using local ghosted arrays.
+    """
+    from assembly.residual_local import ResidualLocalCtx, pack_local_to_layout, scatter_layout_to_local
+    from parallel.dm_manager import global_to_local, local_to_global_add
+
+    comm = mgr.comm
+    rank = int(comm.getRank())
+
+    Xl_liq, Xl_gas, Xl_if = global_to_local(mgr, Xg)
+    aXl_liq = mgr.dm_liq.getVecArray(Xl_liq)
+    aXl_gas = mgr.dm_gas.getVecArray(Xl_gas)
+    aXl_if = Xl_if.getArray()
+
+    ctx_local = ResidualLocalCtx(layout=ctx.layout, ld=ld)
+    u_local = pack_local_to_layout(ctx_local, aXl_liq, aXl_gas, aXl_if, rank=rank)
+
+    if comm.getSize() == 1:
+        u_global = u_local
+    else:
+        try:
+            from mpi4py import MPI
+
+            mpicomm = comm.tompi4py()
+            u_global = mpicomm.allreduce(u_local, op=MPI.SUM)
+        except Exception as exc:
+            raise RuntimeError("mpi4py is required for residual_petsc in MPI mode.") from exc
+
+    res_global, _diag = build_global_residual(u_global, ctx)
+
+    Fl_liq = mgr.dm_liq.createLocalVec()
+    Fl_gas = mgr.dm_gas.createLocalVec()
+    Fl_if = mgr.dm_if.createLocalVec()
+    Fl_liq.set(0.0)
+    Fl_gas.set(0.0)
+    Fl_if.set(0.0)
+
+    aFl_liq = mgr.dm_liq.getVecArray(Fl_liq)
+    aFl_gas = mgr.dm_gas.getVecArray(Fl_gas)
+    aFl_if = Fl_if.getArray()
+
+    scatter_layout_to_local(ctx_local, res_global, aFl_liq, aFl_gas, aFl_if, rank=rank)
+
+    Fg_out = local_to_global_add(mgr, Fl_liq, Fl_gas, Fl_if)
+    if Fg is not None:
+        try:
+            Fg_out.copy(Fg)
+        except Exception:
+            Fg.set(0.0)
+            Fg.axpy(1.0, Fg_out)
+        return Fg
+    return Fg_out
