@@ -360,6 +360,13 @@ def solve_nonlinear_petsc_parallel(
                 f"P={p_range} vs X={x_range}. "
                 "Use jacobian_mode='mf' or update build_sparse_fd_jacobian to use DM ownership."
             )
+        if world_rank == 0 and verbose:
+            logger.info(
+                "mfpc_sparse_fd P matrix stats: nnz_local=%d max_diag_abs_local=%.3e n_fd_calls=%d",
+                fd_stats.get("nnz_total_local", 0),
+                fd_stats.get("max_diag_abs_local", 0.0),
+                fd_stats.get("n_fd_calls", 0),
+            )
     else:
         P = _create_identity_precond_mat(comm, dm)
 
@@ -448,6 +455,15 @@ def solve_nonlinear_petsc_parallel(
         X.set(0.0)
         X.axpy(1.0, X_init)
 
+    if use_mfpc_sparse_fd:
+        u0_from_X = _dm_vec_to_layout(X_init)
+        u0_diff = np.linalg.norm(u0_from_X - u0, ord=np.inf)
+        if u0_diff > 1.0e-10 and world_rank == 0:
+            logger.warning(
+                "P-F consistency check: ||u0_from_DM - u0_layout||_inf = %.3e (should be ~0)",
+                u0_diff,
+            )
+
     snes.solve(None, X)
     if ksp_t.get("in_solve", False):
         tim["time_linear_total"] += (time.perf_counter() - ksp_t["t0"])
@@ -466,7 +482,20 @@ def solve_nonlinear_petsc_parallel(
     res_norm_inf = float(np.linalg.norm(res_final, ord=np.inf))
 
     if not converged and world_rank == 0:
-        logger.warning("SNES not converged: reason=%d res_inf=%.3e", reason, res_norm_inf)
+        logger.warning(
+            "SNES not converged: reason=%d res_inf=%.3e | KSP: reason=%d its=%d",
+            reason,
+            res_norm_inf,
+            ksp_reason,
+            ksp_it,
+        )
+        if use_mfpc_sparse_fd and fd_stats:
+            logger.warning(
+                "mfpc_sparse_fd P matrix: nnz_local=%d max_diag_abs_local=%.3e n_fd_calls=%d",
+                fd_stats.get("nnz_total_local", 0),
+                fd_stats.get("max_diag_abs_local", 0.0),
+                fd_stats.get("n_fd_calls", 0),
+            )
 
     j_type = "none"
     p_type = "none"
