@@ -190,17 +190,18 @@ def solve_nonlinear_petsc_parallel(
     snes_monitor = bool(getattr(petsc_cfg, "snes_monitor", False)) if petsc_cfg is not None else False
 
     ksp_type = "gmres"
-    ksp_rtol = 1.0e-6
+    ksp_rtol = 1.0e-10 if use_mfpc_sparse_fd else 1.0e-8
     ksp_atol = 1.0e-12
     ksp_max_it = 200
     ksp_restart = 30
 
     if world_rank == 0:
         logger.info(
-            "Parallel SNES fixed config: snes=%s/%s, ksp=%s, pc=asm+ilu(0), overlap=1",
+            "Parallel SNES fixed config: snes=%s/%s, ksp=%s (rtol=%.1e), pc=asm+ilu(0), overlap=1",
             snes_type,
             linesearch_type,
             ksp_type,
+            ksp_rtol,
         )
 
     u0 = np.asarray(u0, dtype=np.float64)
