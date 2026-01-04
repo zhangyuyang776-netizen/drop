@@ -190,8 +190,12 @@ def solve_nonlinear_petsc_parallel(
     snes_monitor = bool(getattr(petsc_cfg, "snes_monitor", False)) if petsc_cfg is not None else False
 
     ksp_type = "gmres"
-    ksp_rtol = 1.0e-10 if use_mfpc_sparse_fd else 1.0e-8
-    ksp_atol = 1.0e-12
+    if use_mfpc_sparse_fd:
+        ksp_rtol = 1.0e-12
+        ksp_atol = 1.0e-14
+    else:
+        ksp_rtol = 1.0e-8
+        ksp_atol = 1.0e-12
     ksp_max_it = 200
     ksp_restart = 30
 
@@ -304,6 +308,11 @@ def solve_nonlinear_petsc_parallel(
     try:
         ls = snes.getLineSearch()
         ls.setType(linesearch_type)
+        if world_rank == 0 and verbose:
+            try:
+                ls.setMonitor(True)
+            except Exception:
+                pass
     except Exception:
         logger.debug("Unable to set linesearch_type='%s'", linesearch_type)
 
@@ -464,6 +473,22 @@ def solve_nonlinear_petsc_parallel(
                 "P-F consistency check: ||u0_from_DM - u0_layout||_inf = %.3e (should be ~0)",
                 u0_diff,
             )
+        F_test = dm.createGlobalVec()
+        snes_func(snes, X_init, F_test)
+        F_test_layout = _dm_vec_to_layout(F_test)
+        F_direct = residual_only(u0, ctx)
+        F_diff = np.linalg.norm(F_test_layout - F_direct, ord=np.inf)
+        if world_rank == 0:
+            if F_diff > 1.0e-10:
+                logger.warning(
+                    "P-F residual consistency: ||F_snes(u0) - F_direct(u0)||_inf = %.3e (MISMATCH!)",
+                    F_diff,
+                )
+            else:
+                logger.info(
+                    "P-F residual consistency: ||F_snes(u0) - F_direct(u0)||_inf = %.3e (OK)",
+                    F_diff,
+                )
 
     snes.solve(None, X)
     if ksp_t.get("in_solve", False):
