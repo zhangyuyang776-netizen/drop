@@ -11,10 +11,6 @@ class ResidualLocalCtx:
     ld: object
 
 
-def _local_index(global_i: int, gxs: int) -> int:
-    return int(global_i - gxs)
-
-
 def _get_component(arr, i_arr: int, comp: int) -> float:
     try:
         return float(arr[i_arr, comp])
@@ -54,31 +50,27 @@ def pack_local_to_layout(
         comp = int(ld.comp_liq["Tl"][0])
         for i_local in range(ld.liq_xm):
             il = ld.liq_xs + i_local
-            i_arr = _local_index(il, ld.liq_gxs)
-            u[layout.idx_Tl(il)] = _get_component(Xl_liq, i_arr, comp)
+            u[layout.idx_Tl(il)] = _get_component(Xl_liq, il, comp)
 
     if "Yl" in ld.comp_liq:
         comps = ld.comp_liq["Yl"]
         for i_local in range(ld.liq_xm):
             il = ld.liq_xs + i_local
-            i_arr = _local_index(il, ld.liq_gxs)
             for k_red, comp in enumerate(comps):
-                u[layout.idx_Yl(k_red, il)] = _get_component(Xl_liq, i_arr, int(comp))
+                u[layout.idx_Yl(k_red, il)] = _get_component(Xl_liq, il, int(comp))
 
     if "Tg" in ld.comp_gas:
         comp = int(ld.comp_gas["Tg"][0])
         for i_local in range(ld.gas_xm):
             ig = ld.gas_xs + i_local
-            i_arr = _local_index(ig, ld.gas_gxs)
-            u[layout.idx_Tg(ig)] = _get_component(Xl_gas, i_arr, comp)
+            u[layout.idx_Tg(ig)] = _get_component(Xl_gas, ig, comp)
 
     if "Yg" in ld.comp_gas:
         comps = ld.comp_gas["Yg"]
         for i_local in range(ld.gas_xm):
             ig = ld.gas_xs + i_local
-            i_arr = _local_index(ig, ld.gas_gxs)
             for k_red, comp in enumerate(comps):
-                u[layout.idx_Yg(k_red, ig)] = _get_component(Xl_gas, i_arr, int(comp))
+                u[layout.idx_Yg(k_red, ig)] = _get_component(Xl_gas, ig, int(comp))
 
     if rank == 0 and ld.n_if > 0:
         if "Ts" in ld.comp_if:
@@ -102,54 +94,79 @@ def scatter_layout_to_local(
     Fl_if,
     *,
     rank: int,
+    owned_only: bool = False,
 ) -> None:
     """
     Scatter a layout-ordered vector into local residual arrays.
-    Only owned cells are written; ghost regions remain untouched.
+    If owned_only is True, only owned cells are written; ghost regions remain untouched.
+    Otherwise, ghost ranges are filled to support stencil reads.
     Interface values are written only on rank 0.
     """
     layout = ctx.layout
     ld = ctx.ld
 
+    Nl = int(getattr(layout, "Nl", 0))
+    Ng = int(getattr(layout, "Ng", 0))
+
     if "Tl" in ld.comp_liq:
         comp = int(ld.comp_liq["Tl"][0])
-        for i_local in range(ld.liq_xm):
-            il = ld.liq_xs + i_local
-            i_arr = _local_index(il, ld.liq_gxs)
-            _set_component(Fl_liq, i_arr, comp, float(vec_layout[layout.idx_Tl(il)]))
+        if owned_only:
+            liq_start = ld.liq_xs
+            liq_end = ld.liq_xs + ld.liq_xm
+        else:
+            liq_start = ld.liq_gxs
+            liq_end = ld.liq_gxs + ld.liq_gxm
+        for il in range(liq_start, liq_end):
+            if 0 <= il < Nl:
+                _set_component(Fl_liq, il, comp, float(vec_layout[layout.idx_Tl(il)]))
 
     if "Yl" in ld.comp_liq:
         comps = ld.comp_liq["Yl"]
-        for i_local in range(ld.liq_xm):
-            il = ld.liq_xs + i_local
-            i_arr = _local_index(il, ld.liq_gxs)
-            for k_red, comp in enumerate(comps):
-                _set_component(
-                    Fl_liq,
-                    i_arr,
-                    int(comp),
-                    float(vec_layout[layout.idx_Yl(k_red, il)]),
-                )
+        if owned_only:
+            liq_start = ld.liq_xs
+            liq_end = ld.liq_xs + ld.liq_xm
+        else:
+            liq_start = ld.liq_gxs
+            liq_end = ld.liq_gxs + ld.liq_gxm
+        for il in range(liq_start, liq_end):
+            if 0 <= il < Nl:
+                for k_red, comp in enumerate(comps):
+                    _set_component(
+                        Fl_liq,
+                        il,
+                        int(comp),
+                        float(vec_layout[layout.idx_Yl(k_red, il)]),
+                    )
 
     if "Tg" in ld.comp_gas:
         comp = int(ld.comp_gas["Tg"][0])
-        for i_local in range(ld.gas_xm):
-            ig = ld.gas_xs + i_local
-            i_arr = _local_index(ig, ld.gas_gxs)
-            _set_component(Fl_gas, i_arr, comp, float(vec_layout[layout.idx_Tg(ig)]))
+        if owned_only:
+            gas_start = ld.gas_xs
+            gas_end = ld.gas_xs + ld.gas_xm
+        else:
+            gas_start = ld.gas_gxs
+            gas_end = ld.gas_gxs + ld.gas_gxm
+        for ig in range(gas_start, gas_end):
+            if 0 <= ig < Ng:
+                _set_component(Fl_gas, ig, comp, float(vec_layout[layout.idx_Tg(ig)]))
 
     if "Yg" in ld.comp_gas:
         comps = ld.comp_gas["Yg"]
-        for i_local in range(ld.gas_xm):
-            ig = ld.gas_xs + i_local
-            i_arr = _local_index(ig, ld.gas_gxs)
-            for k_red, comp in enumerate(comps):
-                _set_component(
-                    Fl_gas,
-                    i_arr,
-                    int(comp),
-                    float(vec_layout[layout.idx_Yg(k_red, ig)]),
-                )
+        if owned_only:
+            gas_start = ld.gas_xs
+            gas_end = ld.gas_xs + ld.gas_xm
+        else:
+            gas_start = ld.gas_gxs
+            gas_end = ld.gas_gxs + ld.gas_gxm
+        for ig in range(gas_start, gas_end):
+            if 0 <= ig < Ng:
+                for k_red, comp in enumerate(comps):
+                    _set_component(
+                        Fl_gas,
+                        ig,
+                        int(comp),
+                        float(vec_layout[layout.idx_Yg(k_red, ig)]),
+                    )
 
     if ld.n_if > 0:
         if rank == 0:

@@ -122,6 +122,9 @@ def apply_structured_pc(
     *,
     pc_type_override: Optional[str] = None,
 ) -> Dict[str, Any]:
+    from parallel.mpi_bootstrap import bootstrap_mpi_before_petsc
+
+    bootstrap_mpi_before_petsc()
     from petsc4py import PETSc
 
     diag: Dict[str, Any] = {"enabled": False}
@@ -612,6 +615,9 @@ def solve_linear_system_petsc(
 ) -> LinearSolveResult:
     """Solve Ax=b using PETSc KSP; returns LinearSolveResult (mirrors SciPy backend)."""
     try:
+        from parallel.mpi_bootstrap import bootstrap_mpi_before_petsc
+
+        bootstrap_mpi_before_petsc()
         from petsc4py import PETSc
     except Exception as exc:  # pragma: no cover
         raise RuntimeError("petsc4py is required for PETSc backend.") from exc

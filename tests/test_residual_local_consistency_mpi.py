@@ -13,6 +13,8 @@ if str(ROOT) not in sys.path:
 
 
 def _import_petsc_or_skip():
+    from parallel.mpi_bootstrap import bootstrap_mpi_before_petsc
+    bootstrap_mpi_before_petsc()
     pytest.importorskip("petsc4py")
     from petsc4py import PETSc
     return PETSc
@@ -90,9 +92,9 @@ def _build_case(tmp_path: Path, nproc: int, rank: int):
 
 def test_residual_local_consistency_mpi(tmp_path: Path):
     faulthandler.dump_traceback_later(30, repeat=True)
+    _import_mpi4py_or_skip()
     PETSc = _import_petsc_or_skip()
     _import_chemistry_or_skip()
-    _import_mpi4py_or_skip()
 
     comm = PETSc.COMM_WORLD
     rank = comm.getRank()
@@ -100,7 +102,7 @@ def test_residual_local_consistency_mpi(tmp_path: Path):
     tmp_rank.mkdir(parents=True, exist_ok=True)
     cfg, layout, ctx, u0 = _build_case(tmp_rank, comm.getSize(), rank)
 
-    from parallel.dm_manager import build_dm, local_to_global_add  # noqa: E402
+    from parallel.dm_manager import build_dm, local_state_to_global  # noqa: E402
     from core.layout_dist import LayoutDistributed  # noqa: E402
     from assembly.residual_local import ResidualLocalCtx, scatter_layout_to_local  # noqa: E402
     from assembly.residual_global import residual_petsc, residual_only  # noqa: E402
@@ -122,7 +124,7 @@ def test_residual_local_consistency_mpi(tmp_path: Path):
     ctx_local = ResidualLocalCtx(layout=layout, ld=ld)
     scatter_layout_to_local(ctx_local, u0, aXl_liq, aXl_gas, aXl_if, rank=comm.getRank())
 
-    Xg = local_to_global_add(mgr, Xl_liq, Xl_gas, Xl_if)
+    Xg = local_state_to_global(mgr, Xl_liq, Xl_gas, Xl_if)
     Fg = residual_petsc(mgr, ld, ctx, Xg)
 
     norm_petsc = float(Fg.norm(PETSc.NormType.NORM_INFINITY))
@@ -130,3 +132,8 @@ def test_residual_local_consistency_mpi(tmp_path: Path):
     norm_ref = float(np.linalg.norm(res_ref, ord=np.inf))
 
     assert abs(norm_petsc - norm_ref) <= 1e-8 * max(1.0, norm_ref)
+    faulthandler.cancel_dump_traceback_later()
+    try:
+        comm.barrier()
+    except Exception:
+        pass

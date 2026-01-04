@@ -5,6 +5,11 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import numpy as np
+
+from parallel.mpi_bootstrap import bootstrap_mpi_before_petsc
+
+bootstrap_mpi_before_petsc()
+
 from petsc4py import PETSc
 
 
@@ -38,6 +43,9 @@ def _dmcomposite_access(dm, X):
 
 def _get_mpi_comm(comm: PETSc.Comm):
     try:
+        from parallel.mpi_bootstrap import bootstrap_mpi_before_petsc
+
+        bootstrap_mpi_before_petsc()
         from mpi4py import MPI
         return MPI, comm.tompi4py()
     except Exception as exc:
@@ -160,13 +168,6 @@ def _create_interface_shell_dm(comm, n_if: int) -> PETSc.DM:
     dm_if.setCreateGlobalVector(_create_global_vec)
     dm_if.setCreateLocalVector(_create_local_vec)
 
-    try:
-        from mpi4py import MPI
-        mpicomm = comm.tompi4py()
-    except Exception:
-        MPI = None
-        mpicomm = None
-
     def _is_add_mode(mode) -> bool:
         try:
             return mode == PETSc.InsertMode.ADD_VALUES or int(mode) == int(PETSc.InsertMode.ADD_VALUES)
@@ -176,52 +177,34 @@ def _create_interface_shell_dm(comm, n_if: int) -> PETSc.DM:
     def _g2l_begin(dm, Xg, mode, Xl):
         if n_if == 0:
             return
-
-        buf = np.empty(n_if, dtype=np.float64)
+        xl = Xl.getArray()
         if comm.getRank() == 0:
             try:
-                buf[:] = np.asarray(Xg.getArray(readonly=True), dtype=np.float64)
+                xl[:] = np.asarray(Xg.getArray(readonly=True), dtype=np.float64)
             except TypeError:
-                buf[:] = np.asarray(Xg.getArray(), dtype=np.float64)
-
-        if mpicomm is not None:
-            mpicomm.Bcast([buf, MPI.DOUBLE], root=0)
+                xl[:] = np.asarray(Xg.getArray(), dtype=np.float64)
         else:
-            if comm.getSize() > 1:
-                raise RuntimeError("mpi4py is required for DMShell globalToLocal in MPI mode.")
-
-        xl = Xl.getArray()
-        xl[:] = buf
-        Xl.assemble()
+            xl[:] = 0.0
 
     def _g2l_end(dm, Xg, mode, Xl):
         return
 
     def _l2g_begin(dm, Xl, mode, Xg):
-        if n_if == 0:
+        if n_if == 0 or comm.getRank() != 0:
             return
 
         try:
-            f_loc = np.asarray(Xl.getArray(readonly=True), dtype=np.float64)
+            xl = np.asarray(Xl.getArray(readonly=True), dtype=np.float64)
         except TypeError:
-            f_loc = np.asarray(Xl.getArray(), dtype=np.float64)
-        f_sum = np.empty_like(f_loc)
-        if mpicomm is not None:
-            mpicomm.Allreduce([f_loc, MPI.DOUBLE], [f_sum, MPI.DOUBLE], op=MPI.SUM)
-        else:
-            if comm.getSize() > 1:
-                raise RuntimeError("mpi4py is required for DMShell localToGlobal in MPI mode.")
-            f_sum[:] = f_loc
+            xl = np.asarray(Xl.getArray(), dtype=np.float64)
 
-        if comm.getRank() == 0:
-            xg = Xg.getArray()
-            if xg.size != f_sum.size:
-                raise ValueError(f"Interface global vec size mismatch: {xg.size} vs {f_sum.size}")
-            if _is_add_mode(mode):
-                xg[:] += f_sum
-            else:
-                xg[:] = f_sum
-            Xg.assemble()
+        xg = Xg.getArray()
+        if xg.size != xl.size:
+            raise ValueError(f"Interface global vec size mismatch: {xg.size} vs {xl.size}")
+        if _is_add_mode(mode):
+            xg[:] += xl
+        else:
+            xg[:] = xl
 
     def _l2g_end(dm, Xl, mode, Xg):
         return
@@ -292,7 +275,6 @@ def global_to_local(mgr: DMManager, Xg: PETSc.Vec):
             buf = _iface_bcast_from_root(comm, buf_root, n_if)
             xl = Xl_if.getArray()
             xl[:n_if] = buf
-            Xl_if.assemble()
     return Xl_liq, Xl_gas, Xl_if
 
 
@@ -321,5 +303,56 @@ def local_to_global_add(
                 if xg.size != f_sum.size:
                     raise ValueError(f"Interface global vec size mismatch: {xg.size} vs {f_sum.size}")
                 xg[:n_if] += f_sum
-                F_if_g.assemble()
     return Fg
+
+
+def local_state_to_global(
+    mgr: DMManager,
+    Xl_liq: PETSc.Vec,
+    Xl_gas: PETSc.Vec,
+    Xl_if: PETSc.Vec,
+) -> PETSc.Vec:
+    def _as_scalar(val) -> int:
+        if isinstance(val, (tuple, list, np.ndarray)):
+            if len(val) == 0:
+                raise RuntimeError("Unexpected empty DMDA corners entry.")
+            val = val[0]
+        return int(val)
+
+    def _corners_1d(dm) -> Tuple[int, int]:
+        c = dm.getCorners()
+        if isinstance(c, tuple):
+            if len(c) == 2:
+                return _as_scalar(c[0]), _as_scalar(c[1])
+            if len(c) >= 4:
+                return _as_scalar(c[0]), _as_scalar(c[3])
+        raise RuntimeError(f"Unexpected DMDA.getCorners() return: {c}")
+
+    comm = mgr.comm
+    n_if = int(mgr.n_if)
+    Xg = mgr.dm.createGlobalVec()
+    Xg.set(0.0)
+
+    with _dmcomposite_access(mgr.dm, Xg) as (X_liq_g, X_gas_g, X_if_g):
+        xs, xm = _corners_1d(mgr.dm_liq)
+        aL = mgr.dm_liq.getVecArray(Xl_liq)
+        aG = mgr.dm_liq.getVecArray(X_liq_g)
+        for i in range(xs, xs + xm):
+            try:
+                aG[i, :] = aL[i, :]
+            except Exception:
+                aG[i] = aL[i]
+
+        xs, xm = _corners_1d(mgr.dm_gas)
+        aL = mgr.dm_gas.getVecArray(Xl_gas)
+        aG = mgr.dm_gas.getVecArray(X_gas_g)
+        for i in range(xs, xs + xm):
+            try:
+                aG[i, :] = aL[i, :]
+            except Exception:
+                aG[i] = aL[i]
+
+        if n_if > 0 and comm.getRank() == 0:
+            X_if_g.getArray()[:n_if] = Xl_if.getArray()[:n_if]
+
+    return Xg

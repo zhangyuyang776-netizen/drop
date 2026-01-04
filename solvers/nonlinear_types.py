@@ -9,9 +9,16 @@ Goal:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Dict, List, Optional
 
 import numpy as np
+
+
+class NonlinearBackend(str, Enum):
+    SCIPY = "scipy"
+    PETSC = "petsc"
+    PETSC_MPI = "petsc_mpi"
 
 
 @dataclass(slots=True)

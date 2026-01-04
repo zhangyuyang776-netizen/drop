@@ -42,6 +42,9 @@ def solve_linear_system(
 
     if backend == "petsc":
         try:
+            from parallel.mpi_bootstrap import bootstrap_mpi_before_petsc
+
+            bootstrap_mpi_before_petsc()
             from petsc4py import PETSc
         except Exception as exc:  # pragma: no cover
             raise RuntimeError("petsc4py is required for PETSc backend.") from exc

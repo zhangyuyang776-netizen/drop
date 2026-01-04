@@ -12,6 +12,8 @@ if str(ROOT) not in sys.path:
 
 
 def _import_petsc_or_skip():
+    from parallel.mpi_bootstrap import bootstrap_mpi_before_petsc
+    bootstrap_mpi_before_petsc()
     pytest.importorskip("petsc4py")
     from petsc4py import PETSc
     return PETSc
@@ -88,9 +90,9 @@ def _build_case(tmp_path: Path, nproc: int):
 
 
 def test_residual_iface_not_duplicated_mpi(tmp_path: Path):
+    _import_mpi4py_or_skip()
     PETSc = _import_petsc_or_skip()
     _import_chemistry_or_skip()
-    _import_mpi4py_or_skip()
 
     comm = PETSc.COMM_WORLD
     if comm.getSize() < 2:

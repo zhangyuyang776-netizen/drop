@@ -450,6 +450,39 @@ def residual_only(u: np.ndarray, ctx: NonlinearContext) -> np.ndarray:
     return res
 
 
+def residual_only_owned_rows(
+    u: np.ndarray,
+    ctx: NonlinearContext,
+    ownership_range: tuple[int, int],
+) -> np.ndarray:
+    """
+    Compute residual F(u) and return the slice corresponding to owned rows
+    in [rstart, rend).
+
+    Note: this is a simple baseline implementation:
+    - uses global residual_only(u, ctx)
+    - then slices by global row indices.
+    Later可以换成真正的 residual_local kernel，而接口保持不变。
+    """
+    rstart, rend = ownership_range
+    rstart = int(rstart)
+    rend = int(rend)
+    if rstart < 0 or rend < 0 or rstart > rend:
+        raise ValueError(f"Invalid ownership_range={ownership_range}.")
+
+    res_full = residual_only(u, ctx)
+    if res_full.ndim != 1:
+        res_full = res_full.ravel()
+
+    N = res_full.size
+    if rend > N:
+        raise ValueError(
+            f"ownership_range end {rend} exceeds residual size {N}."
+        )
+
+    return res_full[rstart:rend].copy()
+
+
 def residual_petsc(
     mgr,
     ld,
@@ -499,7 +532,15 @@ def residual_petsc(
     aFl_gas = mgr.dm_gas.getVecArray(Fl_gas)
     aFl_if = Fl_if.getArray()
 
-    scatter_layout_to_local(ctx_local, res_global, aFl_liq, aFl_gas, aFl_if, rank=rank)
+    scatter_layout_to_local(
+        ctx_local,
+        res_global,
+        aFl_liq,
+        aFl_gas,
+        aFl_if,
+        rank=rank,
+        owned_only=True,
+    )
 
     Fg_out = local_to_global_add(mgr, Fl_liq, Fl_gas, Fl_if)
     if Fg is not None:

@@ -1,5 +1,5 @@
 """
-Build PETSc AIJ preconditioner matrices for serial runs.
+Build PETSc AIJ preconditioner matrices (serial dense bridge / native, MPI via sparse FD).
 
 Supports dense-bridge assembly and native PETSc assembly (assembly_mode=native_aij).
 """
@@ -11,6 +11,7 @@ from typing import Any, Dict, Optional, Tuple
 import numpy as np
 
 from solvers.nonlinear_context import NonlinearContext
+from parallel.mpi_bootstrap import bootstrap_mpi_before_petsc
 
 
 def _get_linear_assembly_mode(ctx: NonlinearContext) -> str:
@@ -101,6 +102,7 @@ def _build_state_props_eq(
 
 def _get_petsc():
     try:
+        bootstrap_mpi_before_petsc()
         from petsc4py import PETSc
     except Exception as exc:  # pragma: no cover
         raise RuntimeError("petsc4py is required for PETSc AIJ builder.") from exc
@@ -222,62 +224,110 @@ def build_precond_mat_aij_from_A(
     max_nnz_row: Optional[int] = None,
 ) -> Tuple[Any, Dict[str, Any]]:
     """
-    Build a PETSc AIJ matrix P from dense A(u) and return diagnostics.
+    Build a PETSc AIJ matrix P from A(u) and return diagnostics.
     """
     PETSc = _get_petsc()
     if comm is None:
         comm = PETSc.COMM_WORLD
-    if comm.getSize() != 1:
-        raise NotImplementedError("Stage 2 precond builder is serial-only for now.")
+    size = comm.getSize()
 
-    mode = _get_linear_assembly_mode(ctx)
-    if mode == "native_aij":
-        from assembly.build_system_petsc import build_transport_system_petsc_native
-        state_guess, props, eq_model, eq_result, diag_ctx = _build_state_props_eq(ctx, u_phys)
-        A_p, _b, diag_sys = build_transport_system_petsc_native(
-            cfg=ctx.cfg,
-            grid=ctx.grid_ref,
-            layout=ctx.layout,
-            state_old=ctx.state_old,
-            props=props,
-            dt=float(ctx.dt),
-            state_guess=state_guess,
-            eq_model=eq_model,
-            eq_result=eq_result,
-            return_diag=True,
-            comm=comm,
+    if size == 1:
+        mode = _get_linear_assembly_mode(ctx)
+        if mode == "native_aij":
+            from assembly.build_system_petsc import build_transport_system_petsc_native
+            state_guess, props, eq_model, eq_result, diag_ctx = _build_state_props_eq(ctx, u_phys)
+            A_p, _b, diag_sys = build_transport_system_petsc_native(
+                cfg=ctx.cfg,
+                grid=ctx.grid_ref,
+                layout=ctx.layout,
+                state_old=ctx.state_old,
+                props=props,
+                dt=float(ctx.dt),
+                state_guess=state_guess,
+                eq_model=eq_model,
+                eq_result=eq_result,
+                return_diag=True,
+                comm=comm,
+            )
+            diag = {"assembly_mode": "native_aij", "mode": "native_aij"}
+            diag.update(diag_ctx)
+            if isinstance(diag_sys, dict) and diag_sys:
+                diag["diag_sys"] = diag_sys
+            diag["shape"] = tuple(A_p.getSize())
+            return A_p, diag
+
+        from assembly.residual_global import build_transport_system_from_ctx
+
+        A_dense, _b = build_transport_system_from_ctx(ctx, u_phys)
+        A_dense = np.asarray(A_dense, dtype=PETSc.ScalarType)
+        if A_dense.ndim != 2 or A_dense.shape[0] != A_dense.shape[1]:
+            raise ValueError(f"A must be square 2D array, got {A_dense.shape}")
+
+        n = int(A_dense.shape[0])
+        mask, nnz, diag = _dense_mask_stats(A_dense, drop_tol)
+        if max_nnz_row is not None:
+            max_nnz_row = int(max_nnz_row)
+            nnz_max = int(nnz.max()) if nnz.size else 0
+            if max_nnz_row < nnz_max:
+                max_nnz_row = nnz_max
+            nnz_alloc = max_nnz_row
+            diag["nnz_max_row_alloc"] = max_nnz_row
+        else:
+            nnz_alloc = nnz.tolist()
+
+        P = PETSc.Mat().createAIJ([n, n], nnz=nnz_alloc, comm=comm)
+        P.setUp()
+        _fill_aij_from_dense(P, A_dense, mask)
+        diag["shape"] = tuple(A_dense.shape)
+        diag["mode"] = "dense_seq"
+        return P, diag
+
+    u_phys = np.asarray(u_phys, dtype=np.float64)
+    scale_u = np.asarray(ctx.scale_u, dtype=np.float64)
+    if scale_u.shape != u_phys.shape:
+        raise ValueError(
+            f"ctx.scale_u shape {scale_u.shape} mismatches u_phys shape {u_phys.shape}"
         )
-        diag = {"assembly_mode": "native_aij"}
-        diag.update(diag_ctx)
-        if isinstance(diag_sys, dict) and diag_sys:
-            diag["diag_sys"] = diag_sys
-        diag["shape"] = tuple(A_p.getSize())
-        return A_p, diag
+    scale_u_safe = np.where(scale_u > 0.0, scale_u, 1.0)
+    x0 = u_phys / scale_u_safe
 
-    from assembly.residual_global import build_transport_system_from_ctx
+    from assembly.build_sparse_fd_jacobian import build_sparse_fd_jacobian as _build_fd
 
-    A_dense, _b = build_transport_system_from_ctx(ctx, u_phys)
-    A_dense = np.asarray(A_dense, dtype=PETSc.ScalarType)
-    if A_dense.ndim != 2 or A_dense.shape[0] != A_dense.shape[1]:
-        raise ValueError(f"A must be square 2D array, got {A_dense.shape}")
-
-    n = int(A_dense.shape[0])
-    mask, nnz, diag = _dense_mask_stats(A_dense, drop_tol)
-    if max_nnz_row is not None:
-        max_nnz_row = int(max_nnz_row)
-        nnz_max = int(nnz.max()) if nnz.size else 0
-        if max_nnz_row < nnz_max:
-            max_nnz_row = nnz_max
-        nnz_alloc = max_nnz_row
-        diag["nnz_max_row_alloc"] = max_nnz_row
+    petsc_cfg = getattr(ctx.cfg, "petsc", None)
+    default_eps_precond = 1.0e-6
+    if petsc_cfg is not None and hasattr(petsc_cfg, "fd_eps"):
+        try:
+            eps_precond = float(petsc_cfg.fd_eps)
+        except Exception:
+            eps_precond = default_eps_precond
     else:
-        nnz_alloc = nnz.tolist()
+        eps_precond = default_eps_precond
 
-    P = PETSc.Mat().createAIJ([n, n], nnz=nnz_alloc, comm=comm)
-    P.setUp()
-    _fill_aij_from_dense(P, A_dense, mask)
-    diag["shape"] = tuple(A_dense.shape)
-    return P, diag
+    P_fd, stats_fd = _build_fd(
+        ctx,
+        x0,
+        eps=eps_precond,
+        drop_tol=drop_tol,
+        pattern=None,
+        mat=None,
+    )
+
+    diag_fd: Dict[str, Any] = {
+        "shape": tuple(stats_fd.get("shape", (x0.size, x0.size))),
+        "drop_tol": float(drop_tol),
+        "eps": float(stats_fd.get("eps", eps_precond)),
+        "nnz_total_local": int(stats_fd.get("nnz_total_local", 0)),
+        "n_local_rows": int(stats_fd.get("n_local_rows", 0)),
+        "pattern_nnz_local": int(stats_fd.get("pattern_nnz_local", 0)),
+        "prealloc_nnz_local": int(stats_fd.get("prealloc_nnz_local", 0)),
+        "n_fd_calls": int(stats_fd.get("n_fd_calls", 0)),
+        "mpi_size": int(stats_fd.get("mpi_size", size)),
+        "max_diag_abs_local": float(stats_fd.get("max_diag_abs_local", 0.0)),
+        "mode": "fd_mpi",
+        "builder": "mfpc_aija_fd",
+    }
+
+    return P_fd, diag_fd
 
 
 def fill_precond_mat_aij_from_A(
@@ -291,55 +341,107 @@ def fill_precond_mat_aij_from_A(
     Refill an existing PETSc AIJ matrix P with values from dense A(u).
     """
     PETSc = _get_petsc()
-    mode = _get_linear_assembly_mode(ctx)
-    if mode == "native_aij":
-        from assembly.build_system_petsc import build_transport_system_petsc_native
-        state_guess, props, eq_model, eq_result, diag_ctx = _build_state_props_eq(ctx, u_phys)
-        A_new, _b, diag_sys = build_transport_system_petsc_native(
-            cfg=ctx.cfg,
-            grid=ctx.grid_ref,
-            layout=ctx.layout,
-            state_old=ctx.state_old,
-            props=props,
-            dt=float(ctx.dt),
-            state_guess=state_guess,
-            eq_model=eq_model,
-            eq_result=eq_result,
-            return_diag=True,
-            comm=P.getComm(),
-        )
-        if P.getSize() != A_new.getSize():
-            raise ValueError(f"P size {P.getSize()} does not match native A size {A_new.getSize()}")
-        P.zeroEntries()
-        try:
-            P.axpy(1.0, A_new, structure=PETSc.Mat.Structure.SAME_NONZERO_PATTERN)
-        except Exception:
-            P.axpy(1.0, A_new)
-        P.assemblyBegin()
-        P.assemblyEnd()
-        diag = {"assembly_mode": "native_aij"}
-        diag.update(diag_ctx)
-        if isinstance(diag_sys, dict) and diag_sys:
-            diag["diag_sys"] = diag_sys
-        diag["shape"] = tuple(A_new.getSize())
+    comm = P.getComm()
+    size = comm.getSize()
+
+    if size == 1:
+        mode = _get_linear_assembly_mode(ctx)
+        if mode == "native_aij":
+            from assembly.build_system_petsc import build_transport_system_petsc_native
+            state_guess, props, eq_model, eq_result, diag_ctx = _build_state_props_eq(ctx, u_phys)
+            A_new, _b, diag_sys = build_transport_system_petsc_native(
+                cfg=ctx.cfg,
+                grid=ctx.grid_ref,
+                layout=ctx.layout,
+                state_old=ctx.state_old,
+                props=props,
+                dt=float(ctx.dt),
+                state_guess=state_guess,
+                eq_model=eq_model,
+                eq_result=eq_result,
+                return_diag=True,
+                comm=comm,
+            )
+            if P.getSize() != A_new.getSize():
+                raise ValueError(f"P size {P.getSize()} does not match native A size {A_new.getSize()}")
+            P.zeroEntries()
+            try:
+                P.axpy(1.0, A_new, structure=PETSc.Mat.Structure.SAME_NONZERO_PATTERN)
+            except Exception:
+                P.axpy(1.0, A_new)
+            P.assemblyBegin()
+            P.assemblyEnd()
+            diag = {"assembly_mode": "native_aij", "mode": "native_aij_fill"}
+            diag.update(diag_ctx)
+            if isinstance(diag_sys, dict) and diag_sys:
+                diag["diag_sys"] = diag_sys
+            diag["shape"] = tuple(A_new.getSize())
+            return diag
+
+        from assembly.residual_global import build_transport_system_from_ctx
+
+        A_dense, _b = build_transport_system_from_ctx(ctx, u_phys)
+        A_dense = np.asarray(A_dense, dtype=PETSc.ScalarType)
+        if A_dense.ndim != 2 or A_dense.shape[0] != A_dense.shape[1]:
+            raise ValueError(f"A must be square 2D array, got {A_dense.shape}")
+
+        n = int(A_dense.shape[0])
+        size_mat = P.getSize()
+        if size_mat != (n, n):
+            raise ValueError(f"P size {size_mat} does not match A shape {(n, n)}")
+
+        mask, _nnz, diag = _dense_mask_stats(A_dense, drop_tol)
+        _fill_aij_from_dense(P, A_dense, mask)
+        diag["shape"] = tuple(A_dense.shape)
+        diag["mode"] = "dense_seq_fill"
         return diag
 
-    from assembly.residual_global import build_transport_system_from_ctx
+    u_phys = np.asarray(u_phys, dtype=np.float64)
+    scale_u = np.asarray(ctx.scale_u, dtype=np.float64)
+    if scale_u.shape != u_phys.shape:
+        raise ValueError(
+            f"ctx.scale_u shape {scale_u.shape} mismatches u_phys shape {u_phys.shape}"
+        )
+    scale_u_safe = np.where(scale_u > 0.0, scale_u, 1.0)
+    x0 = u_phys / scale_u_safe
 
-    A_dense, _b = build_transport_system_from_ctx(ctx, u_phys)
-    A_dense = np.asarray(A_dense, dtype=PETSc.ScalarType)
-    if A_dense.ndim != 2 or A_dense.shape[0] != A_dense.shape[1]:
-        raise ValueError(f"A must be square 2D array, got {A_dense.shape}")
+    from assembly.build_sparse_fd_jacobian import build_sparse_fd_jacobian as _build_fd
 
-    n = int(A_dense.shape[0])
-    size = P.getSize()
-    if size != (n, n):
-        raise ValueError(f"P size {size} does not match A shape {(n, n)}")
+    petsc_cfg = getattr(ctx.cfg, "petsc", None)
+    default_eps_precond = 1.0e-6
+    if petsc_cfg is not None and hasattr(petsc_cfg, "fd_eps"):
+        try:
+            eps_precond = float(petsc_cfg.fd_eps)
+        except Exception:
+            eps_precond = default_eps_precond
+    else:
+        eps_precond = default_eps_precond
 
-    mask, _nnz, diag = _dense_mask_stats(A_dense, drop_tol)
-    _fill_aij_from_dense(P, A_dense, mask)
-    diag["shape"] = tuple(A_dense.shape)
-    return diag
+    _P, stats_fd = _build_fd(
+        ctx,
+        x0,
+        eps=eps_precond,
+        drop_tol=drop_tol,
+        pattern=None,
+        mat=P,
+    )
+
+    diag_fd: Dict[str, Any] = {
+        "shape": tuple(stats_fd.get("shape", (x0.size, x0.size))),
+        "drop_tol": float(drop_tol),
+        "eps": float(stats_fd.get("eps", eps_precond)),
+        "nnz_total_local": int(stats_fd.get("nnz_total_local", 0)),
+        "n_local_rows": int(stats_fd.get("n_local_rows", 0)),
+        "pattern_nnz_local": int(stats_fd.get("pattern_nnz_local", 0)),
+        "prealloc_nnz_local": int(stats_fd.get("prealloc_nnz_local", 0)),
+        "n_fd_calls": int(stats_fd.get("n_fd_calls", 0)),
+        "mpi_size": int(stats_fd.get("mpi_size", size)),
+        "max_diag_abs_local": float(stats_fd.get("max_diag_abs_local", 0.0)),
+        "mode": "fd_mpi_fill",
+        "builder": "mfpc_aija_fd",
+    }
+
+    return diag_fd
 
 
 def build_precond_aij_from_ctx(
@@ -349,6 +451,6 @@ def build_precond_aij_from_ctx(
     drop_tol: float = 0.0,
 ) -> Tuple[Any, Dict[str, Any]]:
     """
-    Build P ~ A(u) as PETSc AIJ matrix from current nonlinear context (serial Stage 2).
+    Build P ~ A(u) as PETSc AIJ matrix from current nonlinear context.
     """
     return build_precond_mat_aij_from_A(ctx, u_phys, drop_tol=drop_tol)

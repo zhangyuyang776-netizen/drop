@@ -11,6 +11,8 @@ if str(ROOT) not in sys.path:
 
 
 def _import_petsc_or_skip():
+    from parallel.mpi_bootstrap import bootstrap_mpi_before_petsc
+    bootstrap_mpi_before_petsc()
     pytest.importorskip("petsc4py")
     from petsc4py import PETSc
     return PETSc

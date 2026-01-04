@@ -3,11 +3,15 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from petsc4py import PETSc
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+from parallel.mpi_bootstrap import bootstrap_mpi_before_petsc
+
+bootstrap_mpi_before_petsc()
+from petsc4py import PETSc
 
 try:
     import cantera  # noqa: F401

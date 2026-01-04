@@ -20,6 +20,7 @@ from physics.flux_liq import compute_liq_diffusive_flux_Y
 from physics.interface_bc import EqResultLike, build_interface_coeffs, _get_balance_species_indices
 from physics.radius_eq import build_radius_row
 from physics.stefan_velocity import compute_stefan_velocity
+from parallel.mpi_bootstrap import bootstrap_mpi_before_petsc
 
 from assembly.build_system_SciPy import build_transport_system as build_transport_system_numpy
 from assembly.build_liquid_T_system_SciPy import build_liquid_T_system as build_liquid_T_system_numpy
@@ -36,6 +37,7 @@ if TYPE_CHECKING:
 
 def _get_petsc():
     try:
+        bootstrap_mpi_before_petsc()
         from petsc4py import PETSc
     except Exception as exc:  # pragma: no cover
         raise RuntimeError("petsc4py is required for PETSc assembly bridge.") from exc

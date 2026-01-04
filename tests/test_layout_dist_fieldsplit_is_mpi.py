@@ -12,6 +12,9 @@ if str(ROOT) not in sys.path:
 
 
 def _import_petsc():
+    from parallel.mpi_bootstrap import bootstrap_mpi_before_petsc
+
+    bootstrap_mpi_before_petsc()
     pytest.importorskip("petsc4py")
     from petsc4py import PETSc
     return PETSc
@@ -55,8 +58,8 @@ def _is_to_array(isobj) -> np.ndarray:
 
 
 def test_layout_dist_builds_and_is_partitions_global():
-    PETSc = _import_petsc()
     _import_mpi4py()
+    PETSc = _import_petsc()
     comm = PETSc.COMM_WORLD
     cfg, layout = _build_cfg_and_layout(comm.getSize())
 
