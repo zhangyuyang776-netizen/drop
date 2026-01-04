@@ -272,13 +272,35 @@ def solve_nonlinear_petsc_parallel(
         ctr["n_func_eval"] += 1
         tim["time_func"] += (time.perf_counter() - t0)
 
+    newton_step_info = {"step_norm": 0.0, "lambda": 1.0}
+
     def snes_monitor_fn(snes_obj, its, fnorm):
         v = float(last_inf["val"])
         if np.isfinite(v):
             history_inf.append(v)
-        if snes_monitor or verbose:
-            if (its + 1) % log_every == 0:
-                logger.info("snes iter=%d fnorm=%.3e res_inf=%.3e", its + 1, float(fnorm), v)
+        if world_rank == 0:
+            try:
+                ls = snes_obj.getLineSearch()
+                lam = ls.getLambda()
+                newton_step_info["lambda"] = float(lam)
+            except Exception:
+                pass
+            try:
+                delta_x = snes_obj.getSolutionUpdate()
+                step_norm = float(delta_x.norm(PETSc.NormType.NORM_INFINITY))
+                newton_step_info["step_norm"] = step_norm
+                logger.warning(
+                    "SNES iter=%d fnorm=%.3e res_inf=%.3e step_norm=%.3e lambda=%.6f",
+                    its,
+                    float(fnorm),
+                    v,
+                    step_norm,
+                    newton_step_info["lambda"],
+                )
+            except Exception:
+                if snes_monitor or verbose:
+                    if (its + 1) % log_every == 0:
+                        logger.info("snes iter=%d fnorm=%.3e res_inf=%.3e", its + 1, float(fnorm), v)
 
     snes = PETSc.SNES().create(comm=comm)
     if prefix:
@@ -484,11 +506,20 @@ def solve_nonlinear_petsc_parallel(
                     "P-F residual consistency: ||F_snes(u0) - F_direct(u0)||_inf = %.3e (MISMATCH!)",
                     F_diff,
                 )
-            else:
+            elif verbose or F_diff > 1.0e-14:
                 logger.info(
                     "P-F residual consistency: ||F_snes(u0) - F_direct(u0)||_inf = %.3e (OK)",
                     F_diff,
                 )
+        F_norm_snes = float(F_test.norm(PETSc.NormType.NORM_INFINITY))
+        F_norm_direct = float(np.linalg.norm(F_direct, ord=np.inf))
+        if world_rank == 0:
+            logger.warning(
+                "DEBUG: F_norm: snes=%.6e, direct=%.6e, layout_diff=%.6e",
+                F_norm_snes,
+                F_norm_direct,
+                F_diff,
+            )
 
     snes.solve(None, X)
     if ksp_t.get("in_solve", False):
