@@ -16,6 +16,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Tuple
 
+import logging
+import os
 import numpy as np
 
 try:
@@ -29,6 +31,34 @@ else:
 from core.types import CaseConfig, Grid1D, State
 
 FloatArray = np.ndarray
+
+logger = logging.getLogger(__name__)
+
+_SANITIZE_Y = bool(int(os.environ.get("DROPLET_SANITIZE_Y", "1")))
+_SANITIZE_Y_ONCE = bool(int(os.environ.get("DROPLET_SANITIZE_Y_ONCE", "1")))
+_SANITIZE_PRINTED: set[tuple[int, int]] = set()
+
+
+def _get_mpi_rank() -> int:
+    try:
+        from mpi4py import MPI  # type: ignore
+
+        return int(MPI.COMM_WORLD.Get_rank())
+    except Exception:
+        return -1
+
+
+def _sanitize_mass_fractions(Y: np.ndarray, eps: float = 1.0e-30) -> np.ndarray:
+    Y = np.asarray(Y, dtype=np.float64)
+    Y = np.maximum(Y, 0.0)
+    s = float(np.sum(Y))
+    if s <= eps or not np.isfinite(s):
+        j = int(np.argmax(Y)) if np.any(Y > 0.0) else (Y.size - 1)
+        Y[:] = 0.0
+        Y[j] = 1.0
+        return Y
+    Y /= s
+    return Y
 
 
 @dataclass(slots=True)
@@ -94,6 +124,32 @@ def compute_gas_props(
         Y_mech = np.asarray(state.Yg[:, ig], dtype=np.float64)
 
         sY = float(np.sum(Y_mech))
+        minY = float(np.min(Y_mech)) if Y_mech.size else 0.0
+        maxY = float(np.max(Y_mech)) if Y_mech.size else 0.0
+        bad_sum = (not np.isfinite(sY)) or sY <= 0.0 or abs(sY - 1.0) > 1.0e-8
+        bad_min = minY < -1.0e-12
+        if _SANITIZE_Y and (bad_sum or bad_min):
+            rank = _get_mpi_rank()
+            key = (rank, int(ig))
+            if (not _SANITIZE_Y_ONCE) or (key not in _SANITIZE_PRINTED):
+                _SANITIZE_PRINTED.add(key)
+                y_for_sort = np.where(np.isfinite(Y_mech), Y_mech, -np.inf)
+                top_idx = np.argsort(-y_for_sort)[:3]
+                top = [(int(i), float(Y_mech[i])) for i in top_idx]
+                logger.warning(
+                    "[SANITIZE_Y][rank=%s][cell=%d] sum=%.6g min=%.3e max=%.3e top=%s",
+                    rank,
+                    ig,
+                    sY,
+                    minY,
+                    maxY,
+                    top,
+                )
+            Y_mech = _sanitize_mass_fractions(Y_mech)
+            sY = float(np.sum(Y_mech))
+            minY = float(np.min(Y_mech)) if Y_mech.size else 0.0
+            maxY = float(np.max(Y_mech)) if Y_mech.size else 0.0
+
         if not np.isfinite(sY) or sY <= 0.0:
             raise ValueError(f"Gas mass fractions at cell {ig} are invalid: sum(Y)={sY}")
         if abs(sY - 1.0) > 1e-6:

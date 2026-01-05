@@ -210,6 +210,7 @@ def solve_nonlinear_petsc_parallel(
 
     from assembly.residual_local import ResidualLocalCtx, pack_local_to_layout, scatter_layout_to_local
     from parallel.dm_manager import global_to_local, local_state_to_global
+    from assembly.residual_global import residual_only_owned_rows
 
     ctx_local = ResidualLocalCtx(layout=ctx.layout, ld=ld)
 
@@ -250,6 +251,89 @@ def solve_nonlinear_petsc_parallel(
         except Exception as exc:
             raise RuntimeError("mpi4py is required for DM to layout gather in MPI mode.") from exc
 
+    def residual_petsc_owned_rows(dm_mgr, ctx, X, Fg):
+        """
+        MPI: each rank writes only its owned rows of residual into Fg.
+        """
+        import os
+
+        PETSc = _get_petsc()
+        comm = PETSc.COMM_WORLD
+        rank = int(comm.getRank())
+
+        u_layout = _dm_vec_to_layout(X)
+
+        rstart, rend = Fg.getOwnershipRange()
+        ownership_range = (int(rstart), int(rend))
+
+        r_owned = residual_only_owned_rows(u_layout, ctx, ownership_range)
+        r_owned = np.asarray(r_owned, dtype=np.float64)
+
+        if not np.all(np.isfinite(r_owned)):
+            r_owned = np.where(np.isfinite(r_owned), r_owned, 1.0e20)
+
+        nloc = int(rend - rstart)
+        if r_owned.size != nloc:
+            raise RuntimeError(
+                f"[residual_petsc_owned_rows][rank={rank}] size mismatch: "
+                f"len(r_owned)={r_owned.size} vs nloc={nloc} range=[{rstart},{rend})"
+            )
+
+        Fg.set(0.0)
+        idx = np.arange(rstart, rend, dtype=PETSc.IntType)
+        Fg.setValues(idx, r_owned, addv=PETSc.InsertMode.INSERT_VALUES)
+        Fg.assemblyBegin()
+        Fg.assemblyEnd()
+
+        if os.environ.get("DROPLET_PETSC_DEBUG", "0") == "1":
+            try:
+                f_view = Fg.getArray()
+                f_loc = np.array(f_view, dtype=np.float64, copy=True)
+            finally:
+                try:
+                    Fg.restoreArray()
+                except Exception:
+                    pass
+            err = float(np.max(np.abs(f_loc - r_owned))) if f_loc.size else 0.0
+            logger.warning(
+                "[DBG][rank=%d] OwnedRows writeback check: ||Fg_local - r_owned||_inf = %.3e",
+                rank,
+                err,
+            )
+
+        return r_owned
+
+    def _dbg_log_Y(u_layout: np.ndarray, tag: str) -> None:
+        if not DEBUG:
+            return
+        try:
+            state_dbg = ctx.make_state_from_u(u_layout)
+            Yg = np.asarray(state_dbg.Yg, dtype=np.float64)
+            if Yg.ndim != 2:
+                _dbg_rank("%s Yg shape=%r", tag, getattr(Yg, "shape", None))
+                return
+            cell_idx = 7
+            if Yg.shape[1] <= cell_idx:
+                _dbg_rank("%s Yg cell=%d out of range (ncell=%d)", tag, cell_idx, int(Yg.shape[1]))
+                return
+            Y = Yg[:, cell_idx]
+            s = float(np.sum(Y)) if Y.size else 0.0
+            mn = float(np.min(Y)) if Y.size else 0.0
+            mx = float(np.max(Y)) if Y.size else 0.0
+            idx = np.argsort(-Y)[:3] if Y.size else np.array([], dtype=np.int64)
+            top = [(int(i), float(Y[i])) for i in idx]
+            _dbg_rank(
+                "%s Y@cell%d sum=%.6g min=%.3e max=%.3e top=%s",
+                tag,
+                cell_idx,
+                s,
+                mn,
+                mx,
+                top,
+            )
+        except Exception as exc:
+            _dbg_rank("%s Y debug failed: %r", tag, exc)
+
     history_inf: List[float] = []
     last_inf = {"val": np.nan}
     t_solve0 = time.perf_counter()
@@ -258,7 +342,46 @@ def solve_nonlinear_petsc_parallel(
 
     def snes_func(snes_obj, X, F):
         t0 = time.perf_counter()
-        residual_petsc(dm_mgr, ld, ctx, X, Fg=F)
+        sig_changed = False
+        if DEBUG:
+            try:
+                x_inf = float(X.norm(PETSc.NormType.NORM_INFINITY))
+                x_2 = float(X.norm(PETSc.NormType.NORM_2))
+                try:
+                    x_view = X.getArray()
+                    x_loc = np.array(x_view, dtype=np.float64, copy=True)
+                finally:
+                    try:
+                        X.restoreArray()
+                    except Exception:
+                        pass
+                stride = max(1, int(x_loc.size // 16)) if x_loc.size else 1
+                x_chk = float(x_loc[::stride].sum()) if x_loc.size else 0.0
+                sig = (x_inf, x_2, x_chk, int(x_loc.size))
+                prev = ctx.meta.get("_dbg_prev_x_sig")
+                if prev != sig:
+                    ctx.meta["_dbg_prev_x_sig"] = sig
+                    sig_changed = True
+                    _dbg_rank(
+                        "Xsig inf=%.3e 2=%.3e chk=%.6e nloc=%d",
+                        x_inf,
+                        x_2,
+                        x_chk,
+                        int(x_loc.size),
+                    )
+            except Exception:
+                _dbg_rank("Xsig debug failed")
+        if DEBUG:
+            try:
+                u_layout_dbg = _dm_vec_to_layout(X)
+                _dbg_log_Y(u_layout_dbg, "AFTER_VEC2STATE_BEFORE_PROPS")
+            except Exception as exc:
+                _dbg_rank("Y debug before props failed: %r", exc)
+        use_owned = bool(int(os.environ.get("DROPLET_PETSC_RESID_OWNED", "1")))
+        if use_owned:
+            residual_petsc_owned_rows(dm_mgr, ctx, X, F)
+        else:
+            residual_petsc(dm_mgr, ld, ctx, X, Fg=F)
         try:
             res_inf = float(F.norm(PETSc.NormType.NORM_INFINITY))
         except Exception:
@@ -266,6 +389,28 @@ def solve_nonlinear_petsc_parallel(
         last_inf["val"] = res_inf
         ctr["n_func_eval"] += 1
         tim["time_func"] += (time.perf_counter() - t0)
+        if DEBUG:
+            if sig_changed:
+                _dbg_rank("Fsig inf=%.3e", res_inf)
+            try:
+                rstart_f, rend_f = F.getOwnershipRange()
+                try:
+                    f_view = F.getArray()
+                    f_loc = np.array(f_view, dtype=np.float64, copy=True)
+                finally:
+                    try:
+                        F.restoreArray()
+                    except Exception:
+                        pass
+                _dbg_rank(
+                    "Fg(local) ||F||_inf=%.3e  local_n=%d  range=[%d,%d)",
+                    float(np.max(np.abs(f_loc))),
+                    int(f_loc.size),
+                    int(rstart_f),
+                    int(rend_f),
+                )
+            except Exception:
+                _dbg_rank("Fg(local) debug failed")
 
     def snes_monitor_fn(snes_obj, its, fnorm):
         v = float(last_inf["val"])
@@ -293,6 +438,83 @@ def solve_nonlinear_petsc_parallel(
         snes.setFromOptions()
     except Exception:
         pass
+    import os
+    DEBUG = os.environ.get("DROPLET_PETSC_DEBUG", "0") == "1"
+    DEBUG_ONCE = os.environ.get("DROPLET_PETSC_DEBUG_ONCE", "1") == "1"
+
+    def _dbg(msg, *args):
+        if DEBUG and world_rank == 0:
+            logger.warning("[DBG] " + msg, *args)
+
+    def _dbg_rank(msg, *args):
+        if DEBUG:
+            logger.warning("[DBG][rank=%d] " + msg, world_rank, *args)
+
+    if DEBUG:
+        X0 = None
+        F0 = None
+        try:
+            X0 = _layout_to_dm_vec(u0)
+            F0 = dm.createGlobalVec()
+            residual_petsc(dm_mgr, ld, ctx, X0, Fg=F0)
+
+            rstart_dm, rend_dm = F0.getOwnershipRange()
+            _dbg_rank("DM ownership_range = [%d, %d)", int(rstart_dm), int(rend_dm))
+
+            ld_range = None
+            for key in ("ownership_range", "owned_range", "range_owned", "owned_dof_range"):
+                if hasattr(ld, key):
+                    ld_range = getattr(ld, key)
+                    break
+            if ld_range is not None:
+                try:
+                    _dbg_rank("LD ownership_range = %s", str(tuple(int(x) for x in ld_range)))
+                except Exception:
+                    _dbg_rank("LD ownership_range(raw) = %r", ld_range)
+            else:
+                _dbg_rank("LD ownership_range = <missing>")
+
+            try:
+                x0_view = X0.getArray()
+                x0_loc = np.array(x0_view, dtype=np.float64, copy=True)
+            finally:
+                try:
+                    X0.restoreArray()
+                except Exception:
+                    pass
+            _dbg_rank(
+                "X0 local ||x||_inf=%.3e  local_size=%d",
+                float(np.max(np.abs(x0_loc))),
+                int(x0_loc.size),
+            )
+
+            try:
+                u_back = _dm_vec_to_layout(X0)
+                du = u_back - u0
+                _dbg_rank("Roundtrip ||u_back-u0||_inf=%.3e", float(np.max(np.abs(du))))
+                imax = int(np.argmax(np.abs(du)))
+                _dbg_rank(
+                    "Roundtrip max@i=%d: u0=%.6e u_back=%.6e du=%.6e",
+                    imax,
+                    float(u0[imax]),
+                    float(u_back[imax]),
+                    float(du[imax]),
+                )
+            except Exception as exc:
+                _dbg_rank("Roundtrip failed: %r", exc)
+        finally:
+            if X0 is not None:
+                try:
+                    X0.destroy()
+                except Exception:
+                    pass
+            if F0 is not None:
+                try:
+                    F0.destroy()
+                except Exception:
+                    pass
+        if DEBUG_ONCE:
+            os.environ["DROPLET_PETSC_DEBUG"] = "0"
 
     try:
         snes.setType(snes_type)
@@ -314,25 +536,24 @@ def solve_nonlinear_petsc_parallel(
     if use_mfpc_sparse_fd:
         from assembly.build_sparse_fd_jacobian import build_sparse_fd_jacobian
 
+        x_template = None
         try:
-            P_dm = dm.createMatrix()
-        except Exception:
-            P_dm = None
-        if P_dm is None:
-            try:
-                nloc = int(X.getLocalSize())
-                n_glob = int(X.getSize())
-                P_dm = PETSc.Mat().create(comm=comm)
-                P_dm.setSizes(((nloc, n_glob), (nloc, n_glob)))
+            x_template = dm.createGlobalVec()
+            nloc = int(x_template.getLocalSize())
+            n_glob = int(x_template.getSize())
+        finally:
+            if x_template is not None:
                 try:
-                    P_dm.setType(PETSc.Mat.Type.AIJ)
+                    x_template.destroy()
                 except Exception:
-                    P_dm.setType("aij")
-                P_dm.setUp()
-            except Exception:
-                P_dm = None
-        if P_dm is None:
-            raise RuntimeError("Failed to create a DM-compatible matrix for mfpc_sparse_fd.")
+                    pass
+
+        P_dm = PETSc.Mat().create(comm=comm)
+        P_dm.setSizes(((nloc, n_glob), (nloc, n_glob)))
+        try:
+            P_dm.setType(PETSc.Mat.Type.AIJ)
+        except Exception:
+            P_dm.setType("aij")
 
         t0 = time.perf_counter()
         try:
@@ -360,6 +581,9 @@ def solve_nonlinear_petsc_parallel(
                 f"P={p_range} vs X={x_range}. "
                 "Use jacobian_mode='mf' or update build_sparse_fd_jacobian to use DM ownership."
             )
+        p_type_check = str(P.getType()).lower() if P is not None else ""
+        if "aij" not in p_type_check:
+            raise RuntimeError(f"mfpc_sparse_fd requires AIJ/MPIAIJ, got {p_type_check}")
     else:
         P = _create_identity_precond_mat(comm, dm)
 

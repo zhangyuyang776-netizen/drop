@@ -4,6 +4,8 @@ Build sparse FD Jacobian in PETSc AIJ using a conservative pattern and coloring.
 
 from __future__ import annotations
 
+import logging
+import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -16,6 +18,8 @@ from parallel.mat_prealloc import (
     build_owner_map_from_ownership_ranges,
     count_diag_off_nnz_for_local_rows,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _get_petsc():
@@ -231,7 +235,7 @@ def _build_sparse_fd_jacobian_mpi(
         raise ValueError("x0 must be non-empty for MPI Jacobian build.")
 
     from assembly.jacobian_pattern_dist import build_jacobian_pattern_local
-    from assembly.residual_global import residual_only
+    from assembly.residual_global import residual_only_owned_rows
 
     def _x_to_u_phys(x_arr: np.ndarray) -> np.ndarray:
         """
@@ -379,6 +383,9 @@ def _build_sparse_fd_jacobian_mpi(
 
     owner_map = build_owner_map_from_ownership_ranges(ownership_ranges)
     myrank = int(comm.getRank())
+    debug_fd = os.environ.get("DROPLET_PETSC_DEBUG", "0") == "1"
+    debug_fd_once = os.environ.get("DROPLET_PETSC_DEBUG_ONCE", "1") == "1"
+    debug_fd_logged = False
 
     local_row_cols: List[List[int]] = []
     col_to_rows: Dict[int, List[int]] = {}
@@ -386,7 +393,11 @@ def _build_sparse_fd_jacobian_mpi(
         start = int(indptr[k])
         end = int(indptr[k + 1])
         cols = indices[start:end]
+        gi = int(rows_global[k])
         cols_list = [int(c) for c in cols]
+        if gi not in cols_list:
+            cols_list.append(gi)
+        cols_list = sorted(set(cols_list))
         local_row_cols.append(cols_list)
         for c in cols_list:
             col_to_rows.setdefault(c, []).append(k)
@@ -417,6 +428,10 @@ def _build_sparse_fd_jacobian_mpi(
         except Exception:
             pass
         try:
+            P.setUp()
+        except Exception:
+            pass
+        try:
             P.setOption(PETSc.Mat.Option.NEW_NONZERO_ALLOCATION_ERR, True)
         except Exception:
             pass
@@ -424,10 +439,12 @@ def _build_sparse_fd_jacobian_mpi(
     cols_to_perturb = np.asarray(sorted(col_to_rows.keys()), dtype=PETSc.IntType)
     rows_global_list = rows_global
 
+    local_row_ids = rows_global_list.astype(np.int64) - int(rstart)
     u0_phys = _x_to_u_phys(x0)
-    r0_phys_global = residual_only(u0_phys, ctx)
-    r0_eval_global = _res_phys_to_eval(r0_phys_global)
-    r0_eval = r0_eval_global[rows_global_list]
+    r0_phys = residual_only_owned_rows(u0_phys, ctx, ownership_range)
+    if not np.all(np.isfinite(r0_phys)):
+        r0_phys = np.where(np.isfinite(r0_phys), r0_phys, 1.0e20)
+    r0_eval = _res_phys_to_eval(r0_phys[local_row_ids])
     if r0_eval.shape != (nloc,):
         raise ValueError(f"local residual shape {r0_eval.shape} does not match nloc {nloc}")
 
@@ -453,10 +470,45 @@ def _build_sparse_fd_jacobian_mpi(
             dx = eps
 
         x_work[j] = x0[j] + dx
+        if debug_fd and (not debug_fd_once or not debug_fd_logged):
+            try:
+                dx_inf = float(np.max(np.abs(x_work - x0)))
+                logger.warning(
+                    "[DBG][rank=%d] MFPC_FD eval: ||xpert-x||_inf=%.3e col=%d",
+                    myrank,
+                    dx_inf,
+                    j,
+                )
+                try:
+                    state_dbg = ctx.make_state_from_u(x_work)
+                    Yg = np.asarray(state_dbg.Yg, dtype=np.float64)
+                    cell_idx = 7
+                    if Yg.ndim == 2 and Yg.shape[1] > cell_idx:
+                        Y = Yg[:, cell_idx]
+                        s = float(np.sum(Y)) if Y.size else 0.0
+                        mn = float(np.min(Y)) if Y.size else 0.0
+                        mx = float(np.max(Y)) if Y.size else 0.0
+                        idx = np.argsort(-Y)[:3] if Y.size else np.array([], dtype=np.int64)
+                        top = [(int(i), float(Y[i])) for i in idx]
+                        logger.warning(
+                            "[DBG][rank=%d] MFPC_FD_EVAL Y@cell%d sum=%.6g min=%.3e max=%.3e top=%s",
+                            myrank,
+                            cell_idx,
+                            s,
+                            mn,
+                            mx,
+                            top,
+                        )
+                except Exception as exc:
+                    logger.warning("[DBG][rank=%d] MFPC_FD_EVAL Y debug failed: %r", myrank, exc)
+            except Exception as exc:
+                logger.warning("[DBG][rank=%d] MFPC_FD eval debug failed: %r", myrank, exc)
+            debug_fd_logged = True
         u1_phys = _x_to_u_phys(x_work)
-        r1_phys_global = residual_only(u1_phys, ctx)
-        r1_eval_global = _res_phys_to_eval(r1_phys_global)
-        r1_eval = r1_eval_global[rows_global_list]
+        r1_phys = residual_only_owned_rows(u1_phys, ctx, ownership_range)
+        if not np.all(np.isfinite(r1_phys)):
+            r1_phys = np.where(np.isfinite(r1_phys), r1_phys, 1.0e20)
+        r1_eval = _res_phys_to_eval(r1_phys[local_row_ids])
 
         dF_local = (r1_eval - r0_eval) / dx
         rows_sel = rows_global_list[iloc_list]

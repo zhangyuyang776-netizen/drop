@@ -5,13 +5,14 @@ Current status:
 - Uses build_transport_system with state_guess = ctx.make_state(u).
 - Material properties are recomputed from state_guess each residual evaluation.
 - Interface equilibrium (Yg_eq) is recomputed from state_guess when include_mpp is enabled.
-- All transport terms depend on props(state_guess); fallback to props_old on failure.
+- On compute_props failure, optionally sanitize Yg and retry; if still failing, return a penalty residual.
 - Defines F(u) = A(u) @ u - b(u).
 """
 
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -22,6 +23,59 @@ from properties.equilibrium import build_equilibrium_model, compute_interface_eq
 from solvers.nonlinear_context import NonlinearContext
 
 logger = logging.getLogger(__name__)
+
+_SANITIZE_Y = bool(int(os.environ.get("DROPLET_SANITIZE_Y", "1")))
+
+
+def _sanitize_mass_fractions(Y: np.ndarray, eps: float = 1.0e-30) -> np.ndarray:
+    Y = np.asarray(Y, dtype=np.float64)
+    Y = np.maximum(Y, 0.0)
+    s = float(np.sum(Y))
+    if s <= eps or not np.isfinite(s):
+        j = int(np.argmax(Y)) if np.any(Y > 0.0) else (Y.size - 1)
+        Y[:] = 0.0
+        Y[j] = 1.0
+        return Y
+    Y /= s
+    return Y
+
+
+def _sanitize_state_Yg(state: State) -> tuple[State, int]:
+    state_s = state.copy()
+    Yg = np.asarray(state_s.Yg, dtype=np.float64)
+    n_fix = 0
+    for ig in range(Yg.shape[1]):
+        y = Yg[:, ig]
+        s = float(np.sum(y))
+        miny = float(np.min(y)) if y.size else 0.0
+        if (not np.isfinite(s)) or s <= 0.0 or abs(s - 1.0) > 1.0e-8 or miny < -1.0e-12:
+            Yg[:, ig] = _sanitize_mass_fractions(y)
+            n_fix += 1
+    state_s.Yg = Yg
+    return state_s, n_fix
+
+
+def _penalty_residual(u: np.ndarray, layout, reason: Exception, *, scale: float = 1.0e8) -> tuple[np.ndarray, Dict[str, Any]]:
+    u = np.asarray(u, dtype=np.float64)
+    res = np.full_like(u, scale)
+    res_norm_2 = float(np.linalg.norm(res))
+    res_norm_inf = float(np.linalg.norm(res, ord=np.inf))
+    diag: Dict[str, Any] = {
+        "assembly": {"penalty": True, "error": str(reason)},
+        "residual_norm_2": res_norm_2,
+        "residual_norm_inf": res_norm_inf,
+        "u_min": float(np.min(u)) if u.size else np.nan,
+        "u_max": float(np.max(u)) if u.size else np.nan,
+        "props": {"source": "penalty", "error": str(reason)},
+    }
+    try:
+        if layout.has_block("Ts"):
+            diag["Ts_guess"] = float(u[layout.idx_Ts()])
+        if layout.has_block("Rd"):
+            diag["Rd_guess"] = float(u[layout.idx_Rd()])
+    except Exception:
+        pass
+    return res, diag
 
 
 def _build_molar_mass_from_cfg(names: list[str], Ns: int, mw_map: dict[str, float]) -> np.ndarray:
@@ -151,6 +205,8 @@ def build_transport_system_from_ctx(
     try:
         props, _props_extras = compute_props(cfg, grid, state_props)
     except Exception:
+        if os.environ.get("DROPLET_STRICT_PROPS", "0") == "1":
+            raise
         logger.exception("compute_props failed in residual_global; falling back to props_old.")
         props = props_old
 
@@ -270,15 +326,83 @@ def build_global_residual(
     if Ts_clamped:
         state_props.Ts = t_min_cfg
 
+    debug = os.environ.get("DROPLET_PETSC_DEBUG", "0") == "1"
+    debug_once = os.environ.get("DROPLET_PETSC_DEBUG_ONCE", "1") == "1"
+    strict_props = os.environ.get("DROPLET_STRICT_PROPS", "0") == "1"
+    debug_rank = -1
+    if debug:
+        try:
+            from mpi4py import MPI  # type: ignore
+
+            debug_rank = int(MPI.COMM_WORLD.Get_rank())
+        except Exception:
+            debug_rank = -1
+
+    def _dbg_log_Y(tag: str, state_dbg: State) -> None:
+        if not debug:
+            return
+        key = f"_dbg_y_{tag}"
+        if debug_once and ctx.meta.get(key):
+            return
+        ctx.meta[key] = True
+        try:
+            Yg = np.asarray(state_dbg.Yg, dtype=np.float64)
+            if Yg.ndim != 2:
+                logger.warning("[DBG][rank=%s] %s Yg shape=%r", debug_rank, tag, getattr(Yg, "shape", None))
+                return
+            cell_idx = 7
+            if Yg.shape[1] <= cell_idx:
+                logger.warning(
+                    "[DBG][rank=%s] %s Yg cell=%d out of range (ncell=%d)",
+                    debug_rank,
+                    tag,
+                    cell_idx,
+                    int(Yg.shape[1]),
+                )
+                return
+            Y = Yg[:, cell_idx]
+            s = float(np.sum(Y)) if Y.size else 0.0
+            mn = float(np.min(Y)) if Y.size else 0.0
+            mx = float(np.max(Y)) if Y.size else 0.0
+            idx = np.argsort(-Y)[:3] if Y.size else np.array([], dtype=np.int64)
+            top = [(int(i), float(Y[i])) for i in idx]
+            logger.warning(
+                "[DBG][rank=%s] %s Y@cell%d sum=%.6g min=%.3e max=%.3e top=%s",
+                debug_rank,
+                tag,
+                cell_idx,
+                s,
+                mn,
+                mx,
+                top,
+            )
+        except Exception as exc:
+            logger.warning("[DBG][rank=%s] %s Y debug failed: %r", debug_rank, tag, exc)
+
     props_source = "props_old"
     props_extras = None
     try:
+        _dbg_log_Y("AFTER_VEC2STATE_BEFORE_PROPS", state_props)
         props, props_extras = compute_props(cfg, grid, state_props)
         props_source = "state_guess_clamped" if (Tg_clamped or Tl_clamped or Ts_clamped) else "state_guess"
-    except Exception:
-        logger.exception("compute_props failed in residual_global; falling back to props_old.")
-        props = props_old
-        props_extras = None
+        _dbg_log_Y("AFTER_PROPS_AFTER_RESIDUAL", state_props)
+    except Exception as exc:
+        if strict_props:
+            raise
+        logger.exception("compute_props failed in residual_global; attempting sanitize+retry.")
+        if _SANITIZE_Y:
+            try:
+                state_sanitized, n_fix = _sanitize_state_Yg(state_props)
+                if n_fix:
+                    logger.warning("Sanitized Yg in %d gas cells for retry.", n_fix)
+                props, props_extras = compute_props(cfg, grid, state_sanitized)
+                props_source = "state_guess_sanitized"
+                _dbg_log_Y("AFTER_PROPS_SANITIZED", state_sanitized)
+            except Exception as exc2:
+                logger.exception("compute_props failed after sanitize retry.")
+                return _penalty_residual(u, layout, exc2)
+        else:
+            return _penalty_residual(u, layout, exc)
 
     eq_result = None
     eq_model = None
