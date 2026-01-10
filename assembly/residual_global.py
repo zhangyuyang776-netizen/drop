@@ -185,6 +185,15 @@ def build_transport_system_from_ctx(
     props_old = ctx.props_old
     dt = float(ctx.dt)
 
+    # Ensure ctx.meta exists and is a dict for debug bookkeeping
+    meta = getattr(ctx, "meta", None)
+    if meta is None or not isinstance(meta, dict):
+        meta = {}
+        try:
+            ctx.meta = meta
+        except Exception:
+            pass
+
     try:
         state_guess = ctx.make_state(u)
     except Exception as exc:
@@ -533,6 +542,8 @@ def build_global_residual(
         deltaY_raw = float(evap_diag.get("DeltaY_raw", np.nan))
         deltaY_eff = float(evap_diag.get("DeltaY_eff", np.nan))
         clamp_diag["no_condensation_applied"] = no_cond
+        clamp_diag["DeltaY_raw"] = deltaY_raw
+        clamp_diag["DeltaY_eff"] = deltaY_eff
         if np.isfinite(deltaY_raw) and np.isfinite(deltaY_eff):
             clamp_diag["deltaY_min_applied"] = abs(deltaY_eff) > abs(deltaY_raw)
     except Exception:
@@ -562,6 +573,35 @@ def build_global_residual(
             diag["Rd_guess"] = float(u[layout.idx_Rd()])
     except Exception:
         logger.debug("Failed to extract Ts/Rd from u for diagnostics.", exc_info=True)
+
+    if debug:
+        try:
+            key = "_dbg_residual_global_summary"
+            if (not debug_once) or (not meta.get(key)):
+                meta[key] = True
+                argmax = diag.get("residual_argmax", {}) or {}
+                clamp_info = diag.get("clamp", {}) or {}
+                logger.warning(
+                    "[DBG][rank=%s] residual_global: ||F||_inf=%.3e ||F||_2=%.3e "
+                    "u[min,max]=[%.3e, %.3e] props_src=%s eq_src=%s "
+                    "clamp=%s argmax={idx=%s, abs=%.3e, kind=%s, phase=%s, cell=%s, spec=%s}",
+                    debug_rank,
+                    res_norm_inf,
+                    res_norm_2,
+                    diag.get("u_min", np.nan),
+                    diag.get("u_max", np.nan),
+                    props_source,
+                    eq_source,
+                    {k: clamp_info.get(k) for k in sorted(clamp_info.keys())},
+                    argmax.get("idx"),
+                    argmax.get("abs", 0.0) or 0.0,
+                    argmax.get("kind", ""),
+                    argmax.get("phase", ""),
+                    argmax.get("cell", None),
+                    argmax.get("spec", None),
+                )
+        except Exception:
+            logger.debug("Failed to emit residual_global debug summary.", exc_info=True)
 
     return res, diag
 

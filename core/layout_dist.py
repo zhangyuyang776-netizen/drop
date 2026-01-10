@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+
+from parallel.mpi_bootstrap import bootstrap_mpi_before_petsc
+
+bootstrap_mpi_before_petsc()
+
 from petsc4py import PETSc
 
 
@@ -66,6 +71,10 @@ class LayoutDistributed:
     off_gas: int
     off_if: int
     N_total: int
+    local_size: int
+    global_size: int
+    ownership_range: Tuple[int, int]
+    ownership_ranges: Optional[Tuple[int, ...]]
 
     liq_xs: int
     liq_xm: int
@@ -90,8 +99,25 @@ class LayoutDistributed:
         n_if = int(mgr.n_if)
 
         Xg = mgr.dm.createGlobalVec()
-        r0, r1 = Xg.getOwnershipRange()
+        try:
+            r0, r1 = mgr.dm.getOwnershipRange()
+        except Exception:
+            r0, r1 = Xg.getOwnershipRange()
+        try:
+            global_size = int(mgr.dm.getGlobalSize())
+        except Exception:
+            global_size = int(Xg.getSize())
         N_total = int(Xg.getSize())
+        if global_size != N_total:
+            raise ValueError(
+                f"LayoutDistributed.build: DM global_size={global_size} != Vec size={N_total}."
+            )
+        ownership_range = (int(r0), int(r1))
+        local_size = int(r1 - r0)
+        try:
+            ownership_ranges = tuple(int(x) for x in Xg.getOwnershipRanges())
+        except Exception:
+            ownership_ranges = None
 
         vL = mgr.dm_liq.createGlobalVec()
         vG = mgr.dm_gas.createGlobalVec()
@@ -100,10 +126,15 @@ class LayoutDistributed:
         nloc_gas = int(vG.getLocalSize())
         nloc_if = int(vI.getLocalSize())
 
-        if int(r1 - r0) != (nloc_liq + nloc_gas + nloc_if):
+        if local_size != (nloc_liq + nloc_gas + nloc_if):
             raise RuntimeError(
-                f"DMComposite local size mismatch: total={int(r1 - r0)}, "
+                f"DMComposite local size mismatch: total={local_size}, "
                 f"liq={nloc_liq}, gas={nloc_gas}, if={nloc_if}"
+            )
+        layout_size = int(getattr(layout, "size", layout.n_dof()))
+        if global_size != layout_size:
+            raise ValueError(
+                f"LayoutDistributed.build: DM global_size={global_size} != layout.size={layout_size}."
             )
 
         off_liq = int(r0)
@@ -167,6 +198,10 @@ class LayoutDistributed:
             off_gas=off_gas,
             off_if=off_if,
             N_total=N_total,
+            local_size=local_size,
+            global_size=global_size,
+            ownership_range=ownership_range,
+            ownership_ranges=ownership_ranges,
             liq_xs=liq_xs,
             liq_xm=liq_xm,
             gas_xs=gas_xs,

@@ -14,7 +14,7 @@ Future extensions (not implemented here):
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import logging
 import os
@@ -37,6 +37,18 @@ logger = logging.getLogger(__name__)
 _SANITIZE_Y = bool(int(os.environ.get("DROPLET_SANITIZE_Y", "1")))
 _SANITIZE_Y_ONCE = bool(int(os.environ.get("DROPLET_SANITIZE_Y_ONCE", "1")))
 _SANITIZE_PRINTED: set[tuple[int, int]] = set()
+_CURRENT_GAS_PHASE: Optional[str] = None
+
+
+def set_gas_eval_phase(phase: Optional[str]) -> None:
+    """Set the current gas evaluation phase for debug logging."""
+    global _CURRENT_GAS_PHASE
+    _CURRENT_GAS_PHASE = phase
+
+
+def get_gas_eval_phase() -> Optional[str]:
+    """Get the current gas evaluation phase for debug logging."""
+    return _CURRENT_GAS_PHASE
 
 
 def _get_mpi_rank() -> int:
@@ -133,13 +145,15 @@ def compute_gas_props(
             key = (rank, int(ig))
             if (not _SANITIZE_Y_ONCE) or (key not in _SANITIZE_PRINTED):
                 _SANITIZE_PRINTED.add(key)
+                phase = get_gas_eval_phase()
                 y_for_sort = np.where(np.isfinite(Y_mech), Y_mech, -np.inf)
                 top_idx = np.argsort(-y_for_sort)[:3]
                 top = [(int(i), float(Y_mech[i])) for i in top_idx]
                 logger.warning(
-                    "[SANITIZE_Y][rank=%s][cell=%d] sum=%.6g min=%.3e max=%.3e top=%s",
+                    "[SANITIZE_Y][rank=%s][cell=%d][phase=%s] sum=%.6g min=%.3e max=%.3e top=%s",
                     rank,
                     ig,
+                    phase,
                     sY,
                     minY,
                     maxY,
@@ -182,7 +196,18 @@ def compute_gas_props(
         if not np.isfinite(rho_i) or rho_i <= 0.0:
             raise ValueError(f"Non-physical gas density at cell {ig}: {rho_i}")
         if not np.isfinite(cp_i) or cp_i <= 0.0:
-            raise ValueError(f"Non-physical gas cp at cell {ig}: {cp_i}")
+            raise ValueError(
+                "Non-physical gas cp at cell {ig}: cp={cp} T={T} P={P} "
+                "sumY={sumY} minY={minY} maxY={maxY}".format(
+                    ig=ig,
+                    cp=cp_i,
+                    T=T,
+                    P=P,
+                    sumY=sY,
+                    minY=minY,
+                    maxY=maxY,
+                )
+            )
         if not np.isfinite(k_i) or k_i <= 0.0:
             raise ValueError(f"Non-physical gas k at cell {ig}: {k_i}")
         if D_mech.shape != (Ns_mech,):

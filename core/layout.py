@@ -14,6 +14,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Set, Tuple
 
+import logging
+import os
 import numpy as np
 
 from .types import CaseConfig, Grid1D, State
@@ -24,6 +26,25 @@ ScaleVector = np.ndarray
 
 # Global unknown vector for Step 19 fully implicit Newton
 LAYOUT_VERSION = "step19-global-newton"
+
+logger = logging.getLogger(__name__)
+
+# Debug tag propagated from solver/FD to apply_u_to_state for attribution
+_APPLY_U_TAG: Optional[str] = None
+
+# Debug toggle for apply_u_to_state instrumentation
+APPLY_U_DEBUG = os.getenv("DROPLET_APPLY_U_DEBUG", "0") == "1"
+
+
+def set_apply_u_tag(tag: Optional[str]) -> None:
+    """Set a debug tag for subsequent apply_u_to_state calls (debug only)."""
+    global _APPLY_U_TAG
+    _APPLY_U_TAG = tag
+
+
+def get_apply_u_tag() -> Optional[str]:
+    """Get the current debug tag used by apply_u_to_state."""
+    return _APPLY_U_TAG
 
 
 @dataclass(slots=True)
@@ -710,6 +731,11 @@ def apply_u_to_state(
     Rd = float(state.Rd)
     mpp = float(state.mpp)
 
+    # Debug: track large values written to Yg
+    _debug_cell = 7
+    _debug_Yg_anomaly_threshold = 1.5  # Y value > 1.5 is clearly anomalous
+    tag = get_apply_u_tag()
+
     for entry in layout.entries:
         i = entry.i
         kind = entry.kind
@@ -719,6 +745,24 @@ def apply_u_to_state(
             ig = entry.cell
             k_red = entry.spec
             k_full = layout.gas_reduced_to_full_idx[k_red]
+            if APPLY_U_DEBUG and ig == _debug_cell and abs(val) > _debug_Yg_anomaly_threshold:
+                logger.warning(
+                    "[APPLY_U_DEBUG] Writing LARGE Yg value! tag=%s i=%d k_red=%d k_full=%d cell=%d val=%.6e u[i]=%.6e",
+                    tag, i, k_red, k_full, ig, val, u[i],
+                )
+                try:
+                    yg_slice = np.asarray(state.Yg[:, ig], dtype=np.float64).copy()
+                    logger.warning(
+                        "[APPLY_U_DEBUG] Yg[cell=%d] BEFORE assign (tag=%s): sum=%g min=%g max=%g vals=%s",
+                        ig,
+                        tag,
+                        float(yg_slice.sum()) if yg_slice.size else 0.0,
+                        float(yg_slice.min()) if yg_slice.size else 0.0,
+                        float(yg_slice.max()) if yg_slice.size else 0.0,
+                        np.array2string(yg_slice, precision=6, floatmode="maxprec"),
+                    )
+                except Exception:
+                    logger.warning("[APPLY_U_DEBUG] Yg slice dump failed (cell=%d, tag=%s)", ig, tag)
             Yg[k_full, ig] = val
         elif kind == "Tg":
             ig = entry.cell
@@ -740,6 +784,20 @@ def apply_u_to_state(
         else:
             raise ValueError(f"Unknown variable kind: {kind}")
 
+    # Debug: check Yg before closure reconstruction
+    if APPLY_U_DEBUG and Yg.ndim == 2 and Yg.shape[1] > _debug_cell:
+        Y_before = Yg[:, _debug_cell]
+        Y_sum_before = float(np.sum(Y_before))
+        if abs(Y_sum_before - 1.0) > 0.01:
+            logger.warning(
+                "[APPLY_U_DEBUG] Yg@cell%d BEFORE closure (tag=%s): sum=%.6g values=%s closure_idx=%s",
+                _debug_cell,
+                tag,
+                Y_sum_before,
+                Y_before.tolist(),
+                layout.gas_closure_index,
+            )
+
     if ("Yg" in layout.blocks) and (layout.gas_closure_index is not None):
         _reconstruct_closure(
             Y_full=Yg,
@@ -749,6 +807,20 @@ def apply_u_to_state(
             clip_negative=clip_negative_closure,
             phase="Gas",
         )
+
+    # Debug: check Yg after closure reconstruction
+    if APPLY_U_DEBUG and Yg.ndim == 2 and Yg.shape[1] > _debug_cell:
+        Y_after = Yg[:, _debug_cell]
+        Y_sum_after = float(np.sum(Y_after))
+        if abs(Y_sum_after - 1.0) > 0.01:
+            logger.warning(
+                "[APPLY_U_DEBUG] Yg@cell%d AFTER closure (tag=%s): sum=%.6g values=%s",
+                _debug_cell,
+                tag,
+                Y_sum_after,
+                Y_after.tolist(),
+            )
+
     if ("Yl" in layout.blocks) and (layout.liq_closure_index is not None):
         _reconstruct_closure(
             Y_full=Yl,

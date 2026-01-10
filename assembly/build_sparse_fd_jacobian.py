@@ -10,6 +10,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from core import layout as layout_mod
+from properties.gas import get_gas_eval_phase, set_gas_eval_phase
 from solvers.nonlinear_context import NonlinearContext
 from assembly.jacobian_pattern import JacobianPattern, build_jacobian_pattern
 from parallel.mpi_bootstrap import bootstrap_mpi_before_petsc
@@ -68,7 +70,10 @@ def _build_sparse_fd_jacobian_serial(
     comm=None,
 ) -> Tuple[Any, Dict[str, Any]]:
     """
-    Build sparse FD Jacobian in the scaled (eval) space using a coloring of the pattern.
+    Build sparse FD Jacobian using a coloring of the pattern.
+
+    The x/residual spaces follow ctx.meta["petsc_x_space"] and ["petsc_f_space"].
+    Defaults are physical/physical to align PETSc/FD semantics.
     """
     if PETSc is None:
         PETSc = _get_petsc()
@@ -83,21 +88,50 @@ def _build_sparse_fd_jacobian_serial(
         raise ValueError(f"scale_u shape {scale_u.shape} does not match x0 {x0.shape}")
     scale_u_safe = np.where(scale_u > 0.0, scale_u, 1.0)
 
-    scale_F = np.asarray(ctx.meta.get("residual_scale_F", np.ones_like(x0)), dtype=np.float64)
+    meta = getattr(ctx, "meta", None)
+    if meta is None or not isinstance(meta, dict):
+        meta = {}
+
+    scale_F = np.asarray(meta.get("residual_scale_F", np.ones_like(x0)), dtype=np.float64)
     if scale_F.shape != x0.shape:
         raise ValueError(f"residual_scale_F shape {scale_F.shape} does not match x0 {x0.shape}")
     scale_F_safe = np.where(scale_F > 0.0, scale_F, 1.0)
+    x_space = str(meta.get("petsc_x_space", "physical")).lower()
+    f_space = str(meta.get("petsc_f_space", "physical")).lower()
+    petsc_cfg = getattr(ctx.cfg, "petsc", None)
+    fd_jac_min_col_norm = float(getattr(petsc_cfg, "fd_jac_min_col_norm", 0.0)) if petsc_cfg else 0.0
+    fd_jac_diag_damping = float(getattr(petsc_cfg, "fd_jac_diag_damping", 1.0)) if petsc_cfg else 1.0
+    debug_fd_col = os.environ.get("DROPLET_FD_J_DEBUG_COL", "0") == "1"
 
     from assembly.residual_global import residual_only
 
     def _x_to_u_phys(x_arr: np.ndarray) -> np.ndarray:
-        return x_arr * scale_u_safe
+        if x_space in ("physical", "phys", "unscaled"):
+            return x_arr
+        if x_space in ("scaled", "eval"):
+            return x_arr * scale_u_safe
+        raise ValueError(f"Unknown petsc_x_space={x_space!r}")
 
     def _res_phys_to_eval(res_phys: np.ndarray) -> np.ndarray:
-        return res_phys / scale_F_safe
+        if f_space in ("physical", "phys", "unscaled"):
+            return res_phys
+        if f_space in ("scaled", "eval"):
+            return res_phys / scale_F_safe
+        raise ValueError(f"Unknown petsc_f_space={f_space!r}")
+
+    def _residual_with_phase(u_phys: np.ndarray, phase: str) -> np.ndarray:
+        prev_phase = get_gas_eval_phase()
+        prev_tag = layout_mod.get_apply_u_tag()
+        set_gas_eval_phase(phase)
+        layout_mod.set_apply_u_tag(phase)
+        try:
+            return residual_only(u_phys, ctx)
+        finally:
+            layout_mod.set_apply_u_tag(prev_tag)
+            set_gas_eval_phase(prev_phase)
 
     u0_phys = _x_to_u_phys(x0)
-    r0_phys = residual_only(u0_phys, ctx)
+    r0_phys = _residual_with_phase(u0_phys, "MFPC_FD_base")
     if not np.all(np.isfinite(r0_phys)):
         r0_phys = np.where(np.isfinite(r0_phys), r0_phys, 1.0e20)
     r0_eval = _res_phys_to_eval(r0_phys)
@@ -153,6 +187,10 @@ def _build_sparse_fd_jacobian_serial(
 
     n_fd_calls = 0
     x_work = x0.copy()
+    col_norm_min = np.inf
+    col_norm_max = 0.0
+    col_count = 0
+    suspicious_cols: List[Dict[str, Any]] = []
 
     for color_idx, cols_in_color in enumerate(groups):
         if not cols_in_color:
@@ -167,7 +205,11 @@ def _build_sparse_fd_jacobian_serial(
             dx_by_col[j] = dx
 
         u_phys = _x_to_u_phys(x_work)
-        r_phys = residual_only(u_phys, ctx)
+        if len(cols_in_color) == 1:
+            phase = f"MFPC_FD_col_{cols_in_color[0]}"
+        else:
+            phase = "MFPC_FD_cols_" + "_".join(str(c) for c in cols_in_color)
+        r_phys = _residual_with_phase(u_phys, phase)
         if not np.all(np.isfinite(r_phys)):
             r_phys = np.where(np.isfinite(r_phys), r_phys, 1.0e20)
         r_eval = _res_phys_to_eval(r_phys)
@@ -179,10 +221,36 @@ def _build_sparse_fd_jacobian_serial(
             if not rows:
                 continue
             dx = dx_by_col[j]
-            vals = diff[rows] / dx
-            for row, val in zip(rows, vals):
-                if drop_tol > 0.0 and abs(val) < drop_tol:
-                    continue
+            rows_arr = np.asarray(rows, dtype=np.int64)
+            vals = diff[rows_arr] / dx
+            if drop_tol > 0.0:
+                mask = np.abs(vals) >= drop_tol
+                rows_use = rows_arr[mask]
+                vals_use = vals[mask]
+            else:
+                rows_use = rows_arr
+                vals_use = vals
+
+            nnz_col = int(vals_use.size)
+            col_norm_inf = float(np.max(np.abs(vals_use))) if nnz_col else 0.0
+            col_count += 1
+            col_norm_min = min(col_norm_min, col_norm_inf)
+            col_norm_max = max(col_norm_max, col_norm_inf)
+
+            if fd_jac_min_col_norm > 0.0 and col_norm_inf < fd_jac_min_col_norm:
+                suspicious_cols.append({"col": int(j), "norm_inf": col_norm_inf, "nnz": nnz_col})
+                if debug_fd_col:
+                    logger.warning(
+                        "[FD_J_DEBUG][rank=%d] column i=%d looks nearly zero: ||col||_inf=%.3e nnz=%d",
+                        int(comm.getRank()),
+                        int(j),
+                        col_norm_inf,
+                        nnz_col,
+                    )
+                if fd_jac_diag_damping > 0.0:
+                    P.setValue(int(j), int(j), float(fd_jac_diag_damping), addv=True)
+
+            for row, val in zip(rows_use, vals_use):
                 P.setValue(int(row), int(j), float(val), addv=False)
 
         for j in cols_in_color:
@@ -206,6 +274,15 @@ def _build_sparse_fd_jacobian_serial(
         "eps": float(eps),
         "drop_tol": float(drop_tol),
         "pattern_nnz": int(indices.size),
+    }
+    stats["fd_jacobian_stats"] = {
+        "n_cols": int(col_count),
+        "col_norm_min": float(col_norm_min) if col_count else None,
+        "col_norm_max": float(col_norm_max) if col_count else None,
+        "n_suspicious_cols": int(len(suspicious_cols)),
+        "suspicious_cols": list(suspicious_cols),
+        "min_col_norm": float(fd_jac_min_col_norm),
+        "diag_damping": float(fd_jac_diag_damping),
     }
     return P, stats
 
@@ -234,91 +311,193 @@ def _build_sparse_fd_jacobian_mpi(
     if N == 0:
         raise ValueError("x0 must be non-empty for MPI Jacobian build.")
 
-    from assembly.jacobian_pattern_dist import build_jacobian_pattern_local
-    from assembly.residual_global import residual_only_owned_rows
+    scale_u = np.asarray(ctx.scale_u, dtype=np.float64)
+    if scale_u.shape != x0.shape:
+        raise ValueError(f"scale_u shape {scale_u.shape} does not match x0 {x0.shape}")
+    scale_u_safe = np.where(scale_u > 0.0, scale_u, 1.0)
+
+    meta = getattr(ctx, "meta", None)
+    if meta is None or not isinstance(meta, dict):
+        meta = {}
+    scale_F = np.asarray(meta.get("residual_scale_F", np.ones_like(x0)), dtype=np.float64)
+    if scale_F.shape != x0.shape:
+        raise ValueError(f"residual_scale_F shape {scale_F.shape} does not match x0 {x0.shape}")
+    scale_F_safe = np.where(scale_F > 0.0, scale_F, 1.0)
+    x_space = str(meta.get("petsc_x_space", "physical")).lower()
+    f_space = str(meta.get("petsc_f_space", "physical")).lower()
+
+    from assembly.jacobian_pattern_dist import LocalJacPattern
+    from assembly.residual_global import residual_only
+    from assembly.residual_local import ResidualLocalCtx, pack_local_to_layout
+    from parallel.dm_manager import global_to_local
+
+    dm_mgr = meta.get("dm_manager") or meta.get("dm_mgr") or getattr(ctx, "dm_manager", None)
+    ld = meta.get("layout_dist") or meta.get("ld") or getattr(ctx, "layout_dist", None)
+    if dm_mgr is None or ld is None:
+        raise RuntimeError(
+            "[FD Jacobian] MPI mapping requires ctx.meta['dm_manager'] and ctx.meta['layout_dist']."
+        )
+
+    def _build_perm_l2d_d2l() -> Tuple[np.ndarray, np.ndarray]:
+        Xg_gid = dm_mgr.dm.createGlobalVec()
+        try:
+            dm_rstart, dm_rend = Xg_gid.getOwnershipRange()
+            dm_rstart = int(dm_rstart)
+            dm_rend = int(dm_rend)
+            try:
+                x_view = Xg_gid.getArray()
+                x_view[:] = np.arange(dm_rstart, dm_rend, dtype=np.float64) + 1.0
+            finally:
+                try:
+                    Xg_gid.restoreArray()
+                except Exception:
+                    pass
+
+            Xl_liq, Xl_gas, Xl_if = global_to_local(dm_mgr, Xg_gid)
+            aXl_liq = dm_mgr.dm_liq.getVecArray(Xl_liq)
+            aXl_gas = dm_mgr.dm_gas.getVecArray(Xl_gas)
+            aXl_if = Xl_if.getArray()
+
+            ctx_local = ResidualLocalCtx(layout=ctx.layout, ld=ld)
+            u_layout_gid = pack_local_to_layout(
+                ctx_local,
+                aXl_liq,
+                aXl_gas,
+                aXl_if,
+                rank=int(comm.getRank()),
+            )
+        finally:
+            try:
+                Xg_gid.destroy()
+            except Exception:
+                pass
+            try:
+                Xl_liq.destroy()
+            except Exception:
+                pass
+            try:
+                Xl_gas.destroy()
+            except Exception:
+                pass
+            try:
+                Xl_if.destroy()
+            except Exception:
+                pass
+
+        mask = u_layout_gid != 0.0
+        layout_idx_local = np.nonzero(mask)[0].astype(np.int64)
+        dm_gid_local = (u_layout_gid[mask] - 1.0).astype(np.int64)
+
+        try:
+            from mpi4py import MPI  # type: ignore
+
+            mpicomm = comm.tompi4py()
+        except Exception as exc:
+            raise RuntimeError("mpi4py is required to build MPI layout/DM permutation.") from exc
+
+        all_layout = mpicomm.allgather(layout_idx_local)
+        all_dm = mpicomm.allgather(dm_gid_local)
+
+        perm_l2d = None
+        perm_d2l = None
+        if mpicomm.rank == 0:
+            perm_l2d = np.full(N, -1, dtype=np.int64)
+            for li, di in zip(all_layout, all_dm):
+                if li.size:
+                    perm_l2d[li] = di
+            if np.any(perm_l2d < 0):
+                raise RuntimeError("[FD Jacobian] failed to build full layout->DM permutation.")
+            perm_d2l = np.empty_like(perm_l2d)
+            perm_d2l[perm_l2d] = np.arange(N, dtype=np.int64)
+            if not np.array_equal(perm_d2l[perm_l2d], np.arange(N, dtype=np.int64)):
+                raise RuntimeError("[FD Jacobian] perm_d2l is not the inverse of perm_l2d.")
+            if not np.array_equal(perm_l2d[perm_d2l], np.arange(N, dtype=np.int64)):
+                raise RuntimeError("[FD Jacobian] perm_l2d is not the inverse of perm_d2l.")
+
+        perm_l2d = mpicomm.bcast(perm_l2d, root=0)
+        perm_d2l = mpicomm.bcast(perm_d2l, root=0)
+        return perm_l2d, perm_d2l
 
     def _x_to_u_phys(x_arr: np.ndarray) -> np.ndarray:
-        """
-        并行 PETSc 后端：x0 就是物理 unknown（layout 向量），不做缩放。
-        """
-        return x_arr
+        if x_space in ("physical", "phys", "unscaled"):
+            return x_arr
+        if x_space in ("scaled", "eval"):
+            return x_arr * scale_u_safe
+        raise ValueError(f"Unknown petsc_x_space={x_space!r}")
 
-    def _res_phys_to_eval(res_phys: np.ndarray) -> np.ndarray:
-        """
-        并行 PETSc 后端：在物理残差空间工作，不做 residual_scale_F 缩放。
-        这里只做 NaN/Inf 防护。
-        """
-        if not np.all(np.isfinite(res_phys)):
-            res_phys = np.where(np.isfinite(res_phys), res_phys, 1.0e20)
-        return res_phys
-
+    def _res_phys_to_eval_local(res_phys_rows: np.ndarray, row_ids_global: np.ndarray) -> np.ndarray:
+        if not np.all(np.isfinite(res_phys_rows)):
+            res_phys_rows = np.where(np.isfinite(res_phys_rows), res_phys_rows, 1.0e20)
+        if f_space in ("physical", "phys", "unscaled"):
+            return res_phys_rows
+        if f_space in ("scaled", "eval"):
+            return _res_phys_to_eval_rows(res_phys_rows, scale_F_safe, row_ids_global)
+        raise ValueError(f"Unknown petsc_f_space={f_space!r}")
 
     def _get_ownership_info(mat_local=None) -> Tuple[Tuple[int, int], np.ndarray]:
+        """
+        Resolve ownership range from LayoutDistributed or DM only.
+
+        Do not fallback to a default Vec partition, which can mask partition/mapping bugs.
+        """
+        meta = getattr(ctx, "meta", None)
+        if meta is None or not isinstance(meta, dict):
+            meta = {}
+        ld = meta.get("layout_dist") or meta.get("ld") or getattr(ctx, "layout_dist", None)
+        dm_ctx = meta.get("dm") or getattr(ctx, "dm", None)
+
         rstart = None
         rend = None
         ranges = None
 
-        if mat_local is not None:
-            try:
-                rstart, rend = mat_local.getOwnershipRange()
-            except Exception:
-                rstart, rend = None, None
-            try:
-                ranges = mat_local.getOwnershipRanges()
-            except Exception:
-                ranges = None
-
-            if ranges is None:
-                vec = None
+        if ld is not None and getattr(ld, "ownership_range", None) is not None:
+            rstart, rend = (int(x) for x in ld.ownership_range)
+            ranges = getattr(ld, "ownership_ranges", None)
+            ld_size = getattr(ld, "global_size", getattr(ld, "N_total", N))
+            if int(ld_size) != N:
+                raise RuntimeError(
+                    f"[FD Jacobian] global_size mismatch: ld={int(ld_size)} N={N}"
+                )
+            if ranges is None and dm_ctx is not None:
+                vec = dm_ctx.createGlobalVec()
                 try:
-                    if hasattr(mat_local, "getVecs"):
-                        vec, _ = mat_local.getVecs()
-                    elif hasattr(mat_local, "createVecs"):
-                        vec, _ = mat_local.createVecs()
-                except Exception:
-                    vec = None
-                if vec is not None:
-                    try:
-                        ranges = get_global_ownership_ranges_from_vec(vec)
-                        if rstart is None or rend is None:
-                            rstart, rend = vec.getOwnershipRange()
-                    finally:
-                        try:
-                            vec.destroy()
-                        except Exception:
-                            pass
-
-        if ranges is None or rstart is None or rend is None:
-            dm_ctx = None
-            try:
-                dm_ctx = ctx.meta.get("dm", None)
-            except Exception:
-                dm_ctx = None
-            if dm_ctx is None:
-                dm_ctx = getattr(ctx, "dm", None)
-            if dm_ctx is not None:
-                vec = None
-                try:
-                    vec = dm_ctx.createGlobalVec()
-                    rstart, rend = vec.getOwnershipRange()
                     ranges = get_global_ownership_ranges_from_vec(vec)
+                finally:
+                    try:
+                        vec.destroy()
+                    except Exception:
+                        pass
+        elif dm_ctx is not None:
+            vec = dm_ctx.createGlobalVec()
+            try:
+                rstart, rend = vec.getOwnershipRange()
+                if int(vec.getSize()) != N:
+                    raise RuntimeError(f"[FD Jacobian] DM Vec size mismatch: vec={vec.getSize()} N={N}")
+                ranges = get_global_ownership_ranges_from_vec(vec)
+            finally:
+                try:
+                    vec.destroy()
                 except Exception:
                     pass
-                finally:
-                    if vec is not None:
-                        try:
-                            vec.destroy()
-                        except Exception:
-                            pass
+        else:
+            raise RuntimeError(
+                "[FD Jacobian] cannot determine ownership_range: ctx.meta lacks 'layout_dist' and 'dm'. "
+                "Refusing default partition fallback."
+            )
 
-        if ranges is None or rstart is None or rend is None:
-            tmp = PETSc.Vec().create(comm=comm)
-            tmp.setSizes(N)
-            tmp.setFromOptions()
-            tmp.setUp()
-            rstart, rend = tmp.getOwnershipRange()
-            ranges = get_global_ownership_ranges_from_vec(tmp)
-            tmp.destroy()
+        if rstart is None or rend is None:
+            raise RuntimeError("[FD Jacobian] failed to resolve ownership_range from DM/LD.")
+        if ranges is None:
+            raise RuntimeError("[FD Jacobian] failed to resolve ownership_ranges from DM/LD.")
+
+        if mat_local is not None:
+            mrstart, mrend = mat_local.getOwnershipRange()
+            if (int(mrstart), int(mrend)) != (int(rstart), int(rend)):
+                raise RuntimeError(
+                    f"[FD Jacobian] Mat ownership_range {(int(mrstart), int(mrend))} "
+                    f"!= DM/LD ownership_range {(int(rstart), int(rend))}. "
+                    "Create matrices with the DM partition."
+                )
 
         return (int(rstart), int(rend)), ranges
 
@@ -326,26 +505,69 @@ def _build_sparse_fd_jacobian_mpi(
     rstart, rend = ownership_range
     n_owned = int(rend - rstart)
 
-    local_pattern = build_jacobian_pattern_local(
-        ctx.cfg,
-        ctx.grid_ref,
-        ctx.layout,
-        ownership_range=ownership_range,
-    )
-    rows_global = np.asarray(local_pattern.rows_global, dtype=PETSc.IntType)
-    indices = np.asarray(local_pattern.indices, dtype=PETSc.IntType)
-    indptr = np.asarray(local_pattern.indptr, dtype=np.int64)
-    nloc = int(rows_global.size)
-    if rows_global.size:
-        rmin = int(rows_global.min())
-        rmax = int(rows_global.max())
-        if rmin < rstart or rmax >= rend:
-            raise RuntimeError(
-                "[FD Jacobian] pattern rows not local: "
-                f"min={rmin}, max={rmax}, ownership=[{rstart}, {rend})"
-            )
+    perm_l2d, perm_d2l = _build_perm_l2d_d2l()
+    rows_layout = perm_d2l[rstart:rend].astype(np.int64, copy=False)
+    rows_global_dm = np.arange(rstart, rend, dtype=PETSc.IntType)
+    if rows_layout.size != n_owned:
+        raise RuntimeError(
+            f"[FD Jacobian] layout row count {rows_layout.size} != owned rows {n_owned}."
+        )
+    if rows_layout.size and (rows_layout.min() < 0 or rows_layout.max() >= N):
+        raise RuntimeError("[FD Jacobian] layout rows out of bounds for permutation.")
 
-    if nloc == 0 or indices.size == 0:
+    def _residual_owned_with_phase(u_phys: np.ndarray, phase: str) -> np.ndarray:
+        prev_phase = get_gas_eval_phase()
+        prev_tag = layout_mod.get_apply_u_tag()
+        set_gas_eval_phase(phase)
+        layout_mod.set_apply_u_tag(phase)
+        try:
+            r_full = residual_only(u_phys, ctx)
+            return r_full[rows_layout]
+        finally:
+            layout_mod.set_apply_u_tag(prev_tag)
+            set_gas_eval_phase(prev_phase)
+
+    pattern_global = build_jacobian_pattern(ctx.cfg, ctx.grid_ref, ctx.layout)
+    indptr_global = np.asarray(pattern_global.indptr, dtype=np.int64)
+    indices_global = np.asarray(pattern_global.indices, dtype=np.int64)
+    nloc = int(rows_layout.size)
+
+    if nloc == 0:
+        indptr = np.zeros(1, dtype=np.int64)
+        indices_layout = np.zeros(0, dtype=np.int64)
+    else:
+        indptr = np.zeros(nloc + 1, dtype=np.int64)
+        indices_list: List[int] = []
+        for k, row_l in enumerate(rows_layout):
+            start = int(indptr_global[row_l])
+            end = int(indptr_global[row_l + 1])
+            cols = indices_global[start:end]
+            cols_list = [int(c) for c in cols]
+            if int(row_l) not in cols_list:
+                cols_list.append(int(row_l))
+            cols_list = sorted(set(cols_list))
+            indices_list.extend(cols_list)
+            indptr[k + 1] = len(indices_list)
+        indices_layout = np.asarray(indices_list, dtype=np.int64)
+
+    indices_dm = perm_l2d[indices_layout] if indices_layout.size else np.zeros(0, dtype=np.int64)
+    nnz_total_local = int(indices_layout.size)
+    nnz_max_row = int((indptr[1:] - indptr[:-1]).max()) if nloc > 0 else 0
+    nnz_avg = float(nnz_total_local) / float(nloc) if nloc > 0 else 0.0
+    pattern_local = LocalJacPattern(
+        rows_global=rows_global_dm.astype(PETSc.IntType, copy=False),
+        indptr=indptr.astype(np.int64, copy=False),
+        indices=indices_dm.astype(PETSc.IntType, copy=False),
+        shape=(N, N),
+        meta={
+            "nnz_total": float(nnz_total_local),
+            "nnz_avg": float(nnz_avg),
+            "nnz_max_row": float(nnz_max_row),
+            "n_local_rows": float(nloc),
+        },
+    )
+
+    if nloc == 0 or indices_layout.size == 0:
         if mat is None:
             P = PETSc.Mat().createAIJ(size=((n_owned, N), (n_owned, N)), comm=comm)
             try:
@@ -371,13 +593,13 @@ def _build_sparse_fd_jacobian_mpi(
             "shape": (N, N),
             "eps": float(eps),
             "drop_tol": float(drop_tol),
-            "pattern_nnz_local": int(indices.size),
+            "pattern_nnz_local": int(indices_layout.size),
             "prealloc_nnz_local": 0,
             "cols_to_perturb": [],
             "ownership_range": ownership_range,
             "mpi_size": int(comm.getSize()),
             "max_diag_abs_local": 0.0,
-            "pattern_local": local_pattern,
+            "pattern_local": pattern_local,
         }
         return P, stats
 
@@ -386,25 +608,32 @@ def _build_sparse_fd_jacobian_mpi(
     debug_fd = os.environ.get("DROPLET_PETSC_DEBUG", "0") == "1"
     debug_fd_once = os.environ.get("DROPLET_PETSC_DEBUG_ONCE", "1") == "1"
     debug_fd_logged = False
+    debug_fd_col = os.environ.get("DROPLET_FD_J_DEBUG_COL", "0") == "1"
+    petsc_cfg = getattr(ctx.cfg, "petsc", None)
+    fd_jac_min_col_norm = float(getattr(petsc_cfg, "fd_jac_min_col_norm", 0.0)) if petsc_cfg else 0.0
+    fd_jac_diag_damping = float(getattr(petsc_cfg, "fd_jac_diag_damping", 1.0)) if petsc_cfg else 1.0
 
-    local_row_cols: List[List[int]] = []
+    local_row_cols_layout: List[List[int]] = []
+    local_row_cols_dm: List[List[int]] = []
     col_to_rows: Dict[int, List[int]] = {}
     for k in range(nloc):
         start = int(indptr[k])
         end = int(indptr[k + 1])
-        cols = indices[start:end]
-        gi = int(rows_global[k])
+        cols = indices_layout[start:end]
+        row_l = int(rows_layout[k])
         cols_list = [int(c) for c in cols]
-        if gi not in cols_list:
-            cols_list.append(gi)
+        if row_l not in cols_list:
+            cols_list.append(row_l)
         cols_list = sorted(set(cols_list))
-        local_row_cols.append(cols_list)
+        local_row_cols_layout.append(cols_list)
         for c in cols_list:
             col_to_rows.setdefault(c, []).append(k)
+        cols_dm = perm_l2d[np.asarray(cols_list, dtype=np.int64)]
+        local_row_cols_dm.append([int(c) for c in cols_dm])
 
     d_nz, o_nz = count_diag_off_nnz_for_local_rows(
-        local_rows_global=rows_global,
-        local_row_cols=local_row_cols,
+        local_rows_global=rows_global_dm,
+        local_row_cols=local_row_cols_dm,
         owner_map=owner_map,
         myrank=myrank,
         ownership_range=ownership_range,
@@ -437,14 +666,35 @@ def _build_sparse_fd_jacobian_mpi(
             pass
 
     cols_to_perturb = np.asarray(sorted(col_to_rows.keys()), dtype=PETSc.IntType)
-    rows_global_list = rows_global
-
-    local_row_ids = rows_global_list.astype(np.int64) - int(rstart)
+    rows_global_list = rows_global_dm
     u0_phys = _x_to_u_phys(x0)
-    r0_phys = residual_only_owned_rows(u0_phys, ctx, ownership_range)
+    r0_phys = _residual_owned_with_phase(u0_phys, "MFPC_FD_base")
+    if debug_fd:
+        try:
+            meta = getattr(ctx, "meta", None)
+            if meta is None or not isinstance(meta, dict):
+                meta = {}
+                try:
+                    ctx.meta = meta
+                except Exception:
+                    pass
+            key = "_dbg_mfpc_fd_base"
+            if (not debug_fd_once) or (not meta.get(key)):
+                meta[key] = True
+                r0_inf = float(np.linalg.norm(r0_phys, ord=np.inf)) if r0_phys.size else 0.0
+                r0_2 = float(np.linalg.norm(r0_phys)) if r0_phys.size else 0.0
+                logger.warning(
+                    "[DBG][rank=%d] MFPC_FD_base residual: ||F||_inf=%.3e ||F||_2=%.3e nloc=%d",
+                    myrank,
+                    r0_inf,
+                    r0_2,
+                    int(r0_phys.size),
+                )
+        except Exception:
+            logger.debug("MFPC_FD_base debug logging failed.", exc_info=True)
     if not np.all(np.isfinite(r0_phys)):
         r0_phys = np.where(np.isfinite(r0_phys), r0_phys, 1.0e20)
-    r0_eval = _res_phys_to_eval(r0_phys[local_row_ids])
+    r0_eval = _res_phys_to_eval_local(r0_phys, rows_layout)
     if r0_eval.shape != (nloc,):
         raise ValueError(f"local residual shape {r0_eval.shape} does not match nloc {nloc}")
 
@@ -460,55 +710,85 @@ def _build_sparse_fd_jacobian_mpi(
                 f"[{rmin}, {rmax}] with ownership [{rstart}, {rend})"
             )
     n_fd_calls = 0
+    # Enhanced debug: track which column caused Y anomaly
+    debug_fd_track_Y_anomaly = os.environ.get("DROPLET_FD_TRACK_Y_ANOMALY", "0") == "1"
+    debug_fd_max_logs = int(os.environ.get("DROPLET_FD_MAX_LOGS", "50"))
+    debug_fd_log_count = 0
+    col_norm_min = np.inf
+    col_norm_max = 0.0
+    col_count = 0
+    suspicious_cols: List[Dict[str, Any]] = []
+
+    def _get_var_info(col_idx: int) -> str:
+        """Get variable type and cell/species info for a column index."""
+        layout = ctx.layout
+        entries = getattr(layout, "entries", [])
+        if col_idx < len(entries):
+            e = entries[col_idx]
+            return f"{e.kind}[cell={e.cell},spec={e.spec}]"
+        return f"unknown[{col_idx}]"
+
     for j in cols_to_perturb:
         j = int(j)
         iloc_list = col_to_rows.get(j)
         if not iloc_list:
             continue
+        col_dm = int(perm_l2d[j])
         dx = eps * (1.0 + abs(x0[j]))
         if dx == 0.0:
             dx = eps
 
         x_work[j] = x0[j] + dx
-        if debug_fd and (not debug_fd_once or not debug_fd_logged):
+
+        # Enhanced debug logging
+        should_log = debug_fd and (not debug_fd_once or not debug_fd_logged)
+        if should_log or debug_fd_track_Y_anomaly:
             try:
-                dx_inf = float(np.max(np.abs(x_work - x0)))
-                logger.warning(
-                    "[DBG][rank=%d] MFPC_FD eval: ||xpert-x||_inf=%.3e col=%d",
-                    myrank,
-                    dx_inf,
-                    j,
-                )
-                try:
-                    state_dbg = ctx.make_state_from_u(x_work)
-                    Yg = np.asarray(state_dbg.Yg, dtype=np.float64)
-                    cell_idx = 7
+                u_dbg = _x_to_u_phys(x_work)
+                state_dbg = ctx.make_state_from_u(u_dbg)
+                Yg = np.asarray(state_dbg.Yg, dtype=np.float64)
+                cell_idx = 7
+                Y_sum = 0.0
+                Y_anomaly = False
+                if Yg.ndim == 2 and Yg.shape[1] > cell_idx:
+                    Y = Yg[:, cell_idx]
+                    Y_sum = float(np.sum(Y)) if Y.size else 0.0
+                    Y_anomaly = abs(Y_sum - 1.0) > 0.01  # Y sum deviates from 1.0
+
+                if should_log or (debug_fd_track_Y_anomaly and Y_anomaly and debug_fd_log_count < debug_fd_max_logs):
+                    var_info = _get_var_info(j)
+                    logger.warning(
+                        "[DBG][rank=%d] MFPC_FD col=%d (%s): x0=%.6e dx=%.3e x_pert=%.6e",
+                        myrank, j, var_info, float(x0[j]), dx, float(x_work[j]),
+                    )
                     if Yg.ndim == 2 and Yg.shape[1] > cell_idx:
                         Y = Yg[:, cell_idx]
-                        s = float(np.sum(Y)) if Y.size else 0.0
                         mn = float(np.min(Y)) if Y.size else 0.0
                         mx = float(np.max(Y)) if Y.size else 0.0
                         idx = np.argsort(-Y)[:3] if Y.size else np.array([], dtype=np.int64)
                         top = [(int(i), float(Y[i])) for i in idx]
                         logger.warning(
                             "[DBG][rank=%d] MFPC_FD_EVAL Y@cell%d sum=%.6g min=%.3e max=%.3e top=%s",
-                            myrank,
-                            cell_idx,
-                            s,
-                            mn,
-                            mx,
-                            top,
+                            myrank, cell_idx, Y_sum, mn, mx, top,
                         )
-                except Exception as exc:
-                    logger.warning("[DBG][rank=%d] MFPC_FD_EVAL Y debug failed: %r", myrank, exc)
+                        if Y_anomaly:
+                            # Print more detailed info for anomaly
+                            logger.warning(
+                                "[DBG][rank=%d] Y_ANOMALY at col=%d! Printing full Y: %s",
+                                myrank, j, Y.tolist(),
+                            )
+                    debug_fd_log_count += 1
             except Exception as exc:
-                logger.warning("[DBG][rank=%d] MFPC_FD eval debug failed: %r", myrank, exc)
-            debug_fd_logged = True
+                if should_log:
+                    logger.warning("[DBG][rank=%d] MFPC_FD eval debug failed: %r", myrank, exc)
+            if should_log:
+                debug_fd_logged = True
         u1_phys = _x_to_u_phys(x_work)
-        r1_phys = residual_only_owned_rows(u1_phys, ctx, ownership_range)
+        phase = f"MFPC_FD_col_{j}"
+        r1_phys = _residual_owned_with_phase(u1_phys, phase)
         if not np.all(np.isfinite(r1_phys)):
             r1_phys = np.where(np.isfinite(r1_phys), r1_phys, 1.0e20)
-        r1_eval = _res_phys_to_eval(r1_phys[local_row_ids])
+        r1_eval = _res_phys_to_eval_local(r1_phys, rows_layout)
 
         dF_local = (r1_eval - r0_eval) / dx
         rows_sel = rows_global_list[iloc_list]
@@ -516,23 +796,38 @@ def _build_sparse_fd_jacobian_mpi(
 
         if drop_tol > 0.0:
             mask = np.abs(vals_sel) >= drop_tol
-            if np.any(mask):
-                rows_use = rows_sel[mask]
-                _assert_local_rows(rows_use)
-                _mat_setvalues_local(
-                    P,
-                    rows_use,
-                    np.asarray([j], dtype=PETSc.IntType),
-                    vals_sel[mask].reshape(-1, 1),
-                    addv=False,
-                )
+            rows_use = rows_sel[mask]
+            vals_use = vals_sel[mask]
         else:
-            _assert_local_rows(rows_sel)
+            rows_use = rows_sel
+            vals_use = vals_sel
+
+        nnz_col = int(vals_use.size)
+        col_norm_inf = float(np.max(np.abs(vals_use))) if nnz_col else 0.0
+        col_count += 1
+        col_norm_min = min(col_norm_min, col_norm_inf)
+        col_norm_max = max(col_norm_max, col_norm_inf)
+
+        if fd_jac_min_col_norm > 0.0 and col_norm_inf < fd_jac_min_col_norm:
+            suspicious_cols.append({"col": int(j), "norm_inf": col_norm_inf, "nnz": nnz_col})
+            if debug_fd_col:
+                logger.warning(
+                    "[FD_J_DEBUG][rank=%d] column i=%d looks nearly zero: ||col||_inf=%.3e nnz=%d",
+                    myrank,
+                    int(j),
+                    col_norm_inf,
+                    nnz_col,
+                )
+            if fd_jac_diag_damping > 0.0 and (rstart <= col_dm < rend):
+                P.setValue(col_dm, col_dm, float(fd_jac_diag_damping), addv=True)
+
+        if rows_use.size:
+            _assert_local_rows(rows_use)
             _mat_setvalues_local(
                 P,
-                rows_sel,
-                np.asarray([j], dtype=PETSc.IntType),
-                vals_sel.reshape(-1, 1),
+                rows_use,
+                np.asarray([col_dm], dtype=PETSc.IntType),
+                vals_use.reshape(-1, 1),
                 addv=False,
             )
 
@@ -562,13 +857,22 @@ def _build_sparse_fd_jacobian_mpi(
         "shape": (N, N),
         "eps": float(eps),
         "drop_tol": float(drop_tol),
-        "pattern_nnz_local": int(indices.size),
+        "pattern_nnz_local": int(indices_layout.size),
         "prealloc_nnz_local": int(prealloc_nnz_local),
         "cols_to_perturb": [int(c) for c in cols_to_perturb],
         "ownership_range": ownership_range,
         "mpi_size": int(comm.getSize()),
         "max_diag_abs_local": float(max_diag_abs_local),
-        "pattern_local": local_pattern,
+        "pattern_local": pattern_local,
+    }
+    stats["fd_jacobian_stats"] = {
+        "n_cols": int(col_count),
+        "col_norm_min": float(col_norm_min) if col_count else None,
+        "col_norm_max": float(col_norm_max) if col_count else None,
+        "n_suspicious_cols": int(len(suspicious_cols)),
+        "suspicious_cols": list(suspicious_cols),
+        "min_col_norm": float(fd_jac_min_col_norm),
+        "diag_damping": float(fd_jac_diag_damping),
     }
     return P, stats
 
@@ -582,7 +886,10 @@ def build_sparse_fd_jacobian(
     mat=None,
 ) -> Tuple[Any, Dict[str, Any]]:
     """
-    Build sparse FD Jacobian in the scaled (eval) space.
+    Build sparse FD Jacobian for the current PETSc communicator.
+
+    Defaults to physical space for both serial and MPI; can be overridden via
+    ctx.meta["petsc_x_space"] and ["petsc_f_space"].
 
     If mat is provided, its ownership range defines local rows.
     """

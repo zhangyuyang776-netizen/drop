@@ -55,11 +55,13 @@ from properties.compute_props import compute_props, get_or_build_models
 from physics.initial import build_initial_state_erfc
 from properties.equilibrium import build_equilibrium_model
 from properties.gas import GasPropertiesModel
+from solvers.linear_types import LinearSolverConfig as LinearSolverConfigTyped
 from solvers.timestepper import StepResult, advance_one_step_scipy
 
 logger = logging.getLogger(__name__)
 
 _WRITERS_MODULE_NAME = "io_writers_cached_driver"
+_ROOT_RANK: Optional[int] = None
 
 
 # -----------------------------------------------------------------------------
@@ -276,7 +278,7 @@ def _load_case_config(cfg_path: str) -> CaseConfig:
         log_every=int(nonlinear_raw.get("log_every", 5)),
     )
 
-    return CaseConfig(
+    cfg = CaseConfig(
         case=case_cfg,
         paths=paths_cfg,
         conventions=conv_cfg,
@@ -292,6 +294,9 @@ def _load_case_config(cfg_path: str) -> CaseConfig:
         nonlinear=nonlinear_cfg,
         solver=solver_cfg,
     )
+
+    LinearSolverConfigTyped.from_cfg(cfg)
+    return cfg
 
 
 # -----------------------------------------------------------------------------
@@ -367,8 +372,29 @@ def _prepare_run_dir(cfg: CaseConfig, cfg_path: str) -> Path:
 # -----------------------------------------------------------------------------
 # Logging helpers
 # -----------------------------------------------------------------------------
+def _is_root_rank() -> bool:
+    """Return True when running on the root MPI rank (or single-process)."""
+    global _ROOT_RANK
+    if _ROOT_RANK is not None:
+        return _ROOT_RANK == 0
+    try:
+        from petsc4py import PETSc
+
+        _ROOT_RANK = int(PETSc.COMM_WORLD.getRank())
+    except Exception:
+        try:
+            from mpi4py import MPI
+
+            _ROOT_RANK = int(MPI.COMM_WORLD.Get_rank())
+        except Exception:
+            _ROOT_RANK = 0
+    return _ROOT_RANK == 0
+
+
 def _log_step(res: StepResult, step_id: int) -> None:
     """Emit one-line step summary."""
+    if not _is_root_rank():
+        return
     d = res.diag
     if getattr(d, "nonlinear_method", ""):
         logger.info(

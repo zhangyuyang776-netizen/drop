@@ -6,26 +6,33 @@ Scope:
 - Always uses PETSc.COMM_WORLD as the communicator.
 - Auto-builds DM + dm_manager + layout_dist if missing from ctx.meta.
 - Matrix-free Jacobian (SNES MFFD); supports mf and mfpc_sparse_fd modes.
-- Simple global PC (ASM) only; no fieldsplit variants.
+- Supports fieldsplit additive and schur PC variants.
 - This module does NOT provide serial fallback; use solvers.petsc_snes for serial or hybrid modes.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Mapping
 
 import numpy as np
 
+from core import layout as layout_mod
 from assembly.residual_global import residual_only, residual_petsc
-from solvers.linear_types import JacobianMode
+from properties.gas import set_gas_eval_phase
+from solvers.linear_types import JacobianMode, LinearSolverConfig as LinearSolverConfigTyped
+from solvers.mpi_entry_validate import validate_mpi_before_petsc
 from solvers.nonlinear_context import NonlinearContext
 from solvers.nonlinear_types import NonlinearDiagnostics, NonlinearSolveResult
-from solvers.petsc_linear import apply_structured_pc
+from solvers.petsc_linear import apply_structured_pc, _normalize_pc_type
 from solvers.petsc_snes import _enable_snes_matrix_free, _finalize_ksp_config, _get_petsc
 
 logger = logging.getLogger(__name__)
+
+DEBUG_DOF_GID = os.getenv("DROPLET_DEBUG_DOF_GID")
+DEBUG_DOF_GID = int(DEBUG_DOF_GID) if DEBUG_DOF_GID is not None else None
 
 
 def _create_identity_precond_mat(comm, dm):
@@ -62,6 +69,95 @@ def _create_identity_precond_mat(comm, dm):
     return P
 
 
+def _apply_linesearch_options_from_env(PETSc, prefix: str, default_type: str) -> str:
+    """
+    Inject snes_linesearch_* options from env into PETSc.Options, without
+    relying on petsc4py SNES.getLineSearch().
+    """
+    linesearch_env = os.environ.get("DROPLET_PETSC_LINESEARCH_TYPE", "").strip()
+    desired = linesearch_env or default_type
+
+    try:
+        opts = PETSc.Options(prefix)
+        try:
+            current = opts.getString("snes_linesearch_type", default="")
+        except Exception:
+            current = ""
+
+        if not current and desired:
+            try:
+                opts.setValue("snes_linesearch_type", desired)
+            except Exception:
+                opts["snes_linesearch_type"] = desired
+
+        ls_damping = os.environ.get("DROPLET_PETSC_LINESEARCH_DAMPING", "").strip()
+        if ls_damping:
+            try:
+                opts.setValue("snes_linesearch_damping", ls_damping)
+            except Exception:
+                opts["snes_linesearch_damping"] = ls_damping
+    except Exception:
+        current = ""
+
+    return current or desired
+
+
+def _vec_get_array_read(vec):
+    """
+    Return a read-only array view and a mode flag for safe restore.
+    """
+    try:
+        return vec.getArrayRead(), "read"
+    except Exception:
+        try:
+            return vec.getArray(readonly=True), "read"
+        except Exception:
+            return vec.getArray(), "write"
+
+
+def _vec_restore_array(vec, arr, mode: str) -> None:
+    try:
+        if mode == "read" and hasattr(vec, "restoreArrayRead"):
+            vec.restoreArrayRead(arr)
+        else:
+            vec.restoreArray()
+    except Exception:
+        pass
+
+
+def _log_linesearch_options(PETSc, prefix: str, rank: int) -> None:
+    """
+    Debug helper to report whether PETSc options picked up line search flags.
+    """
+    try:
+        opts_global = PETSc.Options()
+        ls_global = opts_global.getString("snes_linesearch_type", default="(unset)")
+        mon_global = opts_global.getBool("snes_linesearch_monitor", default=False)
+        if prefix:
+            opts_pref = PETSc.Options(prefix)
+            ls_pref = opts_pref.getString("snes_linesearch_type", default="(unset)")
+            mon_pref = opts_pref.getBool("snes_linesearch_monitor", default=False)
+            logger.warning(
+                "[DBG][rank=%d] PETSc opts: snes_linesearch_type=%s monitor=%s "
+                "(prefix=%s -> %s/%s)",
+                rank,
+                ls_global,
+                bool(mon_global),
+                prefix,
+                ls_pref,
+                bool(mon_pref),
+            )
+        else:
+            logger.warning(
+                "[DBG][rank=%d] PETSc opts: snes_linesearch_type=%s monitor=%s",
+                rank,
+                ls_global,
+                bool(mon_global),
+            )
+    except Exception:
+        logger.warning("[DBG][rank=%d] PETSc opts check failed", rank)
+
+
 def solve_nonlinear_petsc_parallel(
     ctx: NonlinearContext,
     u0: np.ndarray,
@@ -69,15 +165,18 @@ def solve_nonlinear_petsc_parallel(
     """
     Solve F(u) = 0 using PETSc SNES (parallel-only, DM + MFFD).
     """
-    PETSc = _get_petsc()
-    comm = PETSc.COMM_WORLD
-    world_rank = int(comm.getRank())
-    world_size = int(comm.getSize())
-
     cfg = ctx.cfg
     nl_cfg = getattr(cfg, "nonlinear", None)
     if nl_cfg is None or not getattr(nl_cfg, "enabled", False):
         raise ValueError("Nonlinear solver requested but cfg.nonlinear.enabled is False or missing.")
+
+    LinearSolverConfigTyped.from_cfg(cfg)
+    validate_mpi_before_petsc(cfg)
+
+    PETSc = _get_petsc()
+    comm = PETSc.COMM_WORLD
+    world_rank = int(comm.getRank())
+    world_size = int(comm.getSize())
 
     if world_rank == 0:
         logger.info(
@@ -94,6 +193,9 @@ def solve_nonlinear_petsc_parallel(
     elif not isinstance(meta, dict):
         meta = dict(meta)
         ctx.meta = meta
+    # Dedicated MPI backend uses physical x and residual spaces.
+    meta["petsc_x_space"] = "physical"
+    meta["petsc_f_space"] = "physical"
 
     dm_mgr = meta.get("dm_manager") or meta.get("dm_mgr") or getattr(ctx, "dm_manager", None)
     dm = meta.get("dm") or getattr(ctx, "dm", None)
@@ -148,6 +250,39 @@ def solve_nonlinear_petsc_parallel(
     if dm is None or ld is None:
         raise RuntimeError("Parallel SNES failed to initialize DM/layout_dist; check configuration.")
 
+    v_check = None
+    try:
+        v_check = dm.createGlobalVec()
+        v_lo, v_hi = (int(x) for x in v_check.getOwnershipRange())
+        v_size = int(v_check.getSize())
+    finally:
+        if v_check is not None:
+            try:
+                v_check.destroy()
+            except Exception:
+                pass
+
+    if getattr(ld, "ownership_range", None) is None:
+        raise ValueError("LayoutDistributed.ownership_range is None (Stage1 requires it).")
+    if tuple(int(x) for x in ld.ownership_range) != (v_lo, v_hi):
+        raise ValueError(
+            f"Ownership mismatch: DM={(v_lo, v_hi)} vs LD={ld.ownership_range}"
+        )
+    ld_global = getattr(ld, "global_size", getattr(ld, "N_total", None))
+    if ld_global is not None and int(ld_global) != v_size:
+        raise ValueError(
+            f"Global size mismatch: DM={v_size} vs LD.global_size={ld_global}"
+        )
+    layout_size = int(ctx.layout.n_dof())
+    if v_size != layout_size:
+        raise ValueError(
+            f"Global size mismatch: DM={v_size} vs layout.size={layout_size}"
+        )
+    if hasattr(ld, "local_size") and int(ld.local_size) != int(v_hi - v_lo):
+        raise ValueError(
+            f"Local size mismatch: LD.local_size={ld.local_size} vs ownership_range_len={v_hi - v_lo}"
+        )
+
     max_outer_iter = int(getattr(nl_cfg, "max_outer_iter", 20))
     # Fixed tolerances for the dedicated MPI backend.
     f_rtol = 1.0e-6
@@ -166,6 +301,18 @@ def solve_nonlinear_petsc_parallel(
             "Parallel SNES backend supports jacobian_mode='mf' or 'mfpc_sparse_fd' only. "
             f"Got: {jacobian_mode!r}."
         )
+    linear_cfg = getattr(getattr(cfg, "solver", None), "linear", None)
+    pc_type_override_raw = os.environ.get("DROPLET_PETSC_PC_TYPE_OVERRIDE", "").strip()
+    pc_type_override_req = _normalize_pc_type(pc_type_override_raw) if pc_type_override_raw else None
+    pc_type_cfg_req = _normalize_pc_type(getattr(linear_cfg, "pc_type", None)) if linear_cfg is not None else None
+    pc_type_req = pc_type_override_req if pc_type_override_req is not None else pc_type_cfg_req
+    if pc_type_req == "fieldsplit" and jacobian_mode == JacobianMode.MF:
+        if world_rank == 0:
+            logger.warning(
+                "pc_type=fieldsplit with jacobian_mode=mf uses identity P; "
+                "promoting to mfpc_sparse_fd for a usable preconditioner."
+            )
+        jacobian_mode = JacobianMode.MFPC_SPARSE_FD
     use_mfpc_sparse_fd = (jacobian_mode == JacobianMode.MFPC_SPARSE_FD)
     fd_eps = float(getattr(petsc_cfg, "fd_eps", 1.0e-8)) if petsc_cfg is not None else 1.0e-8
     precond_drop_tol = float(getattr(petsc_cfg, "precond_drop_tol", 0.0)) if petsc_cfg is not None else 0.0
@@ -176,7 +323,7 @@ def solve_nonlinear_petsc_parallel(
         except Exception:
             precond_max_nnz_row = None
 
-    # Note: dedicated MPI backend does not support scaled unknowns/residuals.
+    # Dedicated MPI backend uses physical unknowns/residuals (see meta flags above).
 
     prefix = ""
     if petsc_cfg is not None:
@@ -186,7 +333,7 @@ def solve_nonlinear_petsc_parallel(
         prefix += "_"
 
     snes_type = "newtonls"
-    linesearch_type = "bt"
+    linesearch_type = os.environ.get("DROPLET_PETSC_LINESEARCH_TYPE", "").strip() or "l2"
     snes_monitor = bool(getattr(petsc_cfg, "snes_monitor", False)) if petsc_cfg is not None else False
 
     ksp_type = "gmres"
@@ -197,7 +344,7 @@ def solve_nonlinear_petsc_parallel(
 
     if world_rank == 0:
         logger.info(
-            "Parallel SNES fixed config: snes=%s/%s, ksp=%s, pc=asm+ilu(0), overlap=1",
+            "Parallel SNES fixed config: snes=%s/%s, ksp=%s",
             snes_type,
             linesearch_type,
             ksp_type,
@@ -210,11 +357,26 @@ def solve_nonlinear_petsc_parallel(
 
     from assembly.residual_local import ResidualLocalCtx, pack_local_to_layout, scatter_layout_to_local
     from parallel.dm_manager import global_to_local, local_state_to_global
-    from assembly.residual_global import residual_only_owned_rows
 
     ctx_local = ResidualLocalCtx(layout=ctx.layout, ld=ld)
 
     def _layout_to_dm_vec(u_layout: np.ndarray):
+        if comm.getSize() == 1:
+            Xg = dm_mgr.dm.createGlobalVec()
+            u_arr = np.asarray(u_layout, dtype=np.float64)
+            try:
+                x_view = Xg.getArray()
+                if u_arr.shape[0] != x_view.shape[0]:
+                    raise ValueError(
+                        f"serial fastpath: len(u)={u_arr.shape[0]} != len(x)={x_view.shape[0]}"
+                    )
+                x_view[:] = u_arr
+            finally:
+                try:
+                    Xg.restoreArray()
+                except Exception:
+                    pass
+            return Xg
         Xl_liq = dm_mgr.dm_liq.createLocalVec()
         Xl_gas = dm_mgr.dm_gas.createLocalVec()
         Xl_if = dm_mgr.dm_if.createLocalVec()
@@ -236,6 +398,18 @@ def solve_nonlinear_petsc_parallel(
         return local_state_to_global(dm_mgr, Xl_liq, Xl_gas, Xl_if)
 
     def _dm_vec_to_layout(Xg_vec) -> np.ndarray:
+        if comm.getSize() == 1:
+            try:
+                try:
+                    x_view = Xg_vec.getArray(readonly=True)
+                except TypeError:
+                    x_view = Xg_vec.getArray()
+                return np.array(x_view, dtype=np.float64, copy=True)
+            finally:
+                try:
+                    Xg_vec.restoreArray()
+                except Exception:
+                    pass
         Xl_liq, Xl_gas, Xl_if = global_to_local(dm_mgr, Xg_vec)
         aXl_liq = dm_mgr.dm_liq.getVecArray(Xl_liq)
         aXl_gas = dm_mgr.dm_gas.getVecArray(Xl_gas)
@@ -251,6 +425,87 @@ def solve_nonlinear_petsc_parallel(
         except Exception as exc:
             raise RuntimeError("mpi4py is required for DM to layout gather in MPI mode.") from exc
 
+    def _get_or_build_perm():
+        perm_l2d = meta.get("perm_l2d")
+        perm_d2l = meta.get("perm_d2l")
+        perm_layout_mask = meta.get("perm_layout_mask")
+        if perm_l2d is not None and perm_d2l is not None and perm_layout_mask is not None:
+            return perm_l2d, perm_d2l, perm_layout_mask
+
+        if comm.getSize() == 1:
+            perm_l2d = np.arange(n_layout, dtype=np.int64)
+            perm_d2l = perm_l2d.copy()
+            perm_layout_mask = np.ones(n_layout, dtype=bool)
+            meta["perm_l2d"] = perm_l2d
+            meta["perm_d2l"] = perm_d2l
+            meta["perm_layout_mask"] = perm_layout_mask
+            return perm_l2d, perm_d2l, perm_layout_mask
+
+        Xg_gid = dm_mgr.dm.createGlobalVec()
+        Xl_liq = None
+        Xl_gas = None
+        Xl_if = None
+        try:
+            lo, hi = Xg_gid.getOwnershipRange()
+            lo = int(lo)
+            hi = int(hi)
+            try:
+                x_view = Xg_gid.getArray()
+                x_view[:] = np.arange(lo, hi, dtype=np.float64) + 1.0
+            finally:
+                try:
+                    Xg_gid.restoreArray()
+                except Exception:
+                    pass
+
+            Xl_liq, Xl_gas, Xl_if = global_to_local(dm_mgr, Xg_gid)
+            aXl_liq = dm_mgr.dm_liq.getVecArray(Xl_liq)
+            aXl_gas = dm_mgr.dm_gas.getVecArray(Xl_gas)
+            aXl_if = Xl_if.getArray()
+            u_layout_local = pack_local_to_layout(
+                ctx_local,
+                aXl_liq,
+                aXl_gas,
+                aXl_if,
+                rank=world_rank,
+            )
+            local_idx = np.nonzero(u_layout_local)[0].astype(np.int64)
+            perm_layout_mask = np.zeros(n_layout, dtype=bool)
+            perm_layout_mask[local_idx] = True
+
+            u_layout_global = _dm_vec_to_layout(Xg_gid)
+        finally:
+            try:
+                Xg_gid.destroy()
+            except Exception:
+                pass
+            for vec in (Xl_liq, Xl_gas, Xl_if):
+                if vec is None:
+                    continue
+                try:
+                    vec.destroy()
+                except Exception:
+                    pass
+
+        perm_l2d = np.rint(u_layout_global).astype(np.int64) - 1
+        if perm_l2d.size != n_layout:
+            raise RuntimeError(
+                f"[perm] layout size mismatch: perm={perm_l2d.size} layout={n_layout}"
+            )
+        if np.any(perm_l2d < 0):
+            raise RuntimeError("[perm] invalid layout->DM permutation (negative entries).")
+        perm_d2l = np.empty_like(perm_l2d)
+        perm_d2l[perm_l2d] = np.arange(n_layout, dtype=np.int64)
+        if not np.array_equal(perm_d2l[perm_l2d], np.arange(n_layout, dtype=np.int64)):
+            raise RuntimeError("[perm] perm_d2l is not the inverse of perm_l2d.")
+        if not np.array_equal(perm_l2d[perm_d2l], np.arange(n_layout, dtype=np.int64)):
+            raise RuntimeError("[perm] perm_l2d is not the inverse of perm_d2l.")
+
+        meta["perm_l2d"] = perm_l2d
+        meta["perm_d2l"] = perm_d2l
+        meta["perm_layout_mask"] = perm_layout_mask
+        return perm_l2d, perm_d2l, perm_layout_mask
+
     def residual_petsc_owned_rows(dm_mgr, ctx, X, Fg):
         """
         MPI: each rank writes only its owned rows of residual into Fg.
@@ -264,15 +519,58 @@ def solve_nonlinear_petsc_parallel(
         u_layout = _dm_vec_to_layout(X)
 
         rstart, rend = Fg.getOwnershipRange()
-        ownership_range = (int(rstart), int(rend))
+        rstart = int(rstart)
+        rend = int(rend)
+        nloc = int(rend - rstart)
 
-        r_owned = residual_only_owned_rows(u_layout, ctx, ownership_range)
-        r_owned = np.asarray(r_owned, dtype=np.float64)
+        perm_l2d, perm_d2l, perm_layout_mask = _get_or_build_perm()
+        idx_dm = np.arange(rstart, rend, dtype=np.int64)
+        idx_layout = perm_d2l[idx_dm]
+
+        if not np.all(perm_layout_mask[idx_layout]):
+            if os.environ.get("DROPLET_PETSC_DEBUG", "0") == "1":
+                bad = np.nonzero(~perm_layout_mask[idx_layout])[0]
+                sample = bad[:10].tolist()
+                logger.warning(
+                    "[DBG][rank=%d] residual_petsc_owned_rows fallback: "
+                    "DM-owned rows map to nonlocal layout rows. bad_count=%d sample_local_idx=%s",
+                    rank,
+                    int(bad.size),
+                    sample,
+                )
+            residual_petsc(dm_mgr, ld, ctx, X, Fg=Fg)
+            try:
+                f_view, f_mode = _vec_get_array_read(Fg)
+                r_owned = np.array(f_view, dtype=np.float64, copy=True)
+            finally:
+                _vec_restore_array(Fg, f_view, f_mode)
+        else:
+            res_full = residual_only(u_layout, ctx)
+            r_owned = np.asarray(res_full[idx_layout], dtype=np.float64)
+            if os.environ.get("DROPLET_PETSC_DEBUG", "0") == "1":
+                Ftmp = dm_mgr.dm.createGlobalVec()
+                try:
+                    residual_petsc(dm_mgr, ld, ctx, X, Fg=Ftmp)
+                    try:
+                        f_view, f_mode = _vec_get_array_read(Ftmp)
+                        f_loc = np.array(f_view, dtype=np.float64, copy=True)
+                    finally:
+                        _vec_restore_array(Ftmp, f_view, f_mode)
+                    err = float(np.max(np.abs(f_loc - r_owned))) if f_loc.size else 0.0
+                    logger.warning(
+                        "[DBG][rank=%d] OwnedRows fastpath vs full residual: ||diff||_inf = %.3e",
+                        rank,
+                        err,
+                    )
+                finally:
+                    try:
+                        Ftmp.destroy()
+                    except Exception:
+                        pass
 
         if not np.all(np.isfinite(r_owned)):
             r_owned = np.where(np.isfinite(r_owned), r_owned, 1.0e20)
 
-        nloc = int(rend - rstart)
         if r_owned.size != nloc:
             raise RuntimeError(
                 f"[residual_petsc_owned_rows][rank={rank}] size mismatch: "
@@ -287,13 +585,10 @@ def solve_nonlinear_petsc_parallel(
 
         if os.environ.get("DROPLET_PETSC_DEBUG", "0") == "1":
             try:
-                f_view = Fg.getArray()
+                f_view, f_mode = _vec_get_array_read(Fg)
                 f_loc = np.array(f_view, dtype=np.float64, copy=True)
             finally:
-                try:
-                    Fg.restoreArray()
-                except Exception:
-                    pass
+                _vec_restore_array(Fg, f_view, f_mode)
             err = float(np.max(np.abs(f_loc - r_owned))) if f_loc.size else 0.0
             logger.warning(
                 "[DBG][rank=%d] OwnedRows writeback check: ||Fg_local - r_owned||_inf = %.3e",
@@ -303,11 +598,10 @@ def solve_nonlinear_petsc_parallel(
 
         return r_owned
 
-    def _dbg_log_Y(u_layout: np.ndarray, tag: str) -> None:
+    def _dbg_log_Y(tag: str, state_dbg) -> None:
         if not DEBUG:
             return
         try:
-            state_dbg = ctx.make_state_from_u(u_layout)
             Yg = np.asarray(state_dbg.Yg, dtype=np.float64)
             if Yg.ndim != 2:
                 _dbg_rank("%s Yg shape=%r", tag, getattr(Yg, "shape", None))
@@ -334,6 +628,59 @@ def solve_nonlinear_petsc_parallel(
         except Exception as exc:
             _dbg_rank("%s Y debug failed: %r", tag, exc)
 
+    def _debug_check_xsig(state_dbg, rank: int) -> None:
+        ok = True
+        try:
+            Y = np.asarray(state_dbg.Yg, dtype=np.float64)
+            if Y.ndim != 2:
+                logger.warning("[XSIG_DEBUG][rank=%d] Yg shape=%r", rank, getattr(Y, "shape", None))
+                return
+            Y_sum = np.sum(Y, axis=0)
+        except Exception as exc:
+            logger.warning("[XSIG_DEBUG][rank=%d] failed to access Yg: %r", rank, exc)
+            return
+
+        if not np.all(np.isfinite(Y)):
+            logger.warning("[XSIG_DEBUG][rank=%d] non-finite values in Yg", rank)
+            ok = False
+
+        neg = np.where(Y < -1.0e-8)
+        if neg[0].size:
+            sample = (int(neg[0][0]), int(neg[1][0]), float(Y[neg[0][0], neg[1][0]]))
+            logger.warning(
+                "[XSIG_DEBUG][rank=%d] negative Yg entries: count=%d sample=%s",
+                rank,
+                int(neg[0].size),
+                str([sample]),
+            )
+            ok = False
+
+        too_large = np.where(Y > 0.79 + 1.0e-2)
+        if too_large[0].size:
+            sample = (
+                int(too_large[0][0]),
+                int(too_large[1][0]),
+                float(Y[too_large[0][0], too_large[1][0]]),
+            )
+            logger.warning(
+                "[XSIG_DEBUG][rank=%d] too large Yg entries: count=%d sample=%s",
+                rank,
+                int(too_large[0].size),
+                str([sample]),
+            )
+            ok = False
+
+        if not np.allclose(Y_sum, 1.0, atol=1.0e-6):
+            logger.warning(
+                "[XSIG_DEBUG][rank=%d] sum(Yg)!=1 for some cells: max|sum-1|=%e",
+                rank,
+                float(np.max(np.abs(Y_sum - 1.0))),
+            )
+            ok = False
+
+        if not ok:
+            logger.warning("[DBG][rank=%d] Xsig debug failed", rank)
+
     history_inf: List[float] = []
     last_inf = {"val": np.nan}
     t_solve0 = time.perf_counter()
@@ -342,46 +689,107 @@ def solve_nonlinear_petsc_parallel(
 
     def snes_func(snes_obj, X, F):
         t0 = time.perf_counter()
+        try:
+            iter_no = int(snes_obj.getIterationNumber())
+        except Exception:
+            iter_no = -1
+        phase_label = f"SNES_F_iter{iter_no}"
         sig_changed = False
-        if DEBUG:
-            try:
-                x_inf = float(X.norm(PETSc.NormType.NORM_INFINITY))
-                x_2 = float(X.norm(PETSc.NormType.NORM_2))
+        set_gas_eval_phase(phase_label)
+        layout_mod.set_apply_u_tag(phase_label)
+        try:
+            if DEBUG_DOF_GID is not None:
                 try:
-                    x_view = X.getArray()
-                    x_loc = np.array(x_view, dtype=np.float64, copy=True)
-                finally:
                     try:
-                        X.restoreArray()
+                        lo, hi = dm.getOwnershipRange()
                     except Exception:
-                        pass
-                stride = max(1, int(x_loc.size // 16)) if x_loc.size else 1
-                x_chk = float(x_loc[::stride].sum()) if x_loc.size else 0.0
-                sig = (x_inf, x_2, x_chk, int(x_loc.size))
-                prev = ctx.meta.get("_dbg_prev_x_sig")
-                if prev != sig:
-                    ctx.meta["_dbg_prev_x_sig"] = sig
-                    sig_changed = True
+                        lo, hi = X.getOwnershipRange()
+                    if lo <= DEBUG_DOF_GID < hi:
+                        local_i = int(DEBUG_DOF_GID - lo)
+                        try:
+                            x_view, x_mode = _vec_get_array_read(X)
+                            x_arr = np.array(x_view, dtype=np.float64, copy=True)
+                        finally:
+                            _vec_restore_array(X, x_view, x_mode)
+                        x_val = float(x_arr[local_i])
+                        debug_key = "_debug_x0_local"
+                        if debug_key not in ctx.meta:
+                            ctx.meta[debug_key] = X.copy()
+                            logger.warning(
+                                "[SNES_FUNC_DEBUG][rank=%d] init x0[gid=%d, loc=%d]=%e (||x0||_inf=%e)",
+                                world_rank,
+                                int(DEBUG_DOF_GID),
+                                local_i,
+                                x_val,
+                                float(np.linalg.norm(x_arr, ord=np.inf)) if x_arr.size else 0.0,
+                            )
+                        else:
+                            x0_vec = ctx.meta[debug_key]
+                            try:
+                                x0_view, x0_mode = _vec_get_array_read(x0_vec)
+                                x0_arr = np.array(x0_view, dtype=np.float64, copy=True)
+                            finally:
+                                _vec_restore_array(x0_vec, x0_view, x0_mode)
+                            dx_val = float(x_val - x0_arr[local_i])
+                            call_count = int(ctx.meta.get("_debug_call_count", 0))
+                            logger.warning(
+                                "[SNES_FUNC_DEBUG][rank=%d] call=%d gid=%d loc=%d x=%e dx=%e (||x||_inf=%e)",
+                                world_rank,
+                                call_count,
+                                int(DEBUG_DOF_GID),
+                                local_i,
+                                x_val,
+                                dx_val,
+                                float(np.linalg.norm(x_arr, ord=np.inf)) if x_arr.size else 0.0,
+                            )
+                            ctx.meta["_debug_call_count"] = call_count + 1
+                except Exception as exc:
+                    logger.debug("DEBUG_DOF_GID logging failed: %r", exc)
+            if DEBUG:
+                try:
+                    x_inf = float(X.norm(PETSc.NormType.NORM_INFINITY))
+                    x_2 = float(X.norm(PETSc.NormType.NORM_2))
+                    try:
+                        x_view, x_mode = _vec_get_array_read(X)
+                        x_loc = np.array(x_view, dtype=np.float64, copy=True)
+                    finally:
+                        _vec_restore_array(X, x_view, x_mode)
+                    stride = max(1, int(x_loc.size // 16)) if x_loc.size else 1
+                    x_chk = float(x_loc[::stride].sum()) if x_loc.size else 0.0
+                    sig = (x_inf, x_2, x_chk, int(x_loc.size))
+                    prev = ctx.meta.get("_dbg_prev_x_sig")
+                    if prev != sig:
+                        ctx.meta["_dbg_prev_x_sig"] = sig
+                        sig_changed = True
+                        _dbg_rank(
+                            "Xsig inf=%.3e 2=%.3e chk=%.6e nloc=%d",
+                            x_inf,
+                            x_2,
+                            x_chk,
+                            int(x_loc.size),
+                        )
+                except Exception as exc:
                     _dbg_rank(
-                        "Xsig inf=%.3e 2=%.3e chk=%.6e nloc=%d",
-                        x_inf,
-                        x_2,
-                        x_chk,
-                        int(x_loc.size),
+                        "Xsig debug failed: %s: %s",
+                        type(exc).__name__,
+                        exc,
                     )
-            except Exception:
-                _dbg_rank("Xsig debug failed")
-        if DEBUG:
-            try:
-                u_layout_dbg = _dm_vec_to_layout(X)
-                _dbg_log_Y(u_layout_dbg, "AFTER_VEC2STATE_BEFORE_PROPS")
-            except Exception as exc:
-                _dbg_rank("Y debug before props failed: %r", exc)
-        use_owned = bool(int(os.environ.get("DROPLET_PETSC_RESID_OWNED", "1")))
-        if use_owned:
-            residual_petsc_owned_rows(dm_mgr, ctx, X, F)
-        else:
-            residual_petsc(dm_mgr, ld, ctx, X, Fg=F)
+            if DEBUG:
+                try:
+                    u_layout_dbg = _dm_vec_to_layout(X)
+                    state_dbg = ctx.make_state_from_u(u_layout_dbg)
+                    _dbg_log_Y("AFTER_VEC2STATE_BEFORE_PROPS", state_dbg)
+                    _debug_check_xsig(state_dbg, world_rank)
+                except Exception as exc:
+                    _dbg_rank("Y debug before props failed: %r", exc)
+            use_owned = bool(int(os.environ.get("DROPLET_PETSC_RESID_OWNED", "1")))
+            if use_owned:
+                residual_petsc_owned_rows(dm_mgr, ctx, X, F)
+            else:
+                residual_petsc(dm_mgr, ld, ctx, X, Fg=F)
+        finally:
+            layout_mod.set_apply_u_tag(None)
+            set_gas_eval_phase(None)
         try:
             res_inf = float(F.norm(PETSc.NormType.NORM_INFINITY))
         except Exception:
@@ -395,13 +803,10 @@ def solve_nonlinear_petsc_parallel(
             try:
                 rstart_f, rend_f = F.getOwnershipRange()
                 try:
-                    f_view = F.getArray()
+                    f_view, f_mode = _vec_get_array_read(F)
                     f_loc = np.array(f_view, dtype=np.float64, copy=True)
                 finally:
-                    try:
-                        F.restoreArray()
-                    except Exception:
-                        pass
+                    _vec_restore_array(F, f_view, f_mode)
                 _dbg_rank(
                     "Fg(local) ||F||_inf=%.3e  local_n=%d  range=[%d,%d)",
                     float(np.max(np.abs(f_loc))),
@@ -434,11 +839,6 @@ def solve_nonlinear_petsc_parallel(
         snes.setFunction(snes_func, F)
     except TypeError:
         snes.setFunction(F, snes_func)
-    try:
-        snes.setFromOptions()
-    except Exception:
-        pass
-    import os
     DEBUG = os.environ.get("DROPLET_PETSC_DEBUG", "0") == "1"
     DEBUG_ONCE = os.environ.get("DROPLET_PETSC_DEBUG_ONCE", "1") == "1"
 
@@ -456,7 +856,13 @@ def solve_nonlinear_petsc_parallel(
         try:
             X0 = _layout_to_dm_vec(u0)
             F0 = dm.createGlobalVec()
-            residual_petsc(dm_mgr, ld, ctx, X0, Fg=F0)
+            layout_mod.set_apply_u_tag("XSIG_TEST")
+            set_gas_eval_phase("XSIG_TEST")
+            try:
+                residual_petsc(dm_mgr, ld, ctx, X0, Fg=F0)
+            finally:
+                layout_mod.set_apply_u_tag(None)
+                set_gas_eval_phase(None)
 
             rstart_dm, rend_dm = F0.getOwnershipRange()
             _dbg_rank("DM ownership_range = [%d, %d)", int(rstart_dm), int(rend_dm))
@@ -475,13 +881,10 @@ def solve_nonlinear_petsc_parallel(
                 _dbg_rank("LD ownership_range = <missing>")
 
             try:
-                x0_view = X0.getArray()
+                x0_view, x0_mode = _vec_get_array_read(X0)
                 x0_loc = np.array(x0_view, dtype=np.float64, copy=True)
             finally:
-                try:
-                    X0.restoreArray()
-                except Exception:
-                    pass
+                _vec_restore_array(X0, x0_view, x0_mode)
             _dbg_rank(
                 "X0 local ||x||_inf=%.3e  local_size=%d",
                 float(np.max(np.abs(x0_loc))),
@@ -522,13 +925,26 @@ def solve_nonlinear_petsc_parallel(
         logger.warning("Unknown snes_type='%s', falling back to newtonls", snes_type)
         snes.setType("newtonls")
     snes.setTolerances(rtol=f_rtol, atol=f_atol, max_it=max_outer_iter)
-    try:
-        ls = snes.getLineSearch()
-        ls.setType(linesearch_type)
-    except Exception:
-        logger.debug("Unable to set linesearch_type='%s'", linesearch_type)
 
-    _enable_snes_matrix_free(snes, prefix)
+    linesearch_type_eff = _apply_linesearch_options_from_env(PETSc, prefix, linesearch_type)
+    if DEBUG and world_rank == 0:
+        _log_linesearch_options(PETSc, prefix, world_rank)
+
+    try:
+        snes.setFromOptions()
+    except Exception:
+        pass
+
+    try:
+        opts_eff = PETSc.Options(prefix)
+        linesearch_type_eff = opts_eff.getString(
+            "snes_linesearch_type",
+            default=linesearch_type_eff,
+        )
+    except Exception:
+        pass
+
+    snes_mf_enabled = _enable_snes_matrix_free(snes, prefix)
 
     X = dm.createGlobalVec()
     P = None
@@ -555,6 +971,26 @@ def solve_nonlinear_petsc_parallel(
         except Exception:
             P_dm.setType("aij")
 
+        v_check = None
+        try:
+            v_check = dm.createGlobalVec()
+            v_lo, v_hi = (int(x) for x in v_check.getOwnershipRange())
+            if hasattr(ld, "ownership_range"):
+                assert tuple(int(x) for x in ld.ownership_range) == (v_lo, v_hi), (
+                    f"LD range {getattr(ld, 'ownership_range', None)} "
+                    f"!= DM Vec range {(v_lo, v_hi)}"
+                )
+            p_lo, p_hi = (int(x) for x in P_dm.getOwnershipRange())
+            assert (p_lo, p_hi) == (v_lo, v_hi), (
+                f"P_dm range {(p_lo, p_hi)} != DM Vec range {(v_lo, v_hi)}"
+            )
+        finally:
+            if v_check is not None:
+                try:
+                    v_check.destroy()
+                except Exception:
+                    pass
+
         t0 = time.perf_counter()
         try:
             P, fd_stats = build_sparse_fd_jacobian(
@@ -566,8 +1002,10 @@ def solve_nonlinear_petsc_parallel(
                 mat=P_dm,
             )
         except Exception as exc:
+            _dbg("build_sparse_fd_jacobian failed in parallel SNES: %r", exc)
             raise RuntimeError("Failed to build mfpc_sparse_fd preconditioner.") from exc
-        tim["time_jac"] += (time.perf_counter() - t0)
+        finally:
+            tim["time_jac"] += (time.perf_counter() - t0)
         ctr["n_jac_eval"] += 1
         try:
             p_range = tuple(int(v) for v in P.getOwnershipRange())
@@ -597,6 +1035,7 @@ def solve_nonlinear_petsc_parallel(
             J.setUp()
         except Exception:
             J = None
+
     try:
         snes.setJacobian(J=J, P=P, func=None)
     except TypeError:
@@ -609,6 +1048,13 @@ def solve_nonlinear_petsc_parallel(
                 snes.setJacobian(P=P)
 
     ksp = snes.getKSP()
+    Aop = J
+    Pop = P if P is not None else J
+    if Aop is not None and Pop is not None:
+        try:
+            ksp.setOperators(Aop, Pop)
+        except Exception:
+            pass
 
     try:
         ksp.setFromOptions()
@@ -633,13 +1079,36 @@ def solve_nonlinear_petsc_parallel(
     except Exception:
         logger.debug("Unable to set restart for ksp_type='%s'", ksp.getType())
 
+    pc_type_override_raw = os.environ.get("DROPLET_PETSC_PC_TYPE_OVERRIDE", "").strip()
+    pc_type_override = _normalize_pc_type(pc_type_override_raw) if pc_type_override_raw else None
+    pc_overridden = pc_type_override is not None
+
+    linear_cfg = getattr(getattr(cfg, "solver", None), "linear", None)
+    pc_type_cfg = _normalize_pc_type(getattr(linear_cfg, "pc_type", None)) if linear_cfg is not None else None
+    pc_type_eff = pc_type_override if pc_type_override is not None else pc_type_cfg
+    if pc_type_eff == "fieldsplit":
+        fs_cfg = getattr(linear_cfg, "fieldsplit", None) if linear_cfg is not None else None
+        if isinstance(fs_cfg, Mapping):
+            fs_type = fs_cfg.get("type", "additive")
+        else:
+            fs_type = getattr(fs_cfg, "type", "additive") if fs_cfg is not None else "additive"
+        fs_type = str(fs_type).strip().lower() or "additive"
+        if fs_type not in ("additive", "schur"):
+            raise ValueError(
+                "Parallel SNES supports fieldsplit types 'additive' and 'schur' only "
+                f"(got '{fs_type}')."
+            )
+
+    Aop_call = Aop
+    Pop_call = Pop
+
     diag_pc = apply_structured_pc(
         ksp=ksp,
         cfg=cfg,
         layout=ctx.layout,
-        A=J,
-        P=P,
-        pc_type_override="asm",
+        A=Aop_call,
+        P=Pop_call,
+        pc_type_override=pc_type_override,
     )
     snes.setMonitor(snes_monitor_fn)
     _finalize_ksp_config(ksp, diag_pc, from_options=False)
@@ -715,6 +1184,8 @@ def solve_nonlinear_petsc_parallel(
     ksp_a_type = ""
     ksp_p_type = ""
     ksp_a_is_p = False
+    ksp_a = None
+    ksp_p = None
     try:
         ksp_a, ksp_p = ksp.getOperators()
         if ksp_a is not None:
@@ -736,7 +1207,7 @@ def solve_nonlinear_petsc_parallel(
         "snes_reason": reason,
         "snes_reason_str": str(reason),
         "snes_type": snes.getType(),
-        "linesearch_type": linesearch_type,
+        "linesearch_type": linesearch_type_eff,
         "ksp_type": ksp.getType(),
         "pc_type": ksp.getPC().getType(),
         "ksp_reason": ksp_reason,
@@ -751,8 +1222,8 @@ def solve_nonlinear_petsc_parallel(
         "time_jac": float(tim["time_jac"]),
         "time_linear_total": float(tim["time_linear_total"]),
         "time_total": float(time.perf_counter() - t_solve0),
-        "snes_mf_enabled": True,
-        "pc_type_overridden": True,
+        "snes_mf_enabled": bool(snes_mf_enabled),
+        "pc_type_overridden": bool(pc_overridden),
         "J_mat_type": j_type,
         "P_mat_type": p_type,
     }
@@ -760,7 +1231,37 @@ def solve_nonlinear_petsc_parallel(
         extra["KSP_A_type"] = ksp_a_type
     if ksp_p_type:
         extra["KSP_P_type"] = ksp_p_type
+    if ksp_a_type or ksp_p_type:
+        ops_info: Dict[str, Any] = {}
+        if ksp_a_type:
+            ops_info["A_type"] = ksp_a_type
+        if ksp_p_type:
+            ops_info["P_type"] = ksp_p_type
+        extra["ksp_operators"] = ops_info
     extra["KSP_A_is_P"] = bool(ksp_a_is_p)
+    if ksp_p is not None:
+        try:
+            PETSc = _get_petsc()
+            info = ksp_p.getInfo(PETSc.Mat.InfoType.GLOBAL_SUM)
+            pmat_info: Dict[str, Any] = {}
+            if isinstance(info, dict):
+                if "nz_used" in info:
+                    pmat_info["nz_used"] = float(info.get("nz_used", 0.0))
+                if "nz_allocated" in info:
+                    pmat_info["nz_allocated"] = float(info.get("nz_allocated", 0.0))
+            else:
+                try:
+                    pmat_info["nz_used"] = float(getattr(info, "nz_used"))
+                except Exception:
+                    pass
+                try:
+                    pmat_info["nz_allocated"] = float(getattr(info, "nz_allocated"))
+                except Exception:
+                    pass
+            if pmat_info:
+                extra["pmat_info"] = pmat_info
+        except Exception:
+            pass
     if use_mfpc_sparse_fd:
         stats = dict(fd_stats) if isinstance(fd_stats, dict) else {}
         stats.setdefault("eps", float(fd_eps))
@@ -768,6 +1269,9 @@ def solve_nonlinear_petsc_parallel(
         if precond_max_nnz_row is not None:
             stats.setdefault("precond_max_nnz_row", int(precond_max_nnz_row))
         extra["mfpc_sparse_fd"] = stats
+        fd_col_stats = stats.get("fd_jacobian_stats")
+        if isinstance(fd_col_stats, dict):
+            extra["fd_jacobian_stats"] = dict(fd_col_stats)
     extra["parallel_backend"] = "petsc_snes_parallel"
     extra["comm_kind"] = "world"
 

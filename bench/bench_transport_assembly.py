@@ -13,6 +13,9 @@ if str(ROOT) not in sys.path:
 
 
 def _petsc_or_die():
+    from parallel.mpi_bootstrap import bootstrap_mpi_before_petsc
+
+    bootstrap_mpi_before_petsc()
     from petsc4py import PETSc
     return PETSc
 

@@ -23,7 +23,7 @@ from assembly.build_precond_aij import build_precond_mat_aij_from_A, fill_precon
 from assembly.build_sparse_fd_jacobian import build_sparse_fd_jacobian
 from assembly.jacobian_pattern import build_jacobian_pattern
 from assembly.residual_global import build_global_residual, residual_only
-from solvers.linear_types import JacobianMode
+from solvers.linear_types import JacobianMode, LinearSolverConfig as LinearSolverConfigTyped
 from solvers.nonlinear_context import NonlinearContext
 from solvers.nonlinear_types import NonlinearDiagnostics, NonlinearSolveResult
 from solvers.petsc_linear import apply_fieldsplit_subksp_defaults, apply_structured_pc, _normalize_pc_type
@@ -150,7 +150,7 @@ def _snes_set_jacobian_compat(snes, J, P, jac_func) -> None:
     except TypeError as exc:
         errors.append(exc)
 
-    # (J, func) — some older versions
+    # (J, func) -- some older versions
     try:
         snes.setJacobian(J, jac_func)
         return
@@ -178,6 +178,29 @@ def _snes_set_jacobian_compat(snes, J, P, jac_func) -> None:
     )
 
 
+def _apply_linesearch_options(PETSc, prefix: str, linesearch_type: str) -> str:
+    """
+    Inject snes_linesearch_type into PETSc.Options to avoid SNES.getLineSearch().
+    """
+    desired = (linesearch_type or "").strip()
+    if not desired:
+        return ""
+    try:
+        opts = PETSc.Options(prefix)
+        try:
+            current = opts.getString("snes_linesearch_type", default="")
+        except Exception:
+            current = ""
+        if not current:
+            try:
+                opts.setValue("snes_linesearch_type", desired)
+            except Exception:
+                opts["snes_linesearch_type"] = desired
+        return current or desired
+    except Exception:
+        return desired
+
+
 def solve_nonlinear_petsc(
     ctx: NonlinearContext,
     u0: np.ndarray,
@@ -192,6 +215,8 @@ def solve_nonlinear_petsc(
 
     cfg = ctx.cfg
     petsc_cfg = cfg.petsc
+
+    LinearSolverConfigTyped.from_cfg(cfg)
 
     # ------------------------------------------------------------------
     # MPI mode selection
@@ -690,12 +715,7 @@ def solve_nonlinear_petsc(
 
     snes.setTolerances(rtol=f_rtol, atol=f_atol, max_it=max_outer_iter)
 
-    # Line search
-    try:
-        ls = snes.getLineSearch()
-        ls.setType(linesearch_type)
-    except Exception:
-        logger.debug("Unable to set linesearch_type='%s'", linesearch_type)
+    linesearch_type_eff = _apply_linesearch_options(PETSc, prefix, linesearch_type)
 
     # ------------------------------------------------------------------
     # Jacobian selection
@@ -1031,6 +1051,14 @@ def solve_nonlinear_petsc(
     except Exception:
         pass
     try:
+        opts_eff = PETSc.Options(prefix)
+        linesearch_type_eff = opts_eff.getString(
+            "snes_linesearch_type",
+            default=linesearch_type_eff,
+        )
+    except Exception:
+        pass
+    try:
         ksp.setFromOptions()
     except Exception:
         pass
@@ -1069,13 +1097,23 @@ def solve_nonlinear_petsc(
     # Apply structured PC (except pure mf in parallel mode)
     diag_pc: Dict[str, Any] = {}
     if not (parallel_active and jacobian_mode_cfg == JacobianMode.MF):
-        A_for_range = Pop
+        Aop_call = None
+        Pop_call = None
+        try:
+            Aop_call, Pop_call = ksp.getOperators()
+        except Exception:
+            Aop_call = None
+            Pop_call = None
+        if Aop_call is None:
+            Aop_call = J
+        if Pop_call is None:
+            Pop_call = Pop
         diag_pc = apply_structured_pc(
             ksp=ksp,
             cfg=cfg,
             layout=ctx.layout,
-            A=A_for_range,
-            P=Pop,
+            A=Aop_call,
+            P=Pop_call,
             pc_type_override=_normalize_pc_type(pc_type),
         )
 
@@ -1193,7 +1231,7 @@ def solve_nonlinear_petsc(
         "snes_reason": reason,
         "snes_reason_str": str(reason),
         "snes_type": snes.getType(),
-        "linesearch_type": linesearch_type,
+        "linesearch_type": linesearch_type_eff or linesearch_type,
         "ksp_type": ksp.getType(),
         "pc_type": ksp.getPC().getType(),
         "ksp_reason": ksp_reason,
