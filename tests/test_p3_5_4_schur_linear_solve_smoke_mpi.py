@@ -63,7 +63,8 @@ class _ShellMultP:
 
 def build_A_shell_from_P(PETSc, comm, P):
     """
-    Build a shell-like matrix A whose MatMult delegates to P.mult().
+    Build a shell-like matrix A whose MatMult delegates to P.mult(), but whose
+    global/local sizes MUST match P exactly (robust across petsc4py size-order variants).
 
     This ensures the linear system A*x=b is equivalent to P*x=b,
     while A remains shell-like (covering fieldsplit+shell risk paths).
@@ -76,25 +77,51 @@ def build_A_shell_from_P(PETSc, comm, P):
     Returns:
         A: PETSc.Mat (shell-like, with mult delegated to P)
     """
-    (M, N) = P.getSize()
-    (m, n) = P.getLocalSize()
+    (M, N) = tuple(P.getSize())
+    (m, n) = tuple(P.getLocalSize())
 
-    try:
-        A = PETSc.Mat().createPython([[m, n], [M, N]], comm=comm)
+    def _finalize(A):
         A.setPythonContext(_ShellMultP(P))
         A.setUp()
+        # Hard guard: sizes must match P (this prevents Nonconforming object sizes)
+        if tuple(A.getSize()) != (M, N) or tuple(A.getLocalSize()) != (m, n):
+            try:
+                A.destroy()
+            except Exception:
+                pass
+            raise ValueError(
+                f"Shell/Python Mat size-order mismatch: "
+                f"A.getSize()={A.getSize()} P.getSize()={(M,N)}; "
+                f"A.getLocalSize()={A.getLocalSize()} P.getLocalSize()={(m,n)}"
+            )
         return A
-    except Exception:
+
+    # Try both size orders for createPython (petsc4py builds differ here)
+    for sizes in (
+        [[M, N], [m, n]],  # common convention: global then local
+        [[m, n], [M, N]],  # fallback: local then global
+    ):
         try:
-            A = PETSc.Mat().createShell([[m, n], [M, N]], comm=comm)
-            A.setPythonContext(_ShellMultP(P))
-            A.setUp()
-            return A
-        except Exception as exc:
-            raise RuntimeError(
-                "Unable to create shell matrix with Python context. "
-                "Check petsc4py version and build."
-            ) from exc
+            A = PETSc.Mat().createPython(sizes, comm=comm)
+            return _finalize(A)
+        except Exception:
+            pass
+
+    # Fallback: createShell with the same guarded size-order probing
+    for sizes in (
+        [[M, N], [m, n]],
+        [[m, n], [M, N]],
+    ):
+        try:
+            A = PETSc.Mat().createShell(sizes, comm=comm)
+            return _finalize(A)
+        except Exception:
+            pass
+
+    raise RuntimeError(
+        "Unable to create shell-like matrix with Python context (createPython/createShell both failed). "
+        "Check petsc4py version and build."
+    )
 
 
 @pytest.mark.mpi
@@ -159,14 +186,16 @@ def test_p3_5_4_schur_solve_smoke_defaults_mpi(tmp_path: Path):
 
     A = build_A_shell_from_P(PETSc, comm, P_solve)
 
-    x_true = mgr.dm.createGlobalVec()
+    # Use A's createVec methods to ensure size consistency
+    x_true = A.createVecRight()
     x_true.set(1.0)
 
-    b = mgr.dm.createGlobalVec()
+    b = A.createVecLeft()
     A.mult(x_true, b)
 
-    tmp1 = mgr.dm.createGlobalVec()
-    tmp2 = mgr.dm.createGlobalVec()
+    # Self-check: A.mult and P_solve.mult should be identical
+    tmp1 = A.createVecLeft()
+    tmp2 = A.createVecLeft()
     A.mult(x_true, tmp1)
     P_solve.mult(x_true, tmp2)
     tmp1.axpy(-1.0, tmp2)
@@ -191,7 +220,7 @@ def test_p3_5_4_schur_solve_smoke_defaults_mpi(tmp_path: Path):
     assert diag_pc.get("fieldsplit_type") == "schur"
     assert diag_pc.get("schur_fact_type") == "lower"
 
-    x = mgr.dm.createGlobalVec()
+    x = A.createVecRight()
     x.set(0.0)
     ksp.solve(b, x)
 
@@ -271,10 +300,11 @@ def test_p3_5_4_schur_solve_smoke_yaml_override_mpi(tmp_path: Path):
 
     A = build_A_shell_from_P(PETSc, comm, P_solve)
 
-    x_true = mgr.dm.createGlobalVec()
+    # Use A's createVec methods to ensure size consistency
+    x_true = A.createVecRight()
     x_true.set(1.0)
 
-    b = mgr.dm.createGlobalVec()
+    b = A.createVecLeft()
     A.mult(x_true, b)
 
     ksp = PETSc.KSP().create(comm=comm)
@@ -293,7 +323,7 @@ def test_p3_5_4_schur_solve_smoke_yaml_override_mpi(tmp_path: Path):
     injected = diag_pc.get("options_injected", {}) or {}
     assert injected.get("fieldsplit_bulk_ksp_type") == "gmres"
 
-    x = mgr.dm.createGlobalVec()
+    x = A.createVecRight()
     x.set(0.0)
     ksp.solve(b, x)
 
