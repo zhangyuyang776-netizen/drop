@@ -370,3 +370,225 @@ def test_p3_5_4_3_build_A_shell_from_P_and_types_mpi(tmp_path: Path):
 
     assert diag_pc.get("fieldsplit_type") == "schur"
     assert diag_pc.get("uses_amat") is False
+
+
+@pytest.mark.mpi
+def test_p3_5_4_4_schur_apply_structured_pc_and_setup_defaults_mpi(tmp_path: Path):
+    """
+    P3.5-4-4: Schur fieldsplit production path with defaults (structure only, no solve).
+
+    Validates the complete production call chain:
+    1. apply_structured_pc() injects options (Schur)
+    2. ksp.setFromOptions(); ksp.setUp() completes without fail-fast or hang
+    3. apply_fieldsplit_subksp_defaults() executes on Schur path
+    4. Sub-block operator types satisfy P3.4 constraints
+
+    Uses build_A_shell_from_P() for stable system construction (A.mult := P.mult).
+    """
+    (
+        _build_precond_matrix,
+        _build_shell_like_matrix,
+        _get_fieldsplit_subksps,
+        _import_chemistry_or_skip,
+        _import_mpi4py_or_skip,
+        _import_petsc_or_skip,
+        _start_watchdog_abort_after_seconds,
+    ) = _import_helpers()
+
+    _import_mpi4py_or_skip()
+    PETSc = _import_petsc_or_skip()
+    _import_chemistry_or_skip()
+
+    comm = PETSc.COMM_WORLD
+    if comm.getSize() < 2:
+        pytest.skip("need MPI size >= 2")
+
+    _start_watchdog_abort_after_seconds(30.0)
+
+    from parallel.dm_manager import build_dm  # noqa: E402
+    from core.layout_dist import LayoutDistributed  # noqa: E402
+    from solvers.petsc_linear import apply_fieldsplit_subksp_defaults, apply_structured_pc  # noqa: E402
+    from solvers.mpi_linear_support import validate_mpi_linear_support  # noqa: E402
+
+    # 1. Configure (minimal Schur structure)
+    cfg, layout, ctx, u0 = _build_context(tmp_path, comm.getSize(), comm.getRank())
+    cfg.petsc.jacobian_mode = "mfpc_sparse_fd"
+    cfg.solver.linear.pc_type = "fieldsplit"
+    cfg.solver.linear.fieldsplit = {"type": "schur", "scheme": "bulk_iface"}
+
+    # 2. Validate (ensures defaults/backfill applied)
+    validate_mpi_linear_support(cfg)
+
+    # 3. Build dm/layout_dist
+    mgr = build_dm(cfg, layout, comm=comm)
+    ld = LayoutDistributed.build(comm, mgr, layout)
+    ctx.meta["dm"] = mgr.dm
+    ctx.meta["dm_manager"] = mgr
+    ctx.meta["layout_dist"] = ld
+
+    fd_eps = float(getattr(getattr(cfg, "petsc", None), "fd_eps", 1.0e-8))
+    drop_tol = float(getattr(getattr(cfg, "petsc", None), "precond_drop_tol", 0.0))
+
+    # 4. Construct P (AIJ/MPIAIJ)
+    P = _build_precond_matrix(PETSc, comm, mgr.dm, ctx, u0, fd_eps=fd_eps, drop_tol=drop_tol)
+
+    # 5. Construct A (shell) using proven helper
+    A = build_A_shell_from_P(PETSc, comm, P)
+
+    # 6. Configure KSP/PC (production path)
+    ksp = PETSc.KSP().create(comm=comm)
+    ksp.setOptionsPrefix("p544_defaults_")
+    ksp.setOperators(A, P)
+    ksp.setType("gmres")
+
+    diag_pc = apply_structured_pc(ksp, cfg, layout, A, P)
+    ksp.setFromOptions()
+    ksp.setUp()
+    apply_fieldsplit_subksp_defaults(ksp, diag_pc)
+
+    # 7. Assertions (structure layer, no solve)
+    assert diag_pc.get("fieldsplit_type") == "schur"
+    assert diag_pc.get("uses_amat") is False, "Schur must force uses_amat=False"
+    assert diag_pc.get("schur_fact_type") == "lower", "Default schur_fact_type should be lower"
+
+    # Verify options injection occurred
+    injected = diag_pc.get("options_injected", {}) or {}
+    assert "fieldsplit_bulk_ksp_type" in injected, "bulk options should be injected"
+    assert "fieldsplit_iface_sub_pc_type" in injected, "iface options should be injected"
+    assert injected["fieldsplit_bulk_ksp_type"] == "preonly", "Default bulk ksp_type"
+    assert injected["fieldsplit_iface_sub_pc_type"] == "lu", "Schur default iface sub_pc_type"
+
+    # Sub-block operator type check (P3.4 constraints)
+    pc = ksp.getPC()
+    subksps = _get_fieldsplit_subksps(pc)
+    assert len(subksps) >= 2, f"Expected at least 2 sub-KSPs, got {len(subksps)}"
+
+    for idx, sksp in enumerate(subksps):
+        try:
+            As, Ps = sksp.getOperators()
+        except Exception:
+            continue
+        As_t = str(As.getType()).lower() if As is not None else ""
+        Ps_t = str(Ps.getType()).lower() if Ps is not None else ""
+
+        # P_sub must be AIJ
+        assert "aij" in Ps_t, f"subKSP[{idx}] Psub={Ps_t} should be AIJ"
+
+        # A_sub: allow AIJ or schurcomplement, but not matshell
+        is_aij_or_schur = ("aij" in As_t) or (As_t == "schurcomplement")
+        is_shell = ("shell" in As_t) or ("mffd" in As_t) or ("python" in As_t)
+        assert is_aij_or_schur, f"subKSP[{idx}] Asub={As_t} should be AIJ or schurcomplement"
+        assert not is_shell, f"subKSP[{idx}] Asub={As_t} should not be shell-like"
+
+
+@pytest.mark.mpi
+def test_p3_5_4_4_schur_apply_structured_pc_and_setup_yaml_override_mpi(tmp_path: Path):
+    """
+    P3.5-4-4: Schur fieldsplit production path with YAML overrides (structure only, no solve).
+
+    Validates that user overrides (schur_fact_type='upper', bulk.ksp_type='gmres')
+    are correctly applied through the production call chain.
+
+    Uses build_A_shell_from_P() for stable system construction (A.mult := P.mult).
+    """
+    (
+        _build_precond_matrix,
+        _build_shell_like_matrix,
+        _get_fieldsplit_subksps,
+        _import_chemistry_or_skip,
+        _import_mpi4py_or_skip,
+        _import_petsc_or_skip,
+        _start_watchdog_abort_after_seconds,
+    ) = _import_helpers()
+
+    _import_mpi4py_or_skip()
+    PETSc = _import_petsc_or_skip()
+    _import_chemistry_or_skip()
+
+    comm = PETSc.COMM_WORLD
+    if comm.getSize() < 2:
+        pytest.skip("need MPI size >= 2")
+
+    _start_watchdog_abort_after_seconds(30.0)
+
+    from parallel.dm_manager import build_dm  # noqa: E402
+    from core.layout_dist import LayoutDistributed  # noqa: E402
+    from solvers.petsc_linear import apply_fieldsplit_subksp_defaults, apply_structured_pc  # noqa: E402
+    from solvers.mpi_linear_support import validate_mpi_linear_support  # noqa: E402
+
+    # 1. Configure (Schur structure with YAML overrides)
+    cfg, layout, ctx, u0 = _build_context(tmp_path, comm.getSize(), comm.getRank())
+    cfg.petsc.jacobian_mode = "mfpc_sparse_fd"
+    cfg.solver.linear.pc_type = "fieldsplit"
+    cfg.solver.linear.fieldsplit = {
+        "type": "schur",
+        "scheme": "bulk_iface",
+        "schur_fact_type": "upper",
+        "subsolvers": {
+            "bulk": {"ksp_type": "gmres"},
+        },
+    }
+
+    # 2. Validate (ensures defaults/backfill + override validation)
+    validate_mpi_linear_support(cfg)
+
+    # 3. Build dm/layout_dist
+    mgr = build_dm(cfg, layout, comm=comm)
+    ld = LayoutDistributed.build(comm, mgr, layout)
+    ctx.meta["dm"] = mgr.dm
+    ctx.meta["dm_manager"] = mgr
+    ctx.meta["layout_dist"] = ld
+
+    fd_eps = float(getattr(getattr(cfg, "petsc", None), "fd_eps", 1.0e-8))
+    drop_tol = float(getattr(getattr(cfg, "petsc", None), "precond_drop_tol", 0.0))
+
+    # 4. Construct P (AIJ/MPIAIJ)
+    P = _build_precond_matrix(PETSc, comm, mgr.dm, ctx, u0, fd_eps=fd_eps, drop_tol=drop_tol)
+
+    # 5. Construct A (shell) using proven helper
+    A = build_A_shell_from_P(PETSc, comm, P)
+
+    # 6. Configure KSP/PC (production path)
+    ksp = PETSc.KSP().create(comm=comm)
+    ksp.setOptionsPrefix("p544_override_")
+    ksp.setOperators(A, P)
+    ksp.setType("gmres")
+
+    diag_pc = apply_structured_pc(ksp, cfg, layout, A, P)
+    ksp.setFromOptions()
+    ksp.setUp()
+    apply_fieldsplit_subksp_defaults(ksp, diag_pc)
+
+    # 7. Assertions (structure layer, verify overrides applied)
+    assert diag_pc.get("fieldsplit_type") == "schur"
+    assert diag_pc.get("uses_amat") is False, "Schur must force uses_amat=False"
+    assert diag_pc.get("schur_fact_type") == "upper", "YAML override schur_fact_type should be upper"
+
+    # Verify options injection with YAML overrides
+    injected = diag_pc.get("options_injected", {}) or {}
+    assert "fieldsplit_bulk_ksp_type" in injected, "bulk options should be injected"
+    assert injected["fieldsplit_bulk_ksp_type"] == "gmres", "YAML override bulk.ksp_type=gmres"
+    assert injected.get("fieldsplit_iface_sub_pc_type") == "lu", "Schur default iface sub_pc_type=lu"
+
+    # Sub-block operator type check (P3.4 constraints)
+    pc = ksp.getPC()
+    subksps = _get_fieldsplit_subksps(pc)
+    assert len(subksps) >= 2, f"Expected at least 2 sub-KSPs, got {len(subksps)}"
+
+    for idx, sksp in enumerate(subksps):
+        try:
+            As, Ps = sksp.getOperators()
+        except Exception:
+            continue
+        As_t = str(As.getType()).lower() if As is not None else ""
+        Ps_t = str(Ps.getType()).lower() if Ps is not None else ""
+
+        # P_sub must be AIJ
+        assert "aij" in Ps_t, f"subKSP[{idx}] Psub={Ps_t} should be AIJ"
+
+        # A_sub: allow AIJ or schurcomplement, but not matshell
+        is_aij_or_schur = ("aij" in As_t) or (As_t == "schurcomplement")
+        is_shell = ("shell" in As_t) or ("mffd" in As_t) or ("python" in As_t)
+        assert is_aij_or_schur, f"subKSP[{idx}] Asub={As_t} should be AIJ or schurcomplement"
+        assert not is_shell, f"subKSP[{idx}] Asub={As_t} should not be shell-like"
+
