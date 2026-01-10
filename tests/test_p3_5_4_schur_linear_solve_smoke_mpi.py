@@ -1,17 +1,25 @@
 """
-P3.5-4-2 smoke tests: Schur fieldsplit setUp path (structure only, no solve yet).
+P3.5-4 smoke tests: Schur fieldsplit setUp and solve validation.
 
-This module validates that Schur fieldsplit can complete setUp without hanging,
-covering the fieldsplit+shell risk path. Solve and numerical validation are
-deferred to P3.5-4-3+.
+This module validates that Schur fieldsplit can complete the full production
+call chain from configuration through solve, covering the fieldsplit+shell
+risk path.
+
+Test phases:
+- P3.5-4-2: setUp path structure validation (no solve)
+- P3.5-4-3: A(shell) construction with MatMult delegation to P
+- P3.5-4-4: Production path configuration and setUp validation
+- P3.5-4-5: Complete solve with numerical convergence validation
 
 Key validations:
 - uses_amat = False (P3.4 fail-fast)
 - fieldsplit_type = schur
 - Sub-block operator types correct (P_sub: AIJ, A_sub: AIJ or schurcomplement)
+- Solve converges with stable system construction (A.mult := P.mult)
 """
 from __future__ import annotations
 
+import math
 import sys
 from pathlib import Path
 
@@ -50,6 +58,21 @@ def _build_context(tmp_path: Path, comm_size: int, rank: int):
     tmp_rank = tmp_path / f"rank_{rank:03d}"
     tmp_rank.mkdir(parents=True, exist_ok=True)
     return _build_case_defaults(tmp_rank, comm_size, rank)
+
+
+def _fill_deterministic(vec):
+    """
+    Fill vector with deterministic values based on global indices.
+
+    Uses pattern: vec[i] = 1.0 + 1e-3 * i
+    This ensures non-trivial, reproducible RHS in parallel.
+    """
+    r0, r1 = vec.getOwnershipRange()
+    idx = list(range(r0, r1))
+    vals = [1.0 + 1e-3 * i for i in idx]
+    vec.setValues(idx, vals)
+    vec.assemblyBegin()
+    vec.assemblyEnd()
 
 
 def build_A_shell_from_P(PETSc, comm, P):
@@ -592,3 +615,238 @@ def test_p3_5_4_4_schur_apply_structured_pc_and_setup_yaml_override_mpi(tmp_path
         assert is_aij_or_schur, f"subKSP[{idx}] Asub={As_t} should be AIJ or schurcomplement"
         assert not is_shell, f"subKSP[{idx}] Asub={As_t} should not be shell-like"
 
+
+@pytest.mark.mpi
+def test_p3_5_4_5_schur_solve_smoke_defaults_mpi(tmp_path: Path):
+    """
+    P3.5-4-5: Schur fieldsplit complete solve with defaults.
+
+    Validates the full production call chain including solve:
+    - System construction: P.shift(1.0), A.mult := P.mult (stable, well-conditioned)
+    - Deterministic x_true construction (1.0 + 1e-3*i)
+    - Production path: validate → apply_structured_pc → setUp →
+      apply_fieldsplit_subksp_defaults → solve
+    - Numerical validation: convergence, finite norm, relative error < 1e-6
+
+    Uses P.createVecRight/Left() to avoid size mismatch (critical for MPI).
+    """
+    (
+        _build_precond_matrix,
+        _build_shell_like_matrix,
+        _get_fieldsplit_subksps,
+        _import_chemistry_or_skip,
+        _import_mpi4py_or_skip,
+        _import_petsc_or_skip,
+        _start_watchdog_abort_after_seconds,
+    ) = _import_helpers()
+
+    _import_mpi4py_or_skip()
+    PETSc = _import_petsc_or_skip()
+    _import_chemistry_or_skip()
+
+    comm = PETSc.COMM_WORLD
+    if comm.getSize() < 2:
+        pytest.skip("need MPI size >= 2")
+
+    _start_watchdog_abort_after_seconds(60.0)
+
+    from parallel.dm_manager import build_dm  # noqa: E402
+    from core.layout_dist import LayoutDistributed  # noqa: E402
+    from solvers.petsc_linear import apply_fieldsplit_subksp_defaults, apply_structured_pc  # noqa: E402
+    from solvers.mpi_linear_support import validate_mpi_linear_support  # noqa: E402
+
+    # 1. Configure (minimal Schur structure)
+    cfg, layout, ctx, u0 = _build_context(tmp_path, comm.getSize(), comm.getRank())
+    cfg.petsc.jacobian_mode = "mfpc_sparse_fd"
+    cfg.solver.linear.pc_type = "fieldsplit"
+    cfg.solver.linear.fieldsplit = {"type": "schur", "scheme": "bulk_iface"}
+
+    # 2. Validate (ensures defaults/backfill applied)
+    validate_mpi_linear_support(cfg)
+
+    # 3. Build dm/layout_dist
+    mgr = build_dm(cfg, layout, comm=comm)
+    ld = LayoutDistributed.build(comm, mgr, layout)
+    ctx.meta["dm"] = mgr.dm
+    ctx.meta["dm_manager"] = mgr
+    ctx.meta["layout_dist"] = ld
+
+    fd_eps = float(getattr(getattr(cfg, "petsc", None), "fd_eps", 1.0e-8))
+    drop_tol = float(getattr(getattr(cfg, "petsc", None), "precond_drop_tol", 0.0))
+
+    # 4. Construct stable system: P.shift(1.0), A.mult := P.mult
+    P_base = _build_precond_matrix(PETSc, comm, mgr.dm, ctx, u0, fd_eps=fd_eps, drop_tol=drop_tol)
+    P = P_base.copy()
+    P.shift(1.0)  # Light regularization for guaranteed solvability
+    A = build_A_shell_from_P(PETSc, comm, P)
+
+    # 5. Construct deterministic x_true and b = A*x_true
+    # CRITICAL: Use P.createVecRight/Left() to avoid size mismatch
+    x_true = P.createVecRight()
+    _fill_deterministic(x_true)
+
+    b = P.createVecLeft()
+    A.mult(x_true, b)
+
+    # 6. Configure KSP/PC (production path)
+    ksp = PETSc.KSP().create(comm=comm)
+    ksp.setOptionsPrefix("p545_defaults_")
+    ksp.setOperators(A, P)
+    ksp.setType("gmres")
+
+    diag_pc = apply_structured_pc(ksp, cfg, layout, A, P)
+    ksp.setFromOptions()
+    ksp.setUp()
+    apply_fieldsplit_subksp_defaults(ksp, diag_pc)
+
+    # Set tight convergence tolerance for accurate solution
+    ksp.setTolerances(rtol=1e-10, atol=0.0, max_it=200)
+
+    # 7. Solve
+    x = P.createVecRight()
+    x.set(0.0)
+    ksp.solve(b, x)
+
+    # 8. Assertions (numerical validation)
+    reason = ksp.getConvergedReason()
+    n_iter = ksp.getIterationNumber()
+
+    # Must converge (not diverge to NaN/Inf)
+    assert reason > 0, f"KSP did not converge: reason={reason}, n_iter={n_iter}"
+
+    # Solution norm must be finite
+    x_norm = x.norm()
+    assert math.isfinite(x_norm), f"Solution norm is not finite: {x_norm}"
+    assert x_norm > 0, f"Solution norm is zero or negative: {x_norm}"
+
+    # Relative error must be small
+    err = x.copy()
+    err.axpy(-1.0, x_true)
+    err_norm = err.norm()
+    x_true_norm = x_true.norm()
+    rel_err = err_norm / max(x_true_norm, 1e-30)
+
+    assert rel_err < 1e-6, f"Solution error too large: rel_err={rel_err:.2e}, n_iter={n_iter}"
+
+
+@pytest.mark.mpi
+def test_p3_5_4_5_schur_solve_smoke_yaml_override_mpi(tmp_path: Path):
+    """
+    P3.5-4-5: Schur fieldsplit complete solve with YAML overrides.
+
+    Same as defaults test, but with user overrides:
+    - schur_fact_type='upper'
+    - bulk.ksp_type='gmres'
+
+    Validates that YAML overrides propagate correctly through the full
+    production call chain including solve.
+    """
+    (
+        _build_precond_matrix,
+        _build_shell_like_matrix,
+        _get_fieldsplit_subksps,
+        _import_chemistry_or_skip,
+        _import_mpi4py_or_skip,
+        _import_petsc_or_skip,
+        _start_watchdog_abort_after_seconds,
+    ) = _import_helpers()
+
+    _import_mpi4py_or_skip()
+    PETSc = _import_petsc_or_skip()
+    _import_chemistry_or_skip()
+
+    comm = PETSc.COMM_WORLD
+    if comm.getSize() < 2:
+        pytest.skip("need MPI size >= 2")
+
+    _start_watchdog_abort_after_seconds(60.0)
+
+    from parallel.dm_manager import build_dm  # noqa: E402
+    from core.layout_dist import LayoutDistributed  # noqa: E402
+    from solvers.petsc_linear import apply_fieldsplit_subksp_defaults, apply_structured_pc  # noqa: E402
+    from solvers.mpi_linear_support import validate_mpi_linear_support  # noqa: E402
+
+    # 1. Configure (Schur structure with YAML overrides)
+    cfg, layout, ctx, u0 = _build_context(tmp_path, comm.getSize(), comm.getRank())
+    cfg.petsc.jacobian_mode = "mfpc_sparse_fd"
+    cfg.solver.linear.pc_type = "fieldsplit"
+    cfg.solver.linear.fieldsplit = {
+        "type": "schur",
+        "scheme": "bulk_iface",
+        "schur_fact_type": "upper",
+        "subsolvers": {
+            "bulk": {"ksp_type": "gmres"},
+        },
+    }
+
+    # 2. Validate (ensures defaults/backfill + override validation)
+    validate_mpi_linear_support(cfg)
+
+    # 3. Build dm/layout_dist
+    mgr = build_dm(cfg, layout, comm=comm)
+    ld = LayoutDistributed.build(comm, mgr, layout)
+    ctx.meta["dm"] = mgr.dm
+    ctx.meta["dm_manager"] = mgr
+    ctx.meta["layout_dist"] = ld
+
+    fd_eps = float(getattr(getattr(cfg, "petsc", None), "fd_eps", 1.0e-8))
+    drop_tol = float(getattr(getattr(cfg, "petsc", None), "precond_drop_tol", 0.0))
+
+    # 4. Construct stable system: P.shift(1.0), A.mult := P.mult
+    P_base = _build_precond_matrix(PETSc, comm, mgr.dm, ctx, u0, fd_eps=fd_eps, drop_tol=drop_tol)
+    P = P_base.copy()
+    P.shift(1.0)  # Light regularization for guaranteed solvability
+    A = build_A_shell_from_P(PETSc, comm, P)
+
+    # 5. Construct deterministic x_true and b = A*x_true
+    # CRITICAL: Use P.createVecRight/Left() to avoid size mismatch
+    x_true = P.createVecRight()
+    _fill_deterministic(x_true)
+
+    b = P.createVecLeft()
+    A.mult(x_true, b)
+
+    # 6. Configure KSP/PC (production path)
+    ksp = PETSc.KSP().create(comm=comm)
+    ksp.setOptionsPrefix("p545_override_")
+    ksp.setOperators(A, P)
+    ksp.setType("gmres")
+
+    diag_pc = apply_structured_pc(ksp, cfg, layout, A, P)
+    ksp.setFromOptions()
+    ksp.setUp()
+    apply_fieldsplit_subksp_defaults(ksp, diag_pc)
+
+    # Set tight convergence tolerance for accurate solution
+    ksp.setTolerances(rtol=1e-10, atol=0.0, max_it=200)
+
+    # 7. Solve
+    x = P.createVecRight()
+    x.set(0.0)
+    ksp.solve(b, x)
+
+    # 8. Assertions (numerical validation)
+    reason = ksp.getConvergedReason()
+    n_iter = ksp.getIterationNumber()
+
+    # Must converge (not diverge to NaN/Inf)
+    assert reason > 0, f"KSP did not converge: reason={reason}, n_iter={n_iter}"
+
+    # Solution norm must be finite
+    x_norm = x.norm()
+    assert math.isfinite(x_norm), f"Solution norm is not finite: {x_norm}"
+    assert x_norm > 0, f"Solution norm is zero or negative: {x_norm}"
+
+    # Relative error must be small
+    err = x.copy()
+    err.axpy(-1.0, x_true)
+    err_norm = err.norm()
+    x_true_norm = x_true.norm()
+    rel_err = err_norm / max(x_true_norm, 1e-30)
+
+    assert rel_err < 1e-6, f"Solution error too large: rel_err={rel_err:.2e}, n_iter={n_iter}"
+
+    # Verify YAML overrides were applied
+    assert diag_pc.get("schur_fact_type") == "upper", "YAML override schur_fact_type should be upper"
+    injected = diag_pc.get("options_injected", {}) or {}
+    assert injected.get("fieldsplit_bulk_ksp_type") == "gmres", "YAML override bulk.ksp_type=gmres"
