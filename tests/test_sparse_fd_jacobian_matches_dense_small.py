@@ -12,6 +12,8 @@ if str(ROOT) not in sys.path:
 
 
 def _import_petsc_or_skip():
+    from parallel.mpi_bootstrap import bootstrap_mpi_before_petsc
+    bootstrap_mpi_before_petsc()
     pytest.importorskip("petsc4py")
     from petsc4py import PETSc
     if PETSc.COMM_WORLD.getSize() != 1:
@@ -87,16 +89,29 @@ def _build_dense_fd_jacobian(ctx, x0, eps=1.0e-8):
 
     scale_u = np.asarray(ctx.scale_u, dtype=np.float64)
     scale_u_safe = np.where(scale_u > 0.0, scale_u, 1.0)
-    scale_F = np.asarray(ctx.meta.get("residual_scale_F", np.ones_like(x0)), dtype=np.float64)
+    meta = getattr(ctx, "meta", None)
+    if meta is None or not isinstance(meta, dict):
+        meta = {}
+    scale_F = np.asarray(meta.get("residual_scale_F", np.ones_like(x0)), dtype=np.float64)
     scale_F_safe = np.where(scale_F > 0.0, scale_F, 1.0)
+    x_space = str(meta.get("petsc_x_space", "physical")).lower()
+    f_space = str(meta.get("petsc_f_space", "physical")).lower()
 
     from assembly.residual_global import residual_only
 
     def _x_to_u_phys(x_arr):
-        return x_arr * scale_u_safe
+        if x_space in ("physical", "phys", "unscaled"):
+            return x_arr
+        if x_space in ("scaled", "eval"):
+            return x_arr * scale_u_safe
+        raise ValueError(f"Unknown petsc_x_space={x_space!r}")
 
     def _res_phys_to_eval(res_phys):
-        return res_phys / scale_F_safe
+        if f_space in ("physical", "phys", "unscaled"):
+            return res_phys
+        if f_space in ("scaled", "eval"):
+            return res_phys / scale_F_safe
+        raise ValueError(f"Unknown petsc_f_space={f_space!r}")
 
     u0_phys = _x_to_u_phys(x0)
     r0_phys = residual_only(u0_phys, ctx)

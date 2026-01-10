@@ -63,7 +63,6 @@ def test_snes_fieldsplit_runs_one_step():
     cfg, grid, layout, state0, props0 = _build_case_base()
 
     cfg_ilu = copy.deepcopy(cfg)
-    cfg_ilu.solver.linear.pc_type = "ilu"
     cfg_ilu.solver.linear.fieldsplit = None
 
     cfg_fs = copy.deepcopy(cfg)

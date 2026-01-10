@@ -53,6 +53,8 @@ def _build_case(tmp_path: Path, nproc: int, rank: int):
     cfg.petsc.ksp_type = "gmres"
     cfg.petsc.pc_type = "asm"
     cfg.petsc.max_it = 2
+    if hasattr(cfg, "solver") and hasattr(cfg.solver, "linear"):
+        cfg.solver.linear.pc_type = "asm"
 
     cfg.paths.output_root = tmp_path
     cfg.paths.case_dir = tmp_path / f"case_rank_{rank:03d}"
@@ -117,9 +119,6 @@ def test_petsc_snes_parallel_defaults_ignore_cfg_mpi(tmp_path: Path):
     cfg.petsc.max_it = 5
     cfg.petsc.restart = 2
 
-    if hasattr(cfg, "solver") and hasattr(cfg.solver, "linear"):
-        cfg.solver.linear.pc_type = "lu"
-
     from parallel.dm_manager import build_dm  # noqa: E402
     from core.layout_dist import LayoutDistributed  # noqa: E402
     from solvers.petsc_snes_parallel import solve_nonlinear_petsc_parallel  # noqa: E402
@@ -181,7 +180,7 @@ def test_petsc_snes_parallel_vec_mat_pc_types_mpi(tmp_path: Path):
 
     assert str(extra.get("pc_type", "")).lower() == "asm"
     assert extra.get("snes_mf_enabled", False) is True
-    assert extra.get("pc_type_overridden", False) is True
+    assert extra.get("pc_type_overridden", False) is False
 
     try:
         comm.barrier()

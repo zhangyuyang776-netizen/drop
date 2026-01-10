@@ -54,6 +54,8 @@ def _build_case(tmp_path: Path, nproc: int, rank: int):
     cfg.petsc.ksp_type = "gmres"
     cfg.petsc.pc_type = "asm"
     cfg.petsc.max_it = 2
+    if hasattr(cfg, "solver") and hasattr(cfg.solver, "linear"):
+        cfg.solver.linear.pc_type = "asm"
 
     cfg.paths.output_root = tmp_path
     cfg.paths.case_dir = tmp_path / f"case_rank_{rank:03d}"

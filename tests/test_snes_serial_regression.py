@@ -53,9 +53,6 @@ def _build_case(tmp_path: Path):
     cfg.petsc.pc_type = "lu"
     cfg.petsc.max_it = 2
 
-    if hasattr(cfg, "solver") and hasattr(cfg.solver, "linear"):
-        cfg.solver.linear.pc_type = "lu"
-
     cfg.paths.output_root = tmp_path
     cfg.paths.case_dir = tmp_path / "case_serial"
     cfg.paths.case_dir.mkdir(parents=True, exist_ok=True)
