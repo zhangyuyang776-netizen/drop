@@ -52,6 +52,42 @@ def _build_context(tmp_path: Path, comm_size: int, rank: int):
     return _build_case_defaults(tmp_rank, comm_size, rank)
 
 
+def build_A_shell_from_P(PETSc, comm, P):
+    """
+    Build a shell-like (python) matrix A whose MatMult delegates to P.mult.
+    A and P must have conforming sizes and parallel layout.
+
+    This construction ensures the linear system A*x=b is equivalent to P*x=b,
+    providing a stable, well-conditioned system for Schur fieldsplit smoke tests.
+
+    Args:
+        PETSc: petsc4py.PETSc module
+        comm: MPI communicator
+        P: PETSc.Mat (AIJ/MPIAIJ preconditioner matrix)
+
+    Returns:
+        A: PETSc.Mat (python mat with A.mult(x,y) == P.mult(x,y))
+    """
+
+    class _AMultFromP:
+        """Python context for shell matrix that delegates mult to P."""
+
+        def __init__(self, Pmat):
+            self.P = Pmat
+
+        def mult(self, A, x, y):
+            """Delegate: y = P * x"""
+            self.P.mult(x, y)
+
+    m_loc, n_loc = P.getLocalSize()
+    m_glb, n_glb = P.getSize()
+
+    A = PETSc.Mat().createPython([[m_loc, m_glb], [n_loc, n_glb]], comm=comm)
+    A.setPythonContext(_AMultFromP(P))
+    A.setUp()
+    return A
+
+
 @pytest.mark.mpi
 def test_p3_5_4_2_schur_setup_defaults_mpi(tmp_path: Path):
     """
@@ -243,3 +279,94 @@ def test_p3_5_4_2_schur_setup_yaml_override_mpi(tmp_path: Path):
         is_shell = ("shell" in As_t) or ("mffd" in As_t) or ("python" in As_t)
         assert is_aij_or_schur, f"subKSP[{idx}] Asub={As_t} should be AIJ or schurcomplement"
         assert not is_shell, f"subKSP[{idx}] Asub={As_t} should not be shell-like"
+
+
+@pytest.mark.mpi
+def test_p3_5_4_3_build_A_shell_from_P_and_types_mpi(tmp_path: Path):
+    """
+    P3.5-4-3: Build A(shell) from P(AIJ) with MatMult delegation.
+
+    Validates the stable system construction where A.mult(x,y) := P.mult(x,y),
+    ensuring type conformance and size consistency without solve.
+
+    Key validations:
+    - P type: AIJ/MPIAIJ
+    - A type: python/shell (shell-like)
+    - A.mult(x,y) size conformance (no "Nonconforming object sizes")
+    - Schur setUp path still stable
+    """
+    (
+        _build_precond_matrix,
+        _build_shell_like_matrix,
+        _get_fieldsplit_subksps,
+        _import_chemistry_or_skip,
+        _import_mpi4py_or_skip,
+        _import_petsc_or_skip,
+        _start_watchdog_abort_after_seconds,
+    ) = _import_helpers()
+
+    _import_mpi4py_or_skip()
+    PETSc = _import_petsc_or_skip()
+    _import_chemistry_or_skip()
+
+    comm = PETSc.COMM_WORLD
+    if comm.getSize() < 2:
+        pytest.skip("need MPI size >= 2")
+
+    _start_watchdog_abort_after_seconds(30.0)
+
+    from parallel.dm_manager import build_dm  # noqa: E402
+    from core.layout_dist import LayoutDistributed  # noqa: E402
+    from solvers.petsc_linear import apply_fieldsplit_subksp_defaults, apply_structured_pc  # noqa: E402
+    from solvers.mpi_linear_support import validate_mpi_linear_support  # noqa: E402
+
+    cfg, layout, ctx, u0 = _build_context(tmp_path, comm.getSize(), comm.getRank())
+    cfg.petsc.jacobian_mode = "mfpc_sparse_fd"
+    cfg.solver.linear.pc_type = "fieldsplit"
+    cfg.solver.linear.fieldsplit = {"type": "schur", "scheme": "bulk_iface"}
+
+    validate_mpi_linear_support(cfg)
+
+    mgr = build_dm(cfg, layout, comm=comm)
+    ld = LayoutDistributed.build(comm, mgr, layout)
+    ctx.meta["dm"] = mgr.dm
+    ctx.meta["dm_manager"] = mgr
+    ctx.meta["layout_dist"] = ld
+
+    fd_eps = float(getattr(getattr(cfg, "petsc", None), "fd_eps", 1.0e-8))
+    drop_tol = float(getattr(getattr(cfg, "petsc", None), "precond_drop_tol", 0.0))
+
+    P = _build_precond_matrix(PETSc, comm, mgr.dm, ctx, u0, fd_eps=fd_eps, drop_tol=drop_tol)
+    A = build_A_shell_from_P(PETSc, comm, P)
+
+    # --- P3.5-4-3 acceptance assertions (types) ---
+    P_type = str(P.getType()).lower()
+    assert "aij" in P_type, f"P should be AIJ/MPIAIJ, got {P.getType()}"
+
+    A_type = str(A.getType()).lower()
+    assert ("python" in A_type) or ("shell" in A_type), f"A should be python/shell, got {A.getType()}"
+
+    # --- size conformance smoke (prevents the old MatMult nonconforming crash) ---
+    # Use P.createVecRight()/Left() to ensure size consistency with matrix layout
+    xr = P.createVecRight()
+    yl = P.createVecLeft()
+    xr.set(1.0)
+    A.mult(xr, yl)  # must not raise "Nonconforming object sizes"
+
+    # Verify sizes match
+    assert A.getSize() == P.getSize(), f"A.getSize()={A.getSize()} != P.getSize()={P.getSize()}"
+    assert A.getLocalSize() == P.getLocalSize(), f"A.getLocalSize()={A.getLocalSize()} != P.getLocalSize()={P.getLocalSize()}"
+
+    # --- still run schur setUp path (structure) ---
+    ksp = PETSc.KSP().create(comm=comm)
+    ksp.setOptionsPrefix("p3543_")
+    ksp.setOperators(A, P)
+    ksp.setType("gmres")
+
+    diag_pc = apply_structured_pc(ksp, cfg, layout, A, P)
+    ksp.setFromOptions()
+    ksp.setUp()
+    apply_fieldsplit_subksp_defaults(ksp, diag_pc)
+
+    assert diag_pc.get("fieldsplit_type") == "schur"
+    assert diag_pc.get("uses_amat") is False
