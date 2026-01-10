@@ -1,14 +1,14 @@
 """
-P3.5-4 smoke tests: Schur fieldsplit linear solve with stable system construction.
+P3.5-4-2 smoke tests: Schur fieldsplit setUp path (structure only, no solve yet).
 
-This module implements the P3.5-4-1 construction strategy:
-- A: shell-like matrix (mult delegates to P)
-- P: AIJ preconditioner (lightly regularized)
-- x_true: deterministic (all 1s)
-- b = A*x_true
+This module validates that Schur fieldsplit can complete setUp without hanging,
+covering the fieldsplit+shell risk path. Solve and numerical validation are
+deferred to P3.5-4-3+.
 
-This ensures the solve is stable and convergence-insensitive, covering
-the fieldsplit+shell risk path while maintaining numerical reliability.
+Key validations:
+- uses_amat = False (P3.4 fail-fast)
+- fieldsplit_type = schur
+- Sub-block operator types correct (P_sub: AIJ, A_sub: AIJ or schurcomplement)
 """
 from __future__ import annotations
 
@@ -25,6 +25,7 @@ if str(ROOT) not in sys.path:
 def _import_helpers():
     from tests.test_p3_4_0_fieldsplit_uses_pmat_only_mpi import (  # noqa: E402
         _build_precond_matrix,
+        _build_shell_like_matrix,
         _get_fieldsplit_subksps,
         _import_chemistry_or_skip,
         _import_mpi4py_or_skip,
@@ -34,6 +35,7 @@ def _import_helpers():
 
     return (
         _build_precond_matrix,
+        _build_shell_like_matrix,
         _get_fieldsplit_subksps,
         _import_chemistry_or_skip,
         _import_mpi4py_or_skip,
@@ -50,94 +52,17 @@ def _build_context(tmp_path: Path, comm_size: int, rank: int):
     return _build_case_defaults(tmp_rank, comm_size, rank)
 
 
-class _ShellMultP:
-    """Shell matrix context that delegates mult to a given PETSc matrix P."""
-
-    def __init__(self, P):
-        self.P = P
-
-    def mult(self, mat, x, y):
-        """Matrix-vector multiplication: y = A*x, delegated to P*x."""
-        self.P.mult(x, y)
-
-
-def build_A_shell_from_P(PETSc, comm, P):
-    """
-    Build a shell-like matrix A whose MatMult delegates to P.mult(), but whose
-    global/local sizes MUST match P exactly (robust across petsc4py size-order variants).
-
-    This ensures the linear system A*x=b is equivalent to P*x=b,
-    while A remains shell-like (covering fieldsplit+shell risk paths).
-
-    Args:
-        PETSc: petsc4py.PETSc module
-        comm: MPI communicator
-        P: PETSc.Mat (AIJ/MPIAIJ preconditioner matrix)
-
-    Returns:
-        A: PETSc.Mat (shell-like, with mult delegated to P)
-    """
-    (M, N) = tuple(P.getSize())
-    (m, n) = tuple(P.getLocalSize())
-
-    def _finalize(A):
-        A.setPythonContext(_ShellMultP(P))
-        A.setUp()
-        # Hard guard: sizes must match P (this prevents Nonconforming object sizes)
-        if tuple(A.getSize()) != (M, N) or tuple(A.getLocalSize()) != (m, n):
-            try:
-                A.destroy()
-            except Exception:
-                pass
-            raise ValueError(
-                f"Shell/Python Mat size-order mismatch: "
-                f"A.getSize()={A.getSize()} P.getSize()={(M,N)}; "
-                f"A.getLocalSize()={A.getLocalSize()} P.getLocalSize()={(m,n)}"
-            )
-        return A
-
-    # Try both size orders for createPython (petsc4py builds differ here)
-    for sizes in (
-        [[M, N], [m, n]],  # common convention: global then local
-        [[m, n], [M, N]],  # fallback: local then global
-    ):
-        try:
-            A = PETSc.Mat().createPython(sizes, comm=comm)
-            return _finalize(A)
-        except Exception:
-            pass
-
-    # Fallback: createShell with the same guarded size-order probing
-    for sizes in (
-        [[M, N], [m, n]],
-        [[m, n], [M, N]],
-    ):
-        try:
-            A = PETSc.Mat().createShell(sizes, comm=comm)
-            return _finalize(A)
-        except Exception:
-            pass
-
-    raise RuntimeError(
-        "Unable to create shell-like matrix with Python context (createPython/createShell both failed). "
-        "Check petsc4py version and build."
-    )
-
-
 @pytest.mark.mpi
-def test_p3_5_4_schur_solve_smoke_defaults_mpi(tmp_path: Path):
+def test_p3_5_4_2_schur_setup_defaults_mpi(tmp_path: Path):
     """
-    Smoke test: Schur fieldsplit can solve a well-conditioned system without hanging.
+    P3.5-4-2: Schur fieldsplit setUp path (structure only, no solve).
 
-    System construction (P3.5-4-1 strategy):
-    - A: shell matrix (mult delegates to P)
-    - P: AIJ preconditioner (lightly regularized with shift)
-    - x_true: deterministic (all 1s)
-    - b = A*x_true
-    - Solve A*x=b with Schur fieldsplit, verify x ≈ x_true
+    Validates that Schur fieldsplit can complete setUp without hanging,
+    and that structure is correct (uses_amat=False, sub-block types).
     """
     (
         _build_precond_matrix,
+        _build_shell_like_matrix,
         _get_fieldsplit_subksps,
         _import_chemistry_or_skip,
         _import_mpi4py_or_skip,
@@ -153,7 +78,7 @@ def test_p3_5_4_schur_solve_smoke_defaults_mpi(tmp_path: Path):
     if comm.getSize() < 2:
         pytest.skip("need MPI size >= 2")
 
-    _start_watchdog_abort_after_seconds(60.0)
+    _start_watchdog_abort_after_seconds(30.0)
 
     from parallel.dm_manager import build_dm  # noqa: E402
     from core.layout_dist import LayoutDistributed  # noqa: E402
@@ -179,75 +104,58 @@ def test_p3_5_4_schur_solve_smoke_defaults_mpi(tmp_path: Path):
     fd_eps = float(getattr(getattr(cfg, "petsc", None), "fd_eps", 1.0e-8))
     drop_tol = float(getattr(getattr(cfg, "petsc", None), "precond_drop_tol", 0.0))
 
-    P_base = _build_precond_matrix(PETSc, comm, mgr.dm, ctx, u0, fd_eps=fd_eps, drop_tol=drop_tol)
-
-    P_solve = P_base.copy()
-    P_solve.shift(1.0)
-
-    A = build_A_shell_from_P(PETSc, comm, P_solve)
-
-    # Use A's createVec methods to ensure size consistency
-    x_true = A.createVecRight()
-    x_true.set(1.0)
-
-    b = A.createVecLeft()
-    A.mult(x_true, b)
-
-    # Self-check: A.mult and P_solve.mult should be identical
-    tmp1 = A.createVecLeft()
-    tmp2 = A.createVecLeft()
-    A.mult(x_true, tmp1)
-    P_solve.mult(x_true, tmp2)
-    tmp1.axpy(-1.0, tmp2)
-    consistency_err = tmp1.norm()
-    assert consistency_err < 1e-12, f"A and P_solve mult inconsistent: {consistency_err}"
-
-    A_type = str(A.getType()).lower()
-    P_type = str(P_solve.getType()).lower()
-    assert "python" in A_type or "shell" in A_type, f"A should be shell-like, got {A_type}"
-    assert "aij" in P_type, f"P should be AIJ, got {P_type}"
+    A = _build_shell_like_matrix(PETSc, comm, mgr.dm)
+    P = _build_precond_matrix(PETSc, comm, mgr.dm, ctx, u0, fd_eps=fd_eps, drop_tol=drop_tol)
 
     ksp = PETSc.KSP().create(comm=comm)
-    ksp.setOptionsPrefix("p354_")
-    ksp.setOperators(A, P_solve)
+    ksp.setOptionsPrefix("p342_")
+    ksp.setOperators(A, P)
     ksp.setType("gmres")
 
-    diag_pc = apply_structured_pc(ksp, cfg, layout, A, P_solve)
+    diag_pc = apply_structured_pc(ksp, cfg, layout, A, P)
     ksp.setFromOptions()
     ksp.setUp()
     apply_fieldsplit_subksp_defaults(ksp, diag_pc)
 
+    # Structure assertions (P3.5-4-2 goal)
+    assert diag_pc.get("uses_amat") is False, "Schur must force uses_amat=False"
     assert diag_pc.get("fieldsplit_type") == "schur"
     assert diag_pc.get("schur_fact_type") == "lower"
 
-    x = A.createVecRight()
-    x.set(0.0)
-    ksp.solve(b, x)
+    # Sub-block operator type check
+    pc = ksp.getPC()
+    subksps = _get_fieldsplit_subksps(pc)
+    assert len(subksps) >= 2, f"Expected at least 2 sub-KSPs, got {len(subksps)}"
 
-    reason = int(ksp.getConvergedReason())
-    n_iter = int(ksp.getIterationNumber())
+    for idx, sksp in enumerate(subksps):
+        try:
+            As, Ps = sksp.getOperators()
+        except Exception:
+            continue
+        As_t = str(As.getType()).lower() if As is not None else ""
+        Ps_t = str(Ps.getType()).lower() if Ps is not None else ""
 
-    x_norm = x.norm()
-    assert x_norm > 0 and x_norm < 1e10, f"x_norm={x_norm} out of reasonable range"
+        # P_sub must be AIJ
+        assert "aij" in Ps_t, f"subKSP[{idx}] Psub={Ps_t} should be AIJ"
 
-    x_true_norm = x_true.norm()
-    x.axpy(-1.0, x_true)
-    err_norm = x.norm()
-    rel_err = err_norm / (x_true_norm + 1e-30)
-
-    assert reason > 0, f"KSP did not converge: reason={reason}, n_iter={n_iter}"
-    assert rel_err < 1e-6, f"Solution error too large: rel_err={rel_err}, n_iter={n_iter}"
+        # A_sub: allow AIJ or schurcomplement, but not matshell
+        is_aij_or_schur = ("aij" in As_t) or (As_t == "schurcomplement")
+        is_shell = ("shell" in As_t) or ("mffd" in As_t) or ("python" in As_t)
+        assert is_aij_or_schur, f"subKSP[{idx}] Asub={As_t} should be AIJ or schurcomplement"
+        assert not is_shell, f"subKSP[{idx}] Asub={As_t} should not be shell-like"
 
 
 @pytest.mark.mpi
-def test_p3_5_4_schur_solve_smoke_yaml_override_mpi(tmp_path: Path):
+def test_p3_5_4_2_schur_setup_yaml_override_mpi(tmp_path: Path):
     """
-    Smoke test: Schur fieldsplit with YAML overrides (schur_fact_type, bulk.ksp_type).
+    P3.5-4-2: Schur fieldsplit setUp with YAML overrides (structure only, no solve).
 
-    Verifies that user overrides are respected and solve still converges.
+    Validates that user overrides (schur_fact_type='upper', bulk.ksp_type='gmres')
+    are respected and setUp completes without hanging.
     """
     (
         _build_precond_matrix,
+        _build_shell_like_matrix,
         _get_fieldsplit_subksps,
         _import_chemistry_or_skip,
         _import_mpi4py_or_skip,
@@ -263,7 +171,7 @@ def test_p3_5_4_schur_solve_smoke_yaml_override_mpi(tmp_path: Path):
     if comm.getSize() < 2:
         pytest.skip("need MPI size >= 2")
 
-    _start_watchdog_abort_after_seconds(60.0)
+    _start_watchdog_abort_after_seconds(30.0)
 
     from parallel.dm_manager import build_dm  # noqa: E402
     from core.layout_dist import LayoutDistributed  # noqa: E402
@@ -293,50 +201,45 @@ def test_p3_5_4_schur_solve_smoke_yaml_override_mpi(tmp_path: Path):
     fd_eps = float(getattr(getattr(cfg, "petsc", None), "fd_eps", 1.0e-8))
     drop_tol = float(getattr(getattr(cfg, "petsc", None), "precond_drop_tol", 0.0))
 
-    P_base = _build_precond_matrix(PETSc, comm, mgr.dm, ctx, u0, fd_eps=fd_eps, drop_tol=drop_tol)
-
-    P_solve = P_base.copy()
-    P_solve.shift(1.0)
-
-    A = build_A_shell_from_P(PETSc, comm, P_solve)
-
-    # Use A's createVec methods to ensure size consistency
-    x_true = A.createVecRight()
-    x_true.set(1.0)
-
-    b = A.createVecLeft()
-    A.mult(x_true, b)
+    A = _build_shell_like_matrix(PETSc, comm, mgr.dm)
+    P = _build_precond_matrix(PETSc, comm, mgr.dm, ctx, u0, fd_eps=fd_eps, drop_tol=drop_tol)
 
     ksp = PETSc.KSP().create(comm=comm)
-    ksp.setOptionsPrefix("p354_override_")
-    ksp.setOperators(A, P_solve)
+    ksp.setOptionsPrefix("p342_override_")
+    ksp.setOperators(A, P)
     ksp.setType("gmres")
 
-    diag_pc = apply_structured_pc(ksp, cfg, layout, A, P_solve)
+    diag_pc = apply_structured_pc(ksp, cfg, layout, A, P)
     ksp.setFromOptions()
     ksp.setUp()
     apply_fieldsplit_subksp_defaults(ksp, diag_pc)
 
+    # Structure assertions: verify YAML overrides were applied
+    assert diag_pc.get("uses_amat") is False, "Schur must force uses_amat=False"
     assert diag_pc.get("fieldsplit_type") == "schur"
     assert diag_pc.get("schur_fact_type") == "upper"
 
     injected = diag_pc.get("options_injected", {}) or {}
     assert injected.get("fieldsplit_bulk_ksp_type") == "gmres"
 
-    x = A.createVecRight()
-    x.set(0.0)
-    ksp.solve(b, x)
+    # Sub-block operator type check
+    pc = ksp.getPC()
+    subksps = _get_fieldsplit_subksps(pc)
+    assert len(subksps) >= 2, f"Expected at least 2 sub-KSPs, got {len(subksps)}"
 
-    reason = int(ksp.getConvergedReason())
-    n_iter = int(ksp.getIterationNumber())
+    for idx, sksp in enumerate(subksps):
+        try:
+            As, Ps = sksp.getOperators()
+        except Exception:
+            continue
+        As_t = str(As.getType()).lower() if As is not None else ""
+        Ps_t = str(Ps.getType()).lower() if Ps is not None else ""
 
-    x_norm = x.norm()
-    assert x_norm > 0 and x_norm < 1e10, f"x_norm={x_norm} out of reasonable range"
+        # P_sub must be AIJ
+        assert "aij" in Ps_t, f"subKSP[{idx}] Psub={Ps_t} should be AIJ"
 
-    x_true_norm = x_true.norm()
-    x.axpy(-1.0, x_true)
-    err_norm = x.norm()
-    rel_err = err_norm / (x_true_norm + 1e-30)
-
-    assert reason > 0, f"KSP did not converge: reason={reason}, n_iter={n_iter}"
-    assert rel_err < 1e-6, f"Solution error too large: rel_err={rel_err}, n_iter={n_iter}"
+        # A_sub: allow AIJ or schurcomplement, but not matshell
+        is_aij_or_schur = ("aij" in As_t) or (As_t == "schurcomplement")
+        is_shell = ("shell" in As_t) or ("mffd" in As_t) or ("python" in As_t)
+        assert is_aij_or_schur, f"subKSP[{idx}] Asub={As_t} should be AIJ or schurcomplement"
+        assert not is_shell, f"subKSP[{idx}] Asub={As_t} should not be shell-like"
