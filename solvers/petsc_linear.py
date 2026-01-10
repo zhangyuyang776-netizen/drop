@@ -642,188 +642,169 @@ def apply_structured_pc(
             else:
                 raise
         diag["schur_fact_type"] = schur_fact
+        diag["uses_amat"] = False
+
+    def _get_subsolvers_cfg(raw_cfg):
+        if raw_cfg is None:
+            return None
+        if isinstance(raw_cfg, Mapping):
+            return raw_cfg.get("subsolvers") or raw_cfg.get("subksp")
+        sub = getattr(raw_cfg, "subsolvers", None)
+        if sub is None:
+            sub = getattr(raw_cfg, "subksp", None)
+        return sub
+
+    def _normalize_block(raw_block: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+        defaults = {
+            "ksp_type": "preonly",
+            "pc_type": "asm",
+            "asm_overlap": 1,
+            "asm_sub_pc_type": "ilu",
+            "ksp_rtol": None,
+            "ksp_max_it": None,
+        }
+        if raw_block and not isinstance(raw_block, Mapping):
+            raw_block = {
+                "ksp_type": getattr(raw_block, "ksp_type", None),
+                "pc_type": getattr(raw_block, "pc_type", None),
+                "asm_overlap": getattr(raw_block, "asm_overlap", None),
+                "asm_sub_pc_type": getattr(raw_block, "asm_sub_pc_type", None),
+                "ksp_rtol": getattr(raw_block, "ksp_rtol", None),
+                "ksp_max_it": getattr(raw_block, "ksp_max_it", None),
+            }
+        if raw_block:
+            for key in defaults:
+                if key in raw_block and raw_block[key] is not None:
+                    defaults[key] = raw_block[key]
+        defaults["ksp_type"] = str(defaults["ksp_type"]).lower()
+        defaults["pc_type"] = _normalize_pc_type(defaults["pc_type"]) or "asm"
+        defaults["asm_sub_pc_type"] = _normalize_pc_type(defaults["asm_sub_pc_type"]) or "ilu"
+        try:
+            defaults["asm_overlap"] = int(defaults["asm_overlap"])
+        except Exception:
+            defaults["asm_overlap"] = 1
+        if defaults.get("ksp_rtol") is not None:
+            defaults["ksp_rtol"] = float(defaults["ksp_rtol"])
+        if defaults.get("ksp_max_it") is not None:
+            defaults["ksp_max_it"] = int(defaults["ksp_max_it"])
+        return defaults
+
+    sub_cfg = _get_subsolvers_cfg(fs_cfg)
+    raw_bulk = None
+    raw_iface = None
+    if isinstance(sub_cfg, Mapping):
+        raw_bulk = sub_cfg.get("bulk")
+        raw_iface = sub_cfg.get("iface")
+    elif sub_cfg is not None:
+        raw_bulk = getattr(sub_cfg, "bulk", None)
+        raw_iface = getattr(sub_cfg, "iface", None)
 
     if fs_type == "schur":
-        bulk_ksp_type = str(_cfg_get(fs_cfg, "bulk_ksp_type", "gmres")).lower()
-        bulk_ksp_rtol = _as_float(_cfg_get(fs_cfg, "bulk_ksp_rtol", None), default_ksp_rtol)
-        bulk_ksp_atol = _as_float(_cfg_get(fs_cfg, "bulk_ksp_atol", None), default_ksp_atol)
-        bulk_ksp_max_it = _as_int(_cfg_get(fs_cfg, "bulk_ksp_max_it", None), default_ksp_max_it)
-        bulk_pc_type = _normalize_pc_type(_cfg_get(fs_cfg, "bulk_pc_type", "ilu"))
-        bulk_pc_asm_overlap = _cfg_get(fs_cfg, "bulk_pc_asm_overlap", None)
-        bulk_sub_ksp_type = str(_cfg_get(fs_cfg, "bulk_sub_ksp_type", "preonly")).lower()
-        bulk_sub_pc_type = _normalize_pc_type(_cfg_get(fs_cfg, "bulk_sub_pc_type", "ilu"))
-        bulk_pc_asm_sub_ksp_type = _cfg_get(fs_cfg, "bulk_pc_asm_sub_ksp_type", None)
-        bulk_pc_asm_sub_pc_type = _cfg_get(fs_cfg, "bulk_pc_asm_sub_pc_type", None)
-        bulk_pc_asm_sub_ksp_rtol = _cfg_get(fs_cfg, "bulk_pc_asm_sub_ksp_rtol", None)
-        bulk_pc_asm_sub_ksp_atol = _cfg_get(fs_cfg, "bulk_pc_asm_sub_ksp_atol", None)
-        bulk_pc_asm_sub_ksp_max_it = _cfg_get(fs_cfg, "bulk_pc_asm_sub_ksp_max_it", None)
-        bulk_pc_bjacobi_sub_ksp_type = _cfg_get(fs_cfg, "bulk_pc_bjacobi_sub_ksp_type", None)
-        bulk_pc_bjacobi_sub_pc_type = _cfg_get(fs_cfg, "bulk_pc_bjacobi_sub_pc_type", None)
-        bulk_pc_bjacobi_sub_ksp_rtol = _cfg_get(fs_cfg, "bulk_pc_bjacobi_sub_ksp_rtol", None)
-        bulk_pc_bjacobi_sub_ksp_atol = _cfg_get(fs_cfg, "bulk_pc_bjacobi_sub_ksp_atol", None)
-        bulk_pc_bjacobi_sub_ksp_max_it = _cfg_get(fs_cfg, "bulk_pc_bjacobi_sub_ksp_max_it", None)
-        if is_parallel:
-            if not _fs_has("bulk_ksp_type"):
-                bulk_ksp_type = "preonly"
-            if not _fs_has("bulk_pc_type"):
-                bulk_pc_type = "asm"
-            if not _fs_has("bulk_pc_asm_overlap"):
-                bulk_pc_asm_overlap = 1
-            if not _fs_has("bulk_pc_asm_sub_ksp_type"):
-                bulk_pc_asm_sub_ksp_type = "preonly"
-            if not _fs_has("bulk_pc_asm_sub_pc_type"):
-                bulk_pc_asm_sub_pc_type = "ilu"
-        if _normalize_pc_type(bulk_pc_type) == "asm" and bulk_pc_asm_overlap is None:
-            bulk_pc_asm_overlap = 1
-        bulk_subdomain_ksp_type = bulk_sub_ksp_type
-        bulk_subdomain_pc_type = bulk_sub_pc_type
-        if bulk_pc_type == "asm":
-            if bulk_pc_asm_sub_ksp_type:
-                bulk_subdomain_ksp_type = str(bulk_pc_asm_sub_ksp_type).lower()
-            if bulk_pc_asm_sub_pc_type:
-                bulk_subdomain_pc_type = _normalize_pc_type(bulk_pc_asm_sub_pc_type)
-        elif bulk_pc_type == "bjacobi":
-            if bulk_pc_bjacobi_sub_ksp_type:
-                bulk_subdomain_ksp_type = str(bulk_pc_bjacobi_sub_ksp_type).lower()
-            if bulk_pc_bjacobi_sub_pc_type:
-                bulk_subdomain_pc_type = _normalize_pc_type(bulk_pc_bjacobi_sub_pc_type)
-        bulk_subdomain_rtol, bulk_subdomain_atol, bulk_subdomain_max_it = _resolve_sub_tols(
-            bulk_subdomain_ksp_type,
-            base_rtol=bulk_ksp_rtol,
-            base_atol=bulk_ksp_atol,
-            base_max_it=bulk_ksp_max_it,
-            cfg_rtol=(
-                bulk_pc_asm_sub_ksp_rtol
-                if bulk_pc_type == "asm"
-                else bulk_pc_bjacobi_sub_ksp_rtol
-                if bulk_pc_type == "bjacobi"
-                else None
-            ),
-            cfg_atol=(
-                bulk_pc_asm_sub_ksp_atol
-                if bulk_pc_type == "asm"
-                else bulk_pc_bjacobi_sub_ksp_atol
-                if bulk_pc_type == "bjacobi"
-                else None
-            ),
-            cfg_max_it=(
-                bulk_pc_asm_sub_ksp_max_it
-                if bulk_pc_type == "asm"
-                else bulk_pc_bjacobi_sub_ksp_max_it
-                if bulk_pc_type == "bjacobi"
-                else None
-            ),
-        )
-        iface_ksp_type = str(_cfg_get(fs_cfg, "iface_ksp_type", "preonly")).lower()
-        iface_ksp_rtol = _as_float(_cfg_get(fs_cfg, "iface_ksp_rtol", None), default_ksp_rtol)
-        iface_ksp_atol = _as_float(_cfg_get(fs_cfg, "iface_ksp_atol", None), default_ksp_atol)
-        iface_ksp_max_it = _as_int(_cfg_get(fs_cfg, "iface_ksp_max_it", None), default_ksp_max_it)
-        iface_pc_type = _normalize_pc_type(_cfg_get(fs_cfg, "iface_pc_type", "lu"))
-        iface_pc_asm_overlap = _cfg_get(fs_cfg, "iface_pc_asm_overlap", None)
-        iface_sub_ksp_type = str(_cfg_get(fs_cfg, "iface_sub_ksp_type", "preonly")).lower()
-        iface_sub_pc_type = _normalize_pc_type(_cfg_get(fs_cfg, "iface_sub_pc_type", "ilu"))
-        iface_pc_asm_sub_ksp_type = _cfg_get(fs_cfg, "iface_pc_asm_sub_ksp_type", None)
-        iface_pc_asm_sub_pc_type = _cfg_get(fs_cfg, "iface_pc_asm_sub_pc_type", None)
-        iface_pc_asm_sub_ksp_rtol = _cfg_get(fs_cfg, "iface_pc_asm_sub_ksp_rtol", None)
-        iface_pc_asm_sub_ksp_atol = _cfg_get(fs_cfg, "iface_pc_asm_sub_ksp_atol", None)
-        iface_pc_asm_sub_ksp_max_it = _cfg_get(fs_cfg, "iface_pc_asm_sub_ksp_max_it", None)
-        iface_pc_bjacobi_sub_ksp_type = _cfg_get(fs_cfg, "iface_pc_bjacobi_sub_ksp_type", None)
-        iface_pc_bjacobi_sub_pc_type = _cfg_get(fs_cfg, "iface_pc_bjacobi_sub_pc_type", None)
-        iface_pc_bjacobi_sub_ksp_rtol = _cfg_get(fs_cfg, "iface_pc_bjacobi_sub_ksp_rtol", None)
-        iface_pc_bjacobi_sub_ksp_atol = _cfg_get(fs_cfg, "iface_pc_bjacobi_sub_ksp_atol", None)
-        iface_pc_bjacobi_sub_ksp_max_it = _cfg_get(fs_cfg, "iface_pc_bjacobi_sub_ksp_max_it", None)
-        if is_parallel:
-            if not _fs_has("iface_ksp_type"):
-                iface_ksp_type = "preonly"
-            if not _fs_has("iface_pc_type"):
-                iface_pc_type = "ilu"
-            if not _fs_has("iface_pc_asm_overlap"):
-                iface_pc_asm_overlap = 1
-            if not _fs_has("iface_pc_asm_sub_ksp_type"):
-                iface_pc_asm_sub_ksp_type = "preonly"
-            if not _fs_has("iface_pc_asm_sub_pc_type"):
-                iface_pc_asm_sub_pc_type = "ilu"
-        if _normalize_pc_type(iface_pc_type) == "asm" and iface_pc_asm_overlap is None:
-            iface_pc_asm_overlap = 1
-        iface_subdomain_ksp_type = iface_sub_ksp_type
-        iface_subdomain_pc_type = iface_sub_pc_type
-        if iface_pc_type == "asm":
-            if iface_pc_asm_sub_ksp_type:
-                iface_subdomain_ksp_type = str(iface_pc_asm_sub_ksp_type).lower()
-            if iface_pc_asm_sub_pc_type:
-                iface_subdomain_pc_type = _normalize_pc_type(iface_pc_asm_sub_pc_type)
-        elif iface_pc_type == "bjacobi":
-            if iface_pc_bjacobi_sub_ksp_type:
-                iface_subdomain_ksp_type = str(iface_pc_bjacobi_sub_ksp_type).lower()
-            if iface_pc_bjacobi_sub_pc_type:
-                iface_subdomain_pc_type = _normalize_pc_type(iface_pc_bjacobi_sub_pc_type)
-        iface_subdomain_rtol, iface_subdomain_atol, iface_subdomain_max_it = _resolve_sub_tols(
-            iface_subdomain_ksp_type,
-            base_rtol=iface_ksp_rtol,
-            base_atol=iface_ksp_atol,
-            base_max_it=iface_ksp_max_it,
-            cfg_rtol=(
-                iface_pc_asm_sub_ksp_rtol
-                if iface_pc_type == "asm"
-                else iface_pc_bjacobi_sub_ksp_rtol
-                if iface_pc_type == "bjacobi"
-                else None
-            ),
-            cfg_atol=(
-                iface_pc_asm_sub_ksp_atol
-                if iface_pc_type == "asm"
-                else iface_pc_bjacobi_sub_ksp_atol
-                if iface_pc_type == "bjacobi"
-                else None
-            ),
-            cfg_max_it=(
-                iface_pc_asm_sub_ksp_max_it
-                if iface_pc_type == "asm"
-                else iface_pc_bjacobi_sub_ksp_max_it
-                if iface_pc_type == "bjacobi"
-                else None
-            ),
-        )
+        if raw_bulk is None and _cfg_get(fs_cfg, "bulk_ksp_type", None) is not None:
+            raw_bulk = {
+                "ksp_type": _cfg_get(fs_cfg, "bulk_ksp_type", None),
+                "pc_type": _cfg_get(fs_cfg, "bulk_pc_type", None),
+                "asm_sub_pc_type": _cfg_get(fs_cfg, "bulk_pc_asm_sub_pc_type", None),
+                "asm_overlap": _cfg_get(fs_cfg, "bulk_pc_asm_overlap", None),
+            }
+        if raw_iface is None and _cfg_get(fs_cfg, "iface_ksp_type", None) is not None:
+            raw_iface = {
+                "ksp_type": _cfg_get(fs_cfg, "iface_ksp_type", None),
+                "pc_type": _cfg_get(fs_cfg, "iface_pc_type", None),
+                "asm_sub_pc_type": _cfg_get(fs_cfg, "iface_pc_asm_sub_pc_type", None),
+                "asm_overlap": _cfg_get(fs_cfg, "iface_pc_asm_overlap", None),
+            }
+
+        if raw_iface is not None and isinstance(raw_iface, Mapping):
+            if raw_iface.get("asm_sub_pc_type") is None:
+                if isinstance(raw_iface, dict):
+                    raw_iface["asm_sub_pc_type"] = "lu"
+
+        bulk_cfg = _normalize_block(raw_bulk)
+        iface_cfg = _normalize_block(raw_iface)
+        if iface_cfg["asm_sub_pc_type"] == "ilu":
+            iface_cfg["asm_sub_pc_type"] = "lu"
+
+        diag.setdefault("options_injected", {})
+        diag.setdefault("options_skipped_cli", {})
+        diag.setdefault("options_overwritten", {})
+
+        options_prefix = diag.get("ksp_prefix", "")
+        try:
+            opts = PETSc.Options(options_prefix or "")
+        except Exception:
+            opts = PETSc.Options()
+
+        def _inject_block(name: str, block_cfg: Dict[str, Any]) -> None:
+            base = f"fieldsplit_{name}_"
+            kv = {
+                f"{base}ksp_type": block_cfg["ksp_type"],
+                f"{base}pc_type": block_cfg["pc_type"],
+            }
+            if block_cfg.get("ksp_rtol") is not None:
+                kv[f"{base}ksp_rtol"] = block_cfg["ksp_rtol"]
+            if block_cfg.get("ksp_max_it") is not None:
+                kv[f"{base}ksp_max_it"] = block_cfg["ksp_max_it"]
+            if block_cfg["pc_type"] in ("asm", "bjacobi"):
+                kv[f"{base}pc_asm_overlap"] = block_cfg["asm_overlap"]
+                kv[f"{base}sub_ksp_type"] = "preonly"
+                kv[f"{base}sub_pc_type"] = block_cfg["asm_sub_pc_type"]
+
+            for key, val in kv.items():
+                _opts_set_guarded(
+                    opts,
+                    ksp_prefix=options_prefix,
+                    key=key,
+                    value=val,
+                    diag_injected=diag["options_injected"],
+                    diag_skipped=diag["options_skipped_cli"],
+                    diag_overwritten=diag["options_overwritten"],
+                )
+
+        _inject_block("bulk", bulk_cfg)
+        _inject_block("iface", iface_cfg)
+
+        def _split_info(block_cfg: Dict[str, Any]) -> Dict[str, Any]:
+            info = {
+                "ksp_type": block_cfg["ksp_type"],
+                "pc_type": block_cfg["pc_type"],
+                "asm_overlap": block_cfg["asm_overlap"],
+                "subdomain_ksp_type": "preonly",
+                "subdomain_pc_type": block_cfg["asm_sub_pc_type"],
+            }
+            if block_cfg.get("ksp_rtol") is not None:
+                info["ksp_rtol"] = float(block_cfg["ksp_rtol"])
+            if block_cfg.get("ksp_max_it") is not None:
+                info["ksp_max_it"] = int(block_cfg["ksp_max_it"])
+            return info
+
+        fs_diag = diag.setdefault("fieldsplit", {})
+        fs_splits = fs_diag.setdefault("splits", {})
+        fs_splits.setdefault("bulk", _split_info(bulk_cfg))
+        fs_splits.setdefault("iface", _split_info(iface_cfg))
+
         diag["sub_defaults"] = {
             "default": {
-                "ksp_type": bulk_ksp_type,
-                "ksp_rtol": bulk_ksp_rtol,
-                "ksp_atol": bulk_ksp_atol,
-                "ksp_max_it": bulk_ksp_max_it,
-                "pc_type": bulk_pc_type,
-                "pc_asm_overlap": bulk_pc_asm_overlap,
-                "subdomain_ksp_type": bulk_subdomain_ksp_type,
-                "subdomain_pc_type": bulk_subdomain_pc_type,
-                "subdomain_ksp_rtol": bulk_subdomain_rtol,
-                "subdomain_ksp_atol": bulk_subdomain_atol,
-                "subdomain_ksp_max_it": bulk_subdomain_max_it,
+                "ksp_type": bulk_cfg["ksp_type"],
+                "pc_type": bulk_cfg["pc_type"],
+                "pc_asm_overlap": bulk_cfg["asm_overlap"],
+                "subdomain_ksp_type": "preonly",
+                "subdomain_pc_type": bulk_cfg["asm_sub_pc_type"],
             },
             "by_name": {
                 "bulk": {
-                    "ksp_type": bulk_ksp_type,
-                    "ksp_rtol": bulk_ksp_rtol,
-                    "ksp_atol": bulk_ksp_atol,
-                    "ksp_max_it": bulk_ksp_max_it,
-                    "pc_type": bulk_pc_type,
-                    "pc_asm_overlap": bulk_pc_asm_overlap,
-                    "subdomain_ksp_type": bulk_subdomain_ksp_type,
-                    "subdomain_pc_type": bulk_subdomain_pc_type,
-                    "subdomain_ksp_rtol": bulk_subdomain_rtol,
-                    "subdomain_ksp_atol": bulk_subdomain_atol,
-                    "subdomain_ksp_max_it": bulk_subdomain_max_it,
+                    "ksp_type": bulk_cfg["ksp_type"],
+                    "pc_type": bulk_cfg["pc_type"],
+                    "pc_asm_overlap": bulk_cfg["asm_overlap"],
+                    "subdomain_ksp_type": "preonly",
+                    "subdomain_pc_type": bulk_cfg["asm_sub_pc_type"],
                 },
                 "iface": {
-                    "ksp_type": iface_ksp_type,
-                    "ksp_rtol": iface_ksp_rtol,
-                    "ksp_atol": iface_ksp_atol,
-                    "ksp_max_it": iface_ksp_max_it,
-                    "pc_type": iface_pc_type,
-                    "pc_asm_overlap": iface_pc_asm_overlap,
-                    "subdomain_ksp_type": iface_subdomain_ksp_type,
-                    "subdomain_pc_type": iface_subdomain_pc_type,
-                    "subdomain_ksp_rtol": iface_subdomain_rtol,
-                    "subdomain_ksp_atol": iface_subdomain_atol,
-                    "subdomain_ksp_max_it": iface_subdomain_max_it,
+                    "ksp_type": iface_cfg["ksp_type"],
+                    "pc_type": iface_cfg["pc_type"],
+                    "pc_asm_overlap": iface_cfg["asm_overlap"],
+                    "subdomain_ksp_type": "preonly",
+                    "subdomain_pc_type": iface_cfg["asm_sub_pc_type"],
                 },
             },
         }
@@ -1072,8 +1053,10 @@ def apply_fieldsplit_subksp_defaults(ksp, diag: Mapping[str, Any]) -> None:
             for name in names:
                 _fill_split_defaults(str(name), default_cfg)
 
-    if fs_type == "additive":
+    if fs_type in ("additive", "schur"):
         _fill_splits_from_defaults()
+
+    if fs_type == "additive":
         return
 
     pc = ksp.getPC()
