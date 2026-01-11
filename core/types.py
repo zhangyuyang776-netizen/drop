@@ -291,6 +291,9 @@ class CaseNonlinear:
     verbose: bool = False
     log_every: int = 5
 
+    # P3.5-5-1: smoke mode for quick SNES smoke tests (limits iterations)
+    smoke: bool = False
+
 
 @dataclass(slots=True)
 class CaseIOFields:
