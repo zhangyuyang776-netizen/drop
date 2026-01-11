@@ -276,6 +276,7 @@ def _load_case_config(cfg_path: str) -> CaseConfig:
         residual_scale_floor=float(nonlinear_raw.get("residual_scale_floor", 1.0e-12)),
         verbose=bool(nonlinear_raw.get("verbose", False)),
         log_every=int(nonlinear_raw.get("log_every", 5)),
+        smoke=bool(nonlinear_raw.get("smoke", False)),  # P3.5-5-1: Load smoke field
     )
 
     cfg = CaseConfig(
