@@ -35,6 +35,80 @@ DEBUG_DOF_GID = os.getenv("DROPLET_DEBUG_DOF_GID")
 DEBUG_DOF_GID = int(DEBUG_DOF_GID) if DEBUG_DOF_GID is not None else None
 
 
+def _normalize_cfg_for_snes_smoke(cfg):
+    """
+    P3.5-5-1: Normalize config for SNES smoke mode.
+
+    Smoke mode adjustments:
+    1. Limit SNES outer iterations to 1 (or min(max_outer_iter, 1))
+    2. Force fieldsplit to use mfpc_sparse_fd (never pure mf, which gives identity P)
+
+    Args:
+        cfg: Case configuration object
+
+    Returns:
+        dict: Diagnostic info about normalization applied
+            {
+                "smoke_enabled": bool,
+                "max_outer_iter_original": int,
+                "max_outer_iter_effective": int,
+                "jacobian_mode_original": str,
+                "jacobian_mode_effective": str,
+            }
+    """
+    diag_info = {
+        "smoke_enabled": False,
+        "max_outer_iter_original": None,
+        "max_outer_iter_effective": None,
+        "jacobian_mode_original": None,
+        "jacobian_mode_effective": None,
+    }
+
+    # Check smoke mode
+    nl_cfg = getattr(cfg, "nonlinear", None)
+    if nl_cfg is None:
+        return diag_info
+
+    smoke = bool(getattr(nl_cfg, "smoke", False))
+    diag_info["smoke_enabled"] = smoke
+
+    # Record original max_outer_iter
+    max_outer_iter_orig = int(getattr(nl_cfg, "max_outer_iter", 20))
+    diag_info["max_outer_iter_original"] = max_outer_iter_orig
+
+    # If smoke mode, limit to 1 iteration
+    if smoke:
+        max_outer_iter_eff = min(max_outer_iter_orig, 1)
+        nl_cfg.max_outer_iter = max_outer_iter_eff
+        diag_info["max_outer_iter_effective"] = max_outer_iter_eff
+    else:
+        diag_info["max_outer_iter_effective"] = max_outer_iter_orig
+
+    # Record original jacobian_mode
+    petsc_cfg = getattr(cfg, "petsc", None)
+    if petsc_cfg is not None:
+        jac_mode_orig = getattr(petsc_cfg, "jacobian_mode", "mf")
+        diag_info["jacobian_mode_original"] = jac_mode_orig
+
+        # Check if fieldsplit is being used
+        linear_cfg = getattr(getattr(cfg, "solver", None), "linear", None)
+        pc_type = None
+        if linear_cfg is not None:
+            pc_type = getattr(linear_cfg, "pc_type", None)
+
+        # Force fieldsplit + mf → mfpc_sparse_fd (ensures P is assemblable AIJ)
+        if pc_type == "fieldsplit" and jac_mode_orig == "mf":
+            petsc_cfg.jacobian_mode = "mfpc_sparse_fd"
+            diag_info["jacobian_mode_effective"] = "mfpc_sparse_fd"
+        else:
+            diag_info["jacobian_mode_effective"] = jac_mode_orig
+    else:
+        diag_info["jacobian_mode_original"] = "mf"
+        diag_info["jacobian_mode_effective"] = "mf"
+
+    return diag_info
+
+
 def _create_identity_precond_mat(comm, dm):
     """
     Stage P1.5: DM-driven MPIAIJ identity preconditioner matrix.
@@ -169,6 +243,9 @@ def solve_nonlinear_petsc_parallel(
     nl_cfg = getattr(cfg, "nonlinear", None)
     if nl_cfg is None or not getattr(nl_cfg, "enabled", False):
         raise ValueError("Nonlinear solver requested but cfg.nonlinear.enabled is False or missing.")
+
+    # P3.5-5-1: Normalize config for smoke mode (limits iterations, ensures AIJ P for fieldsplit)
+    smoke_diag = _normalize_cfg_for_snes_smoke(cfg)
 
     LinearSolverConfigTyped.from_cfg(cfg)
     validate_mpi_before_petsc(cfg)
@@ -1227,6 +1304,9 @@ def solve_nonlinear_petsc_parallel(
         "J_mat_type": j_type,
         "P_mat_type": p_type,
     }
+    # P3.5-5-1: Record smoke mode diagnostics
+    if smoke_diag:
+        extra["snes_smoke"] = smoke_diag
     if ksp_a_type:
         extra["KSP_A_type"] = ksp_a_type
     if ksp_p_type:
