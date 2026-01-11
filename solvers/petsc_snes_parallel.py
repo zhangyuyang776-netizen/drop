@@ -56,6 +56,8 @@ def _normalize_cfg_for_snes_smoke(cfg):
                 "jacobian_mode_effective": str,
             }
     """
+    import sys
+
     diag_info = {
         "smoke_enabled": False,
         "max_outer_iter_original": None,
@@ -66,28 +68,41 @@ def _normalize_cfg_for_snes_smoke(cfg):
 
     # Check smoke mode
     nl_cfg = getattr(cfg, "nonlinear", None)
+
+    # P3.5-5-1 DEBUG: Log entry state
+    print(f"[P3.5-5-1 DEBUG] _normalize_cfg_for_snes_smoke called", file=sys.stderr, flush=True)
+    print(f"  nl_cfg type: {type(nl_cfg)}", file=sys.stderr, flush=True)
+    print(f"  nl_cfg: {nl_cfg}", file=sys.stderr, flush=True)
+
     if nl_cfg is None:
+        print(f"  nl_cfg is None, returning early", file=sys.stderr, flush=True)
         return diag_info
 
     smoke = bool(getattr(nl_cfg, "smoke", False))
+    print(f"  smoke field value: {smoke}", file=sys.stderr, flush=True)
     diag_info["smoke_enabled"] = smoke
 
     # Record original max_outer_iter
     max_outer_iter_orig = int(getattr(nl_cfg, "max_outer_iter", 20))
+    print(f"  max_outer_iter_original: {max_outer_iter_orig}", file=sys.stderr, flush=True)
     diag_info["max_outer_iter_original"] = max_outer_iter_orig
 
     # If smoke mode, limit to 1 iteration
     if smoke:
         max_outer_iter_eff = min(max_outer_iter_orig, 1)
+        print(f"  smoke=True, setting nl_cfg.max_outer_iter to {max_outer_iter_eff}", file=sys.stderr, flush=True)
         nl_cfg.max_outer_iter = max_outer_iter_eff
+        print(f"  After mutation: nl_cfg.max_outer_iter = {getattr(nl_cfg, 'max_outer_iter', 'MISSING')}", file=sys.stderr, flush=True)
         diag_info["max_outer_iter_effective"] = max_outer_iter_eff
     else:
+        print(f"  smoke=False, no iteration limiting", file=sys.stderr, flush=True)
         diag_info["max_outer_iter_effective"] = max_outer_iter_orig
 
     # Record original jacobian_mode
     petsc_cfg = getattr(cfg, "petsc", None)
     if petsc_cfg is not None:
         jac_mode_orig = getattr(petsc_cfg, "jacobian_mode", "mf")
+        print(f"  jacobian_mode_original: {jac_mode_orig}", file=sys.stderr, flush=True)
         diag_info["jacobian_mode_original"] = jac_mode_orig
 
         # Check if fieldsplit is being used
@@ -95,17 +110,21 @@ def _normalize_cfg_for_snes_smoke(cfg):
         pc_type = None
         if linear_cfg is not None:
             pc_type = getattr(linear_cfg, "pc_type", None)
+        print(f"  pc_type: {pc_type}", file=sys.stderr, flush=True)
 
         # Force fieldsplit + mf → mfpc_sparse_fd (ensures P is assemblable AIJ)
         if pc_type == "fieldsplit" and jac_mode_orig == "mf":
+            print(f"  Promoting jacobian_mode: mf -> mfpc_sparse_fd", file=sys.stderr, flush=True)
             petsc_cfg.jacobian_mode = "mfpc_sparse_fd"
             diag_info["jacobian_mode_effective"] = "mfpc_sparse_fd"
+            print(f"  After mutation: petsc_cfg.jacobian_mode = {getattr(petsc_cfg, 'jacobian_mode', 'MISSING')}", file=sys.stderr, flush=True)
         else:
             diag_info["jacobian_mode_effective"] = jac_mode_orig
     else:
         diag_info["jacobian_mode_original"] = "mf"
         diag_info["jacobian_mode_effective"] = "mf"
 
+    print(f"  Returning diag_info: {diag_info}", file=sys.stderr, flush=True)
     return diag_info
 
 
@@ -247,6 +266,12 @@ def solve_nonlinear_petsc_parallel(
     # P3.5-5-1: Normalize config for smoke mode (limits iterations, ensures AIJ P for fieldsplit)
     smoke_diag = _normalize_cfg_for_snes_smoke(cfg)
 
+    # P3.5-5-1 DEBUG: Log smoke_diag returned value
+    import sys
+    print(f"[P3.5-5-1 DEBUG] After _normalize_cfg_for_snes_smoke:", file=sys.stderr, flush=True)
+    print(f"  smoke_diag = {smoke_diag}", file=sys.stderr, flush=True)
+    print(f"  nl_cfg.max_outer_iter = {getattr(nl_cfg, 'max_outer_iter', 'MISSING')}", file=sys.stderr, flush=True)
+
     LinearSolverConfigTyped.from_cfg(cfg)
     validate_mpi_before_petsc(cfg)
 
@@ -361,6 +386,13 @@ def solve_nonlinear_petsc_parallel(
         )
 
     max_outer_iter = int(getattr(nl_cfg, "max_outer_iter", 20))
+
+    # P3.5-5-1 DEBUG: Log max_outer_iter read from nl_cfg
+    print(f"[P3.5-5-1 DEBUG] Reading max_outer_iter from nl_cfg:", file=sys.stderr, flush=True)
+    print(f"  max_outer_iter = {max_outer_iter}", file=sys.stderr, flush=True)
+    print(f"  nl_cfg.max_outer_iter = {getattr(nl_cfg, 'max_outer_iter', 'MISSING')}", file=sys.stderr, flush=True)
+    print(f"  Expected from smoke_diag: {smoke_diag.get('max_outer_iter_effective', 'N/A')}", file=sys.stderr, flush=True)
+
     # Fixed tolerances for the dedicated MPI backend.
     f_rtol = 1.0e-6
     f_atol = 1.0e-8
@@ -372,6 +404,11 @@ def solve_nonlinear_petsc_parallel(
     jacobian_mode_raw = "mf"
     if petsc_cfg is not None:
         jacobian_mode_raw = getattr(petsc_cfg, "jacobian_mode", "mf")
+
+    # P3.5-5-1 DEBUG: Log jacobian_mode read from petsc_cfg
+    print(f"[P3.5-5-1 DEBUG] Reading jacobian_mode from petsc_cfg:", file=sys.stderr, flush=True)
+    print(f"  jacobian_mode_raw = {jacobian_mode_raw}", file=sys.stderr, flush=True)
+    print(f"  Expected from smoke_diag: {smoke_diag.get('jacobian_mode_effective', 'N/A')}", file=sys.stderr, flush=True)
     jacobian_mode = JacobianMode.normalize(jacobian_mode_raw)
     if jacobian_mode not in (JacobianMode.MF, JacobianMode.MFPC_SPARSE_FD):
         raise ValueError(
@@ -1001,6 +1038,13 @@ def solve_nonlinear_petsc_parallel(
     except Exception:
         logger.warning("Unknown snes_type='%s', falling back to newtonls", snes_type)
         snes.setType("newtonls")
+
+    # P3.5-5-1 DEBUG: Log SNES tolerance parameters before setting
+    print(f"[P3.5-5-1 DEBUG] About to call snes.setTolerances:", file=sys.stderr, flush=True)
+    print(f"  max_it = {max_outer_iter}", file=sys.stderr, flush=True)
+    print(f"  f_rtol = {f_rtol}", file=sys.stderr, flush=True)
+    print(f"  f_atol = {f_atol}", file=sys.stderr, flush=True)
+
     snes.setTolerances(rtol=f_rtol, atol=f_atol, max_it=max_outer_iter)
 
     linesearch_type_eff = _apply_linesearch_options_from_env(PETSc, prefix, linesearch_type)
